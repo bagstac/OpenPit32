@@ -1,0 +1,348 @@
+@page "/grill"
+@inject GrillRpcService Rpc
+@implements IDisposable
+
+<PageTitle>Grill — Pit Boss</PageTitle>
+
+@if (health is null && !polledOnce)
+{
+    <p class="text-muted">Connecting to the grill bridge…</p>
+}
+else if (health is null)
+{
+    <div class="alert alert-warning">
+        Grill bridge unreachable — start <code>scripts\grill_sidecar.py</code>.
+    </div>
+    <button class="btn btn-outline-secondary" @onclick="PollSidecar">Retry</button>
+    <a class="btn btn-outline-secondary ms-1" href="/">Back</a>
+}
+else if (!health.configured)
+{
+    <div class="alert alert-warning">
+        The bridge has no grill password yet — go <a href="/">back</a> and fetch it
+        from your Pit Boss account.
+    </div>
+}
+else
+{
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <h3 class="mb-0">@(info?.model ?? "Grill")</h3>
+        <div>
+            <button class="btn btn-outline-secondary btn-sm" @onclick="PollSidecar">Refresh</button>
+            <a class="btn btn-outline-secondary btn-sm ms-1" href="/">Back</a>
+        </div>
+    </div>
+    @if (info is not null)
+    {
+        <p class="text-muted small">
+            @info.board_id
+            @if (info.firmware is { } fw)
+            {
+                <span>· fw @FirmwareText(fw)</span>
+            }
+        </p>
+    }
+
+    @if (live is not null)
+    {
+        <div class="card pb-card mb-4">
+            <div class="card-header">
+                Live Status
+                <span class="text-muted small ms-2">
+                    @if (stateAge is not null)
+                    {
+                        <span>@stateAge s ago</span>
+                    }
+                </span>
+                <span class="badge @(live.moduleIsOn ? "text-bg-success" : "text-bg-secondary") ms-2">
+                    Controller @(live.moduleIsOn ? "on" : "off")
+                </span>
+                <span class="badge @LinkBadgeClass ms-1" title="Bluetooth LE through the ESP32 proxy — works with the controller off">@LinkLabel</span>
+                @if (!string.IsNullOrEmpty(LinkProblem))
+                {
+                    <span class="badge text-bg-warning ms-1">@LinkProblem</span>
+                }
+            </div>
+            <div class="card-body">
+                <div class="row text-center pb-temps">
+                    <div class="col">
+                        <div class="pb-big">@Fmt(live.grillTemp)°</div>
+                        <div class="text-muted small">Grill Temp</div>
+                    </div>
+                    <div class="col">
+                        <div class="pb-big">@Fmt(live.grillSetTemp)°</div>
+                        <div class="text-muted small">Set Point</div>
+                    </div>
+                    <div class="col">
+                        <div class="pb-big">@Fmt(live.smokerActTemp)°</div>
+                        <div class="text-muted small">Smoker</div>
+                    </div>
+                    <div class="col">
+                        <div class="pb-big">@(live.isFahrenheit ? "°F" : "°C")</div>
+                        <div class="text-muted small">Units</div>
+                    </div>
+                </div>
+                <hr />
+                <div class="row text-center pb-temps">
+                    @foreach (var p in ModelProbes(live))
+                    {
+                        <div class="col">
+                            <div class="pb-big">@Fmt(p.Value)°</div>
+                            <div class="text-muted small">Probe @p.Key</div>
+                        </div>
+                    }
+                </div>
+                <hr />
+                <p class="mb-0 text-muted small">
+                    Fan @OnOff(live.fanState) · Igniter @OnOff(live.hotState)
+                    · Auger @OnOff(live.motorState) · Light @OnOff(live.lightState)
+                    · Prime @OnOff(live.primeState)
+                    @if (AnyError(live))
+                    {
+                        <span class="badge text-bg-danger ms-1">Error flags set</span>
+                    }
+                </p>
+            </div>
+        </div>
+    }
+    else if (string.IsNullOrEmpty(LinkProblem))
+    {
+        <div class="alert alert-secondary">No status data from the grill yet.</div>
+    }
+    else
+    {
+        <div class="alert alert-warning">
+            <span class="badge @LinkBadgeClass me-1">@LinkLabel</span>
+            @LinkProblem
+        </div>
+    }
+
+    <div class="card pb-card">
+        <div class="card-header">Controls</div>
+        <div class="card-body">
+            @if (!string.IsNullOrEmpty(actionMessage))
+            {
+                <div class="alert @(actionFailed ? "alert-danger" : "alert-info") py-2">@actionMessage</div>
+            }
+            <div class="row g-2 align-items-end">
+                <div class="col-6 col-md-3">
+                    <label class="form-label small text-muted mb-1">Target temp (@(live?.isFahrenheit == true ? "F" : "C"))</label>
+                    <input type="number" class="form-control" placeholder="e.g. 250" @bind="setTemp" />
+                </div>
+                <div class="col-auto">
+                    <button class="btn btn-outline-secondary" disabled="@actionBusy" @onclick="SetTemp">Set Temperature</button>
+                </div>
+            </div>
+            <div class="row g-2 mt-3">
+                <div class="col-auto">
+                    @if (live?.moduleIsOn == true)
+                    {
+                        <button class="btn @(confirmFor == "power_off" ? "btn-danger" : "btn-outline-danger")"
+                                disabled="@actionBusy" @onclick="PowerOff">
+                            @(confirmFor == "power_off" ? "Confirm Power Off?" : "Power Off")
+                        </button>
+                    }
+                    else
+                    {
+                        <button class="btn @(confirmFor == "power_on" ? "btn-danger" : "btn-outline-danger")"
+                                disabled="@actionBusy" @onclick="PowerOn">
+                            @(confirmFor == "power_on" ? "Confirm Power On (ignites)?" : "Power On")
+                        </button>
+                    }
+                </div>
+                @if (info is null || info.has_lights)
+                {
+                    <div class="col-auto">
+                        <button class="btn btn-outline-secondary" disabled="@actionBusy" @onclick="ToggleLight">
+                            Light @(live?.lightState == true ? "Off" : "On")
+                        </button>
+                    </div>
+                }
+                <div class="col-auto">
+                    <button class="btn btn-outline-secondary" disabled="@actionBusy" @onclick="TogglePrime">
+                        Prime @(live?.primeState == true ? "Off" : "On")
+                    </button>
+                </div>
+            </div>
+            <p class="text-muted small mt-3 mb-0">
+                Commands go over Bluetooth LE through the ESP32 proxy — no cloud involved.
+                They act on a real appliance; double-check before confirming.
+            </p>
+        </div>
+    </div>
+
+    <p class="text-muted small mt-3">
+        Link diagnostics (BLE / WiFi signal, proxy status): <a href="/health">Bridge health</a>
+    </p>
+}
+
+@code {
+    private string? setTemp;
+    private SidecarState? live;
+    private double? stateAge;
+    private string? sidecarError;
+    private SidecarHealthResponse? health;
+    private SidecarInfoResponse? info;
+    private bool polledOnce;
+    private string? confirmFor;
+    private string? actionMessage;
+    private bool actionFailed;
+    private bool actionBusy;
+    private System.Threading.Timer? pollTimer;
+    private System.Threading.Timer? confirmTimer;
+
+    protected override void OnInitialized()
+    {
+        pollTimer = new System.Threading.Timer(_ => _ = InvokeAsync(PollSidecar),
+            null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
+    }
+
+    private async Task PollSidecar()
+    {
+        try
+        {
+            health = await Rpc.GetHealthAsync();
+            if (health?.configured == true)
+            {
+                info ??= await Rpc.GetInfoAsync();
+                var resp = await Rpc.GetStateAsync();
+                live = resp?.state;
+                stateAge = resp?.state_age_seconds;
+                sidecarError = resp?.last_error;
+            }
+        }
+        catch (Exception ex)
+        {
+            sidecarError = "sidecar unreachable: " + ex.Message;
+            health = null;
+        }
+        polledOnce = true;
+        StateHasChanged();
+    }
+
+    private string LinkLabel => health switch
+    {
+        null => "bridge down",
+        { rssi: int r } => $"BLE {r} dBm",
+        _ => "BLE",
+    };
+
+    private string LinkBadgeClass => health switch
+    {
+        null => "text-bg-danger",
+        { proxy_connected: false } => "text-bg-danger",
+        { connected: false } => "text-bg-secondary",
+        _ => "text-bg-primary",
+    };
+
+    /// <summary>
+    /// One line explaining why data may be stale: "proxy down" (fix the
+    /// ESP32) versus "grill not heard" (unplugged / out of range).
+    /// </summary>
+    private string? LinkProblem
+    {
+        get
+        {
+            if (health is null) return sidecarError ?? "sidecar unreachable";
+            if (!health.proxy_connected)
+                return "ESP32 proxy unreachable — check its power/WiFi";
+            if (!health.connected)
+                return "grill not heard by the proxy — unplugged or out of range?";
+            return sidecarError;
+        }
+    }
+
+    private void PowerOn() => ClickPower("power_on");
+    private void PowerOff() => ClickPower("power_off");
+    private Task ToggleLight() => Send(live?.lightState == true ? "light_off" : "light_on");
+    private Task TogglePrime() => Send(live?.primeState == true ? "prime_off" : "prime_on");
+
+    private void ClickPower(string action)
+    {
+        if (confirmFor != action)
+        {
+            confirmFor = action;
+            actionFailed = false;
+            actionMessage = action == "power_on"
+                ? "Power On ignites the grill. Click again to confirm."
+                : "Click again to confirm Power Off.";
+            confirmTimer?.Dispose();
+            confirmTimer = new System.Threading.Timer(_ =>
+            {
+                confirmFor = null;
+                actionMessage = null;
+                _ = InvokeAsync(StateHasChanged);
+            }, null, TimeSpan.FromSeconds(8), Timeout.InfiniteTimeSpan);
+            return;
+        }
+        confirmFor = null;
+        actionMessage = null;
+        _ = Send(action);
+    }
+
+    private async Task SetTemp()
+    {
+        if (!int.TryParse(setTemp, out var t))
+        {
+            actionMessage = "Enter a temperature first.";
+            actionFailed = true;
+            return;
+        }
+        await Send("set_temp", t);
+    }
+
+    private async Task Send(string action, double? value = null)
+    {
+        actionBusy = true;
+        actionMessage = null;
+        actionFailed = false;
+        try
+        {
+            var r = await Rpc.SendCommandAsync(action, value, confirm: true);
+            actionMessage = r.ok ? "Command accepted." : r.error;
+            actionFailed = !r.ok;
+            await PollSidecar();
+        }
+        catch (Exception ex)
+        {
+            actionMessage = "sidecar error: " + ex.Message;
+            actionFailed = true;
+        }
+        finally
+        {
+            actionBusy = false;
+        }
+    }
+
+    private static IEnumerable<KeyValuePair<int, double?>> Probes(SidecarState s)
+    {
+        if (s.p1Temp is not null) yield return new(1, s.p1Temp);
+        if (s.p2Temp is not null) yield return new(2, s.p2Temp);
+        if (s.p3Temp is not null) yield return new(3, s.p3Temp);
+        if (s.p4Temp is not null) yield return new(4, s.p4Temp);
+    }
+
+    private IEnumerable<KeyValuePair<int, double?>> ModelProbes(SidecarState s) =>
+        Probes(s).Where(p => p.Key <= (info?.meat_probes is > 0 ? info.meat_probes : 4));
+
+    private static string OnOff(bool b) => b ? "on" : "off";
+
+    private static bool AnyError(SidecarState s) =>
+        s.err1 || s.err2 || s.err3 || s.highTempErr
+        || s.fanErr || s.hotErr || s.motorErr || s.erL;
+
+    private static string Fmt(double? v) =>
+        v is null ? "—" : v.Value.ToString("0.#");
+
+    private static string FirmwareText(System.Text.Json.JsonElement fw) =>
+        fw.ValueKind == System.Text.Json.JsonValueKind.Object
+        && fw.TryGetProperty("firmwareVersion", out var v)
+            ? v.ToString()
+            : fw.ToString();
+
+    public void Dispose()
+    {
+        pollTimer?.Dispose();
+        confirmTimer?.Dispose();
+    }
+}

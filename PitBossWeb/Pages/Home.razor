@@ -1,0 +1,145 @@
+@page "/"
+@inject GrillRpcService Rpc
+@inject NavigationManager Nav
+@implements IDisposable
+
+<PageTitle>Pit Boss — Grill</PageTitle>
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h3 class="mb-0">Grill <span class="text-muted small">via Bluetooth bridge</span></h3>
+    <div>
+        <button class="btn btn-outline-secondary btn-sm" @onclick="() => setupOpen = true">Pit Boss account…</button>
+        <a class="btn btn-outline-secondary btn-sm ms-1" href="/health">Bridge health</a>
+    </div>
+</div>
+
+@if (health is null)
+{
+    <div class="alert alert-secondary py-2 mb-4">
+        Grill bridge not reachable at 127.0.0.1:8091 — start
+        <code>.venv312\Scripts\python.exe scripts\grill_sidecar.py</code>.
+        <button class="btn btn-sm btn-outline-secondary ms-2" @onclick="PollSidecar">Retry</button>
+    </div>
+}
+else if (!health.configured)
+{
+    <div class="card pb-card p-4 mb-4">
+        <h5>One-time setup</h5>
+        <p class="mb-3">
+            The bridge is running and can see the ESP32 proxy, but it does not have the
+            grill's password yet. Sign in to your Pit Boss account once to fetch it.
+        </p>
+        <div><button class="btn btn-primary" @onclick="() => setupOpen = true">Fetch grill password</button></div>
+    </div>
+}
+else if (info is not null)
+{
+    <div class="row g-3 mb-4">
+        <div class="col-12 col-md-6 col-xl-4">
+            <div class="card pb-card h-100" role="button" @onclick="OpenGrill">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between">
+                        <h5 class="card-title">@info.model</h5>
+                        <span class="badge @LinkBadge">@LinkLabel</span>
+                    </div>
+                    <div class="small mb-2 text-muted">
+                        @info.board_id
+                        <span>· BLE @Dbm(health.rssi) · WiFi @Dbm(health.proxy_wifi_rssi)</span>
+                    </div>
+                    @if (live is not null)
+                    {
+                        <div class="row text-center pb-temps">
+                            <div class="col">
+                                <div class="pb-big">@Fmt(live.grillTemp)°</div>
+                                <div class="text-muted small">Grill</div>
+                            </div>
+                            <div class="col">
+                                <div class="pb-big">@Fmt(live.grillSetTemp)°</div>
+                                <div class="text-muted small">Set</div>
+                            </div>
+                            <div class="col">
+                                <span class="badge @(live.moduleIsOn ? "text-bg-success" : "text-bg-secondary") mt-2">
+                                    @(live.moduleIsOn ? "on" : "off")
+                                </span>
+                                <div class="text-muted small mt-1">Controller</div>
+                            </div>
+                        </div>
+                    }
+                    else
+                    {
+                        <p class="text-muted small mb-0">@(health.last_error ?? "No state yet.")</p>
+                    }
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+<SetupDialog @bind-Open="setupOpen" CurrentModel="@info?.model" OnConfigured="PollSidecar" />
+
+@code {
+    private System.Threading.Timer? localPoll;
+    private SidecarState? live;
+    private SidecarInfoResponse? info;
+    private SidecarHealthResponse? health;
+    private bool setupOpen;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await PollSidecar();
+        localPoll = new System.Threading.Timer(_ => _ = InvokeAsync(PollSidecar),
+            null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+    }
+
+    private void OpenGrill() => Nav.NavigateTo("/grill");
+
+    private string LinkLabel => health switch
+    {
+        null => "bridge down",
+        { proxy_connected: false } => "proxy down",
+        { connected: false } => "not connected",
+        { rssi: int r } => $"BLE {r} dBm",
+        _ => "BLE",
+    };
+
+    private string LinkBadge => health switch
+    {
+        null => "text-bg-danger",
+        { proxy_connected: false } => "text-bg-danger",
+        { connected: false } => "text-bg-secondary",
+        _ => "text-bg-primary",
+    };
+
+    private async Task PollSidecar()
+    {
+        try
+        {
+            health = await Rpc.GetHealthAsync();
+            if (health?.configured == true)
+            {
+                live = (await Rpc.GetStateAsync())?.state;
+                info ??= await Rpc.GetInfoAsync();
+            }
+            else
+            {
+                live = null;
+                info = null;
+            }
+        }
+        catch
+        {
+            // sidecar not running — the page shows the start hint
+            live = null;
+            health = null;
+            info = null;
+        }
+        StateHasChanged();
+    }
+
+    private static string Fmt(double? v) =>
+        v is null ? "—" : v.Value.ToString("0.#");
+
+    private static string Dbm(int? v) => v is int d ? $"{d} dBm" : "—";
+
+    public void Dispose() => localPoll?.Dispose();
+}

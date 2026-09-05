@@ -1,0 +1,22 @@
+# Secrets — never commit
+scripts/.grill_env
+esphome/secrets.yaml
+
+# ESPHome build output (contains the compiled WiFi credentials)
+esphome/.esphome/
+
+# Python
+.venv/
+.venv312/
+__pycache__/
+*.pyc
+
+# .NET
+PitBossWeb/bin/
+PitBossWeb/obj/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

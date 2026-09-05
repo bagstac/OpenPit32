@@ -1,0 +1,14 @@
+# Copy to scripts/.grill_env (git-ignored). KEY=value, no quotes.
+
+# ESP32 running esphome/grill-proxy.yaml — its LAN IP (mDNS is unreliable on
+# Windows) and the api.encryption.key from esphome/secrets.yaml.
+GRILL_PROXY_HOST=192.168.1.x
+GRILL_PROXY_KEY=base64-noise-key-from-esphome-secrets
+#GRILL_PROXY_PORT=6053
+
+# Filled in by the web UI's "Pit Boss account" dialog (or
+# scripts/pitboss_cloud.py). You can also enter them by hand: the board id is
+# the name the grill advertises over Bluetooth ("PBV2-" + 12 hex digits).
+#GRILL_BOARD_ID=PBV2-XXXXXXXXXXXX
+#GRILL_PASSWORD=
+#GRILL_MODEL=PBV5 P2

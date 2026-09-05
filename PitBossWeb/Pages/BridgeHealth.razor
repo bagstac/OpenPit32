@@ -1,0 +1,129 @@
+@page "/health"
+@inject Services.GrillRpcService Rpc
+@implements IDisposable
+
+<PageTitle>Bridge Health — Pit Boss Web</PageTitle>
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h3 class="mb-0">Bridge Health <span class="text-muted small">grill sidecar · 127.0.0.1:8091</span></h3>
+    <div>
+        <a class="btn btn-outline-secondary btn-sm" href="@Rpc.HealthUrl" target="_blank" rel="noopener">raw /health ↗</a>
+        <a class="btn btn-outline-secondary btn-sm ms-1" href="/">Back</a>
+    </div>
+</div>
+
+<div class="card pb-card">
+    <div class="card-body">
+        @if (health is null)
+        {
+            <p class="text-danger mb-0">
+                Sidecar unreachable — start
+                <code>.venv312\Scripts\python.exe scripts\grill_sidecar.py</code>.
+            </p>
+        }
+        else
+        {
+            <div class="row g-3">
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">Setup</div>
+                    <span class="@(health.configured ? "text-success" : "text-warning")">
+                        @(health.configured ? "grill password saved" : "not set up")
+                    </span>
+                </div>
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">Grill link (BLE)</div>
+                    <span class="@(health.connected ? "text-success" : "text-danger")">
+                        @(health.connected ? "connected" : "not connected")
+                    </span>
+                </div>
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">ESP32 ↔ grill (BLE)</div>
+                    <span class="pb-big-sm @RssiClass(health.rssi, -80, -90)">@Dbm(health.rssi)</span>
+                </div>
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">ESP32 ↔ router (WiFi)</div>
+                    <span class="pb-big-sm @RssiClass(health.proxy_wifi_rssi, -70, -80)">@Dbm(health.proxy_wifi_rssi)</span>
+                </div>
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">Proxy</div>
+                    <span class="@(health.proxy_connected ? "text-success" : "text-danger")">
+                        @(health.proxy_connected ? "up" : "down")
+                    </span>
+                    @if (health.proxy_host is not null)
+                    {
+                        <span class="text-muted">· @health.proxy_host</span>
+                    }
+                </div>
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">Proxy uptime</div>
+                    @(health.proxy_uptime_seconds is long up ? Uptime(up) : "—")
+                </div>
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">State age</div>
+                    @(health.state_age_seconds is double a ? $"{a:0.#} s" : "—")
+                </div>
+                <div class="col-6 col-md-3">
+                    <div class="text-muted small">Last checked</div>
+                    @lastPoll.ToString("HH:mm:ss")
+                </div>
+                @if (!string.IsNullOrEmpty(health.last_error))
+                {
+                    <div class="col-12">
+                        <div class="alert alert-warning py-2 mb-0">@health.last_error</div>
+                    </div>
+                }
+            </div>
+            <hr />
+            <p class="text-muted small mb-0">
+                <strong>BLE</strong> is measured by the ESP32 on the grill's advertisements, which
+                the grill only sends while not connected — so it refreshes between
+                connections, not continuously. Above −80 dBm is comfortable; below −85
+                expect drops. Move the ESP32 to face the controller panel, clear of metal.
+                <strong>WiFi</strong> is the ESP32's own signal to the router (30 s cadence);
+                above −70 dBm is fine.
+            </p>
+        }
+    </div>
+</div>
+
+@code {
+    private Services.SidecarHealthResponse? health;
+    private DateTime lastPoll;
+    private System.Threading.Timer? pollTimer;
+
+    protected override void OnInitialized()
+    {
+        pollTimer = new System.Threading.Timer(_ => _ = InvokeAsync(Poll),
+            null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
+    }
+
+    private async Task Poll()
+    {
+        try { health = await Rpc.GetHealthAsync(); }
+        catch { health = null; }
+        lastPoll = DateTime.Now;
+        StateHasChanged();
+    }
+
+    private static string Dbm(int? v) => v is int d ? $"{d} dBm" : "—";
+
+    /// <summary>Colour a signal reading: good above <paramref name="warn"/>,
+    /// amber down to <paramref name="bad"/>, red below.</summary>
+    private static string RssiClass(int? v, int warn, int bad) => v switch
+    {
+        null => "text-muted",
+        int d when d >= warn => "text-success",
+        int d when d >= bad => "text-warning",
+        _ => "text-danger fw-bold",
+    };
+
+    private static string Uptime(long s) => s switch
+    {
+        < 60 => $"{s}s",
+        < 3600 => $"{s / 60}m",
+        < 86400 => $"{s / 3600}h {s % 3600 / 60}m",
+        _ => $"{s / 86400}d {s % 86400 / 3600}h",
+    };
+
+    public void Dispose() => pollTimer?.Dispose();
+}

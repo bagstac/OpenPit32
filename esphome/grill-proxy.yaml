@@ -1,0 +1,82 @@
+# ESPHome Bluetooth proxy that sits next to the Pit Boss grill.
+#
+# Role: pure BLE radio. The PC-side sidecar (scripts/grill_sidecar.py) connects
+# to this device over TCP (ESPHome native API, port 6053) via bleak-esphome and
+# drives pytboss's BleConnection through it. No grill logic lives here.
+#
+# Hardware: classic ESP32-D0WD-V3 dev board, CP2102 USB-UART, 4 MB flash.
+# Its auto-reset circuit does not enter download mode by itself: hold BOOT,
+# tap EN, release BOOT, then flash with --before no-reset (see below).
+# First flash over USB:
+#   .venv\Scripts\esphome compile esphome\grill-proxy.yaml
+#   .venv\Scripts\python -m esptool --port COM4 --before no-reset --baud 460800 \
+#       write-flash 0x0 esphome\.esphome\build\grill-proxy\.pioenvs\grill-proxy\firmware.factory.bin
+# Later flashes go OTA once it is on WiFi (esphome run ... picks OTA).
+#
+# (An ESP32-C3 was tried first; it had a WiFi hardware fault. For a C3 use
+#  board: esp32-c3-devkitm-1 — the rest of this file is unchanged.)
+#
+# Secrets live in esphome/secrets.yaml (never committed, never printed).
+
+esphome:
+  name: grill-proxy
+  friendly_name: Grill BLE Proxy
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Never let the grill WiFi drop us into captive-portal mode; just retry.
+  reboot_timeout: 15min
+
+# Native API for bleak-esphome. Encryption key is the noise PSK the sidecar
+# must present (GRILL_PROXY_KEY in scripts/.grill_env).
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+  level: INFO
+
+esp32_ble_tracker:
+  scan_parameters:
+    # Active scanning gets the grill's full name in the scan response.
+    active: true
+    # Continuous scanning so the sidecar's find_grill() sees an
+    # advertisement quickly after a reconnect.
+    continuous: true
+  # Step 1 of plan.md Phase 5: log the grill's RSSI whenever it is heard so
+  # the board can be positioned before the sidecar is touched. Matched by
+  # advertised name (prefix "PBV2-") rather than MAC, which may rotate.
+  on_ble_advertise:
+    - then:
+        - lambda: |-
+            if (x.get_name().rfind("PBV2-", 0) == 0) {
+              ESP_LOGI("grill", "%s rssi=%d dBm addr=%s",
+                       x.get_name().c_str(), x.get_rssi(),
+                       x.address_str().c_str());
+            }
+
+bluetooth_proxy:
+  active: true
+
+# Telemetry for the sidecar's /health (esphome_ble.TelemetryProxyManager
+# subscribes to these over the same API session). object_id is what the
+# sidecar keys on — keep it stable.
+sensor:
+  - platform: wifi_signal
+    name: WiFi Signal
+    id: wifi_signal_db
+    update_interval: 30s
+  - platform: uptime
+    name: Uptime
+    id: uptime_s
+    update_interval: 60s

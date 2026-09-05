@@ -1,0 +1,180 @@
+@inject GrillRpcService Rpc
+
+@*
+    One-time setup: fetch the grill's Bluetooth password from the user's
+    Pit Boss account. The credentials go to the local sidecar, which logs in
+    once, stores only the grill's board id / password / model in
+    scripts/.grill_env, and discards the account token. Nothing is kept in
+    the browser.
+*@
+@if (Open)
+{
+    <div class="modal d-block" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="setupTitle">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content pb-card">
+                <EditForm Model="form" OnValidSubmit="Submit">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="setupTitle">Fetch grill password from Pit Boss account</h5>
+                        <button type="button" class="btn-close btn-close-white" aria-label="Close"
+                                disabled="@busy" @onclick="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p class="small text-muted">
+                            Commands to the grill must carry the password the Pit Boss app set when
+                            the grill was paired. It is stored on your account, so sign in once here:
+                            the local bridge logs in, saves the grill's password to
+                            <code>scripts/.grill_env</code>, and forgets your account login.
+                            Nothing is stored in this browser.
+                        </p>
+                        <div class="mb-3">
+                            <label class="form-label" for="setupEmail">Pit Boss account email</label>
+                            <InputText id="setupEmail" class="form-control" type="email" autocomplete="username"
+                                       @bind-Value="form.Email" />
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="setupPassword">Account password</label>
+                            <InputText id="setupPassword" class="form-control" type="password"
+                                       autocomplete="current-password" @bind-Value="form.Password" />
+                        </div>
+                        <div class="row g-2">
+                            <div class="col-4">
+                                <label class="form-label" for="setupCountry">Country</label>
+                                <InputText id="setupCountry" class="form-control" maxlength="2"
+                                           @bind-Value="form.Country" />
+                                <div class="form-text">2-letter code the account was created with.</div>
+                            </div>
+                            <div class="col-8">
+                                <label class="form-label" for="setupModel">Grill model</label>
+                                <InputSelect id="setupModel" class="form-select" @bind-Value="form.Model">
+                                    @foreach (var m in models)
+                                    {
+                                        <option value="@m">@m</option>
+                                    }
+                                </InputSelect>
+                                <div class="form-text">Determines setpoints, probes and lights (from pytboss).</div>
+                            </div>
+                        </div>
+                        @if (choices is not null)
+                        {
+                            <div class="mt-3">
+                                <label class="form-label" for="setupGrill">Which grill?</label>
+                                <InputSelect id="setupGrill" class="form-select" @bind-Value="form.GrillId">
+                                    @foreach (var g in choices)
+                                    {
+                                        <option value="@g.grill_id">
+                                            @(g.nickname ?? "(no nickname)") — @g.board_id@(g.has_password ? "" : " (not paired yet)")
+                                        </option>
+                                    }
+                                </InputSelect>
+                            </div>
+                        }
+                        @if (!string.IsNullOrEmpty(error))
+                        {
+                            <div class="alert alert-danger py-2 mt-3 mb-0">@error</div>
+                        }
+                        @if (!string.IsNullOrEmpty(success))
+                        {
+                            <div class="alert alert-success py-2 mt-3 mb-0">@success</div>
+                        }
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-outline-secondary" disabled="@busy" @onclick="Close">
+                            @(success is null ? "Cancel" : "Close")
+                        </button>
+                        @if (success is null)
+                        {
+                            <button type="submit" class="btn btn-primary" disabled="@busy">
+                                @(busy ? "Signing in…" : choices is null ? "Fetch password" : "Use this grill")
+                            </button>
+                        }
+                    </div>
+                </EditForm>
+            </div>
+        </div>
+    </div>
+    <div class="modal-backdrop show"></div>
+}
+
+@code {
+    [Parameter] public bool Open { get; set; }
+    [Parameter] public EventCallback<bool> OpenChanged { get; set; }
+    /// <summary>Raised after a successful setup so the page can refresh.</summary>
+    [Parameter] public EventCallback OnConfigured { get; set; }
+    /// <summary>Pre-selected model (the sidecar's current one), if any.</summary>
+    [Parameter] public string? CurrentModel { get; set; }
+
+    private sealed class Form
+    {
+        public string Email { get; set; } = "";
+        public string Password { get; set; } = "";
+        public string Country { get; set; } = "US";
+        public string? Model { get; set; }
+        public int? GrillId { get; set; }
+    }
+
+    private readonly Form form = new();
+    private List<string> models = new();
+    private List<SidecarGrillChoice>? choices;
+    private string? error;
+    private string? success;
+    private bool busy;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (Open && models.Count == 0)
+        {
+            try
+            {
+                var m = await Rpc.GetModelsAsync();
+                models = m?.models ?? new();
+                form.Model ??= CurrentModel ?? m?.@default ?? models.FirstOrDefault();
+            }
+            catch { models = new(); }
+        }
+    }
+
+    private async Task Submit()
+    {
+        busy = true;
+        error = null;
+        try
+        {
+            var r = await Rpc.SetupAsync(form.Email.Trim(), form.Password,
+                form.Country.Trim().ToUpperInvariant(), form.Model, form.GrillId);
+            if (r.ok)
+            {
+                form.Password = "";
+                success = $"Saved the password for {r.board_id}"
+                    + (r.nickname is null ? "" : $" (“{r.nickname}”)")
+                    + (r.connected ? " — connected." : " — connecting…");
+                await OnConfigured.InvokeAsync();
+            }
+            else if (r.grills is { Count: > 0 })
+            {
+                choices = r.grills;
+                form.GrillId ??= r.grills.FirstOrDefault(g => g.has_password)?.grill_id
+                                 ?? r.grills[0].grill_id;
+            }
+            else
+            {
+                error = r.error ?? "setup failed";
+            }
+        }
+        catch (Exception ex)
+        {
+            error = "bridge error: " + ex.Message;
+        }
+        finally
+        {
+            busy = false;
+        }
+    }
+
+    private async Task Close()
+    {
+        form.Password = "";
+        error = success = null;
+        choices = null;
+        await OpenChanged.InvokeAsync(false);
+    }
+}
