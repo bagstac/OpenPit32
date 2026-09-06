@@ -12,7 +12,11 @@
     </div>
 </div>
 
-@if (health is null)
+@if (health is null && !polledOnce)
+{
+    <p class="text-muted">Connecting to the grill bridge…</p>
+}
+else if (health is null)
 {
     <div class="alert alert-secondary py-2 mb-4">
         Grill bridge not reachable. If it's running (start it locally with
@@ -80,6 +84,7 @@ else if (info is not null)
     private SidecarInfoResponse? info;
     private SidecarHealthResponse? health;
     private bool setupOpen;
+    private bool polledOnce;
 
     protected override async Task OnInitializedAsync()
     {
@@ -134,6 +139,7 @@ else if (info is not null)
             health = null;
             info = null;
         }
+        polledOnce = true;
         StateHasChanged();
     }
 
