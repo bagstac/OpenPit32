@@ -4,12 +4,10 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 COPY OpenPit32/ ./OpenPit32/
 WORKDIR /src/OpenPit32
-RUN dotnet publish -c Release -o /app/publish
-# Route the app's API calls through nginx's own /api/ reverse proxy (see
-# docker/nginx.conf) instead of the local-dev default of a separate port on
-# the same host — Program.cs falls back to that default when this file is
-# absent, which is the case for a plain `dotnet run`.
-RUN echo '{"SidecarBaseUrl": "/api/"}' > /app/publish/wwwroot/appsettings.json
+# DOCKER_DEPLOY makes Program.cs route API calls through nginx's own /api/
+# reverse proxy (docker/nginx.conf) instead of the local-dev default of a
+# separate port on the same host.
+RUN dotnet publish -c Release -o /app/publish -p:DefineConstants=DOCKER_DEPLOY
 
 FROM nginx:alpine
 COPY --from=build /app/publish/wwwroot /usr/share/nginx/html
