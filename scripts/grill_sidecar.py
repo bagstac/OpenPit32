@@ -29,6 +29,12 @@ Configuration: scripts/.grill_env (git-ignored), keys GRILL_PROXY_HOST,
 GRILL_PROXY_KEY, GRILL_PROXY_PORT, GRILL_BOARD_ID, GRILL_PASSWORD, GRILL_MODEL.
 Environment variables of the same names override it. The grill password is
 never printed or logged.
+
+Deployment: GRILL_SIDECAR_HOST binds the HTTP server (default
+127.0.0.1; set to 0.0.0.0 in a container). GRILL_ENV_PATH points
+scripts/pitboss_cloud.py at a mounted volume instead of a path
+next to this script, so a password fetched via /setup survives a
+container restart. See docker/ and docker-compose.yml.
 """
 
 from __future__ import annotations
@@ -509,9 +515,10 @@ async def main():
     app = make_app(bridge)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", args.port)
+    bind_host = os.environ.get("GRILL_SIDECAR_HOST", "127.0.0.1")
+    site = web.TCPSite(runner, bind_host, args.port)
     await site.start()
-    print(f"grill sidecar listening on http://127.0.0.1:{args.port} "
+    print(f"grill sidecar listening on http://{bind_host}:{args.port} "
           f"(proxy {proxy_host}; {status})")
     try:
         await asyncio.Event().wait()

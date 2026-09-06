@@ -93,6 +93,12 @@ nothing. (Command line alternative: `scripts/pitboss_cloud.py` with
 From then on: the Home card shows live temps; **Status & controls** is the
 grill page; **Bridge health** shows the BLE and WiFi links.
 
+### Or with Docker
+
+docker-compose.yml runs the sidecar and web app as two containers
+on one host (skip the venvs/`.NET SDK` above). See
+[docker/README.md](docker/README.md).
+
 ## Sidecar HTTP API
 
 | Method | Path | Purpose |
@@ -104,7 +110,8 @@ grill page; **Bridge health** shows the BLE and WiFi links.
 | POST | `/command` | `{"action": "set_temp", "value": 225}` · `power_on` / `power_off` need `"confirm": true` · `prime_on/off`, `light_on/off`, `set_probe` |
 | POST | `/setup` | `{"email","password","country"?,"grill_id"?,"model"?}` — one-time password fetch |
 
-Binds to 127.0.0.1 only; CORS is allowed for `http://localhost:*`.
+Binds to 127.0.0.1 by default (`GRILL_SIDECAR_HOST` to change it); CORS is
+allowed for `http://localhost:*` plus whatever `GRILL_SIDECAR_ORIGINS` lists.
 
 ## Safety
 

@@ -1,0 +1,45 @@
+# OpenPit32: local, cloud-free Pit Boss grill control over Bluetooth LE.
+# See README.md for the full picture; docker/README.md for deploying this.
+#
+# Configure via a .env file next to this one (copy docker/.env.example) —
+# at minimum GRILL_PROXY_HOST / GRILL_PROXY_KEY (the ESP32 proxy) and
+# HOST_IP (this machine's LAN address, so the browser and the sidecar's
+# CORS allowlist agree on the web app's origin).
+#
+#   docker compose up -d --build
+#
+# The grill password itself is NOT set here: leave GRILL_BOARD_ID /
+# GRILL_PASSWORD unset and use the web app's "Pit Boss account" dialog once
+# it's running — it calls the sidecar's /setup, which saves them into the
+# grill-data volume.
+
+services:
+  sidecar:
+    build:
+      context: .
+      dockerfile: docker/sidecar.Dockerfile
+    ports:
+      - "8091:8091"
+    environment:
+      GRILL_PROXY_HOST: ${GRILL_PROXY_HOST}
+      GRILL_PROXY_KEY: ${GRILL_PROXY_KEY}
+      GRILL_PROXY_PORT: ${GRILL_PROXY_PORT:-6053}
+      GRILL_BOARD_ID: ${GRILL_BOARD_ID:-}
+      GRILL_PASSWORD: ${GRILL_PASSWORD:-}
+      GRILL_MODEL: ${GRILL_MODEL:-PBV5 P2}
+      # Must match the origin the browser loads the web app from.
+      GRILL_SIDECAR_ORIGINS: http://${HOST_IP}:${WEB_PORT:-5219}
+    volumes:
+      - grill-data:/data
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    ports:
+      - "${WEB_PORT:-5219}:80"
+    restart: unless-stopped
+
+volumes:
+  grill-data:

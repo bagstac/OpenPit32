@@ -31,7 +31,11 @@ import urllib.request
 from pathlib import Path
 
 BASE = "https://api-prod.dansonscorp.com/api/v1"
-ENV_PATH = Path(__file__).resolve().parent / ".grill_env"
+# GRILL_ENV_PATH lets a container point this at a mounted volume
+# (e.g. /data/.grill_env) so a password fetched via /setup survives
+# a container restart; unset, it sits next to this script as before.
+ENV_PATH = Path(os.environ.get("GRILL_ENV_PATH") or
+                (Path(__file__).resolve().parent / ".grill_env"))
 BOARD_PREFIX = "PBV2"  # the board generation this project has been tested on
 
 

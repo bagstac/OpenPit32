@@ -1,5 +1,6 @@
 # Secrets — never commit
 scripts/.grill_env
+.env
 esphome/secrets.yaml
 
 # ESPHome build output (contains the compiled WiFi credentials)
