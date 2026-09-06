@@ -1,7 +1,7 @@
 using System.Net.Http.Json;
 using System.Text.Json;
 
-namespace PitBossWeb.Services;
+namespace OpenPit32.Services;
 
 /// <summary>Decoded grill state served by scripts/grill_sidecar.py (/state).</summary>
 public class SidecarState

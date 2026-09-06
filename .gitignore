@@ -12,8 +12,8 @@ __pycache__/
 *.pyc
 
 # .NET
-PitBossWeb/bin/
-PitBossWeb/obj/
+OpenPit32/bin/
+OpenPit32/obj/
 
 # Editors / OS
 .vscode/

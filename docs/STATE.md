@@ -1,4 +1,4 @@
-# PitBossAlarms — Session Handoff / Current State
+# OpenPit32 — Session Handoff / Current State
 
 Read this first, then PLAN.md (history) and PROTOCOL.md (protocol facts).
 The README at the repo root is the user-facing setup guide.
@@ -27,7 +27,7 @@ to fetch the grill's Bluetooth password.
    print/read it into chat): GRILL_PROXY_HOST/KEY required; GRILL_BOARD_ID /
    GRILL_PASSWORD / GRILL_MODEL filled in by /setup. Starts fine without
    them (`configured: false`).
-2. Web app: `dotnet run --project PitBossWeb\PitBossWeb.csproj --urls http://localhost:5219`
+2. Web app: `dotnet run --project OpenPit32\OpenPit32.csproj --urls http://localhost:5219`
 3. Open http://localhost:5219. First run: "Fetch grill password" → the dialog
    posts the Pit Boss account email/password to the sidecar's /setup, which
    logs in once, saves board id + password + model to .grill_env and
@@ -35,7 +35,7 @@ to fetch the grill's Bluetooth password.
    /health (link diagnostics).
 
 ## Architecture
-PitBossWeb (Blazor WASM) → GrillRpcService (typed HttpClient) → sidecar
+OpenPit32 (Blazor WASM) → GrillRpcService (typed HttpClient) → sidecar
 (aiohttp) → pytboss `PitBoss(BleConnection)` → habluetooth / bleak-esphome →
 ESPHome native API (TCP 6053, noise-encrypted) → ESP32 `bluetooth_proxy` →
 grill GATT (Mongoose OS RPC service).
@@ -94,7 +94,7 @@ grill GATT (Mongoose OS RPC service).
   proxy_scan.py (what the ESP32 hears), ble_probe.py (RPC smoke test),
   ble_scan.py (PC adapter scan), .grill_env.example.
 - esphome/: grill-proxy.yaml, secrets.yaml.example.
-- PitBossWeb/: Pages (Home, GrillDetail `/grill`, BridgeHealth `/health`),
+- OpenPit32/: Pages (Home, GrillDetail `/grill`, BridgeHealth `/health`),
   Layout (MainLayout, NavMenu, SetupDialog), Services/GrillRpcService.cs.
 - docs/: STATE.md (this), PLAN.md (history), PROTOCOL.md.
 - requirements.txt (runtime, .venv312), requirements-esphome.txt (tooling, .venv).

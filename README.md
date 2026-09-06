@@ -1,4 +1,4 @@
-# PitBossAlarms
+# OpenPit32
 
 Local, cloud-free control of a Pit Boss pellet grill over Bluetooth LE, from
 a small web app on your PC, via an ESP32 sitting next to the grill.
@@ -17,7 +17,7 @@ that makes fire — see [Safety](#safety).
 ## How it works
 
 ```
-Browser ──> PitBossWeb (Blazor WebAssembly, localhost:5219)
+Browser ──> OpenPit32 (Blazor WebAssembly, localhost:5219)
                │  HTTP/JSON
                ▼
          grill_sidecar.py (aiohttp, 127.0.0.1:8091)
@@ -80,7 +80,7 @@ RSSI and flags the grill. Aim for better than −80 dBm.
 Requires the [.NET 10 SDK](https://dotnet.microsoft.com/download).
 
 ```
-dotnet run --project PitBossWeb\PitBossWeb.csproj --urls http://localhost:5219
+dotnet run --project OpenPit32\OpenPit32.csproj --urls http://localhost:5219
 ```
 
 Open http://localhost:5219. On first run click **Fetch grill password**: the

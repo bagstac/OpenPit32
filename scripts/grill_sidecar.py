@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local bridge: Pit Boss grill over BLE (via an ESP32 proxy) <-> localhost HTTP.
 
-The web UI (PitBossWeb, Blazor WebAssembly) cannot speak Bluetooth, so this
+The web UI (OpenPit32, Blazor WebAssembly) cannot speak Bluetooth, so this
 sidecar holds one pytboss PitBoss session to the grill and exposes it on
 http://127.0.0.1:8091 with CORS for the local web app:
 
