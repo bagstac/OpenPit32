@@ -55,7 +55,7 @@ else
                     }
                 </span>
                 <span class="badge @(live.moduleIsOn ? "text-bg-success" : "text-bg-secondary") ms-2">
-                    Controller @(live.moduleIsOn ? "on" : "off")
+                    Power @(live.moduleIsOn ? "on" : "off")
                 </span>
                 <span class="badge @LinkBadgeClass ms-1" title="Bluetooth LE through the ESP32 proxy — works with the controller off">@LinkLabel</span>
                 @if (!string.IsNullOrEmpty(LinkProblem))
