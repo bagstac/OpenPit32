@@ -23,6 +23,8 @@ var configuredBase = builder.Configuration["SidecarBaseUrl"];
 var sidecarBase = string.IsNullOrWhiteSpace(configuredBase)
     ? new Uri($"http://{new Uri(builder.HostEnvironment.BaseAddress).Host}:8091")
     : new Uri(new Uri(builder.HostEnvironment.BaseAddress), configuredBase);
-builder.Services.AddHttpClient<GrillRpcService>(client => client.BaseAddress = sidecarBase);
+builder.Services.AddTransient<IncludeCredentialsHandler>();
+builder.Services.AddHttpClient<GrillRpcService>(client => client.BaseAddress = sidecarBase)
+    .AddHttpMessageHandler<IncludeCredentialsHandler>();
 
 await builder.Build().RunAsync();

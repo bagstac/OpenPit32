@@ -15,8 +15,10 @@
 @if (health is null)
 {
     <div class="alert alert-secondary py-2 mb-4">
-        Grill bridge not reachable at 127.0.0.1:8091 — start
-        <code>.venv312\Scripts\python.exe scripts\grill_sidecar.py</code>.
+        Grill bridge not reachable. If it's running (start it locally with
+        <code>.venv312\Scripts\python.exe scripts\grill_sidecar.py</code> — for a
+        Docker deployment check the containers instead), check the browser console
+        for the actual error.
         <button class="btn btn-sm btn-outline-secondary ms-2" @onclick="PollSidecar">Retry</button>
     </div>
 }
@@ -121,9 +123,13 @@ else if (info is not null)
                 info = null;
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // sidecar not running — the page shows the start hint
+            // Logged rather than shown in the banner — the banner's fixed
+            // "start .venv312..." wording is only accurate for local dev;
+            // check the browser console for what actually failed (network
+            // error vs. a non-2xx response vs. something else).
+            Console.WriteLine($"[PollSidecar] {ex.GetType().Name}: {ex.Message}");
             live = null;
             health = null;
             info = null;
