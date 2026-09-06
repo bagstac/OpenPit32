@@ -2,6 +2,7 @@
 scripts/.grill_env
 .env
 esphome/secrets.yaml
+docker/.htpasswd
 
 # ESPHome build output (contains the compiled WiFi credentials)
 esphome/.esphome/

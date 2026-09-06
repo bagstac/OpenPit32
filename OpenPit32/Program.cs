@@ -8,14 +8,21 @@ builder.RootComponents.Add<App>("#app");
 builder.RootComponents.Add<HeadOutlet>("head::after");
 
 // The only backend is the sidecar (scripts/grill_sidecar.py), which holds
-// the Bluetooth session and the grill password. It always runs on the same
-// host as this page — 127.0.0.1 for local dev, a LAN host once deployed
-// (docker-compose.yml runs both containers on one host) — just a fixed
-// different port, so the sidecar address is derived from the page's own
-// host rather than hardcoded. Cross-origin because the ports differ; the
-// sidecar's CORS allowlist (GRILL_SIDECAR_ORIGINS) must include this origin.
-var pageHost = new Uri(builder.HostEnvironment.BaseAddress).Host;
-builder.Services.AddHttpClient<GrillRpcService>(client =>
-    client.BaseAddress = new Uri($"http://{pageHost}:8091"));
+// the Bluetooth session and the grill password. Where it's reachable
+// depends on how this page is served:
+//   - Docker (docker/web.Dockerfile writes wwwroot/appsettings.json with
+//     "SidecarBaseUrl": "/api/"): nginx reverse-proxies /api/ to the sidecar
+//     container on the same origin — needed so a single hostname (and a
+//     single Cloudflare Tunnel / Basic Auth challenge) covers both, and
+//     avoids CORS entirely.
+//   - Local dev (`dotnet run`, no appsettings.json): falls back to the
+//     sidecar's fixed port on the page's own host, e.g. http://localhost:8091
+//     — cross-origin, so the sidecar's CORS allowlist (GRILL_SIDECAR_ORIGINS)
+//     must include this origin.
+var configuredBase = builder.Configuration["SidecarBaseUrl"];
+var sidecarBase = string.IsNullOrWhiteSpace(configuredBase)
+    ? new Uri($"http://{new Uri(builder.HostEnvironment.BaseAddress).Host}:8091")
+    : new Uri(new Uri(builder.HostEnvironment.BaseAddress), configuredBase);
+builder.Services.AddHttpClient<GrillRpcService>(client => client.BaseAddress = sidecarBase);
 
 await builder.Build().RunAsync();

@@ -12,6 +12,9 @@
 # GRILL_PASSWORD unset and use the web app's "Pit Boss account" dialog once
 # it's running — it calls the sidecar's /setup, which saves them into the
 # grill-data volume.
+#
+# Before the first `up`, create docker/.htpasswd (git-ignored) — nginx uses
+# it for the login that guards the whole app; see docker/README.md.
 
 services:
   sidecar:
@@ -39,6 +42,10 @@ services:
       dockerfile: docker/web.Dockerfile
     ports:
       - "${WEB_PORT:-5219}:80"
+    volumes:
+      - ./docker/.htpasswd:/etc/nginx/.htpasswd:ro
+    depends_on:
+      - sidecar
     restart: unless-stopped
 
 volumes:
