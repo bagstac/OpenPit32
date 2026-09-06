@@ -13,6 +13,11 @@
     <link rel="icon" type="image/svg+xml" href="icon.svg" />
     <link rel="apple-touch-icon" href="apple-touch-icon.png" />
     <link href="OpenPit32.styles.css" rel="stylesheet" />
+    <link rel="manifest" href="manifest.json" />
+    <meta name="theme-color" content="#2b1c14" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-title" content="OpenPit32" />
     <script type="importmap"></script>
 </head>
 
@@ -31,6 +36,14 @@
         <span class="dismiss">🗙</span>
     </div>
     <script src="_framework/blazor.webassembly#[.{fingerprint}].js"></script>
+    <script>
+        // Service workers require a secure context (HTTPS or localhost); on
+        // the plain-HTTP LAN address navigator.serviceWorker is undefined,
+        // so guard the call rather than let it throw.
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('service-worker.js');
+        }
+    </script>
 </body>
 
 </html>

@@ -1,0 +1,21 @@
+{
+  "name": "OpenPit32",
+  "short_name": "OpenPit32",
+  "description": "Local, cloud-free Pit Boss grill control over Bluetooth LE.",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#2b1c14",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ]
+}
