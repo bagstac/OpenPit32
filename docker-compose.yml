@@ -18,8 +18,15 @@ services:
     build:
       context: .
       dockerfile: docker/sidecar.Dockerfile
-    ports:
-      - "8091:8091"
+    # Host networking, not a published port: bridge networking's NAT layer
+    # was observed to break bleak-esphome's BLE-advertisement subscription
+    # to the ESP32 proxy (it never received scan data, even though simpler
+    # calls like plain API logs worked fine through the same bridge) while
+    # the identical code worked from a bare-metal host. Host networking
+    # matches that working bare-metal path exactly. Linux-only; if this
+    # ever needs to run on Docker Desktop (mac/Windows), fall back to the
+    # ports: mapping and treat this as a knob to try if BLE scanning stalls.
+    network_mode: host
     environment:
       GRILL_PROXY_HOST: ${GRILL_PROXY_HOST}
       GRILL_PROXY_KEY: ${GRILL_PROXY_KEY}
