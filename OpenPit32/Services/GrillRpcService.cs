@@ -114,24 +114,24 @@ public class GrillRpcService
     public GrillRpcService(HttpClient http) => _http = http;
 
     /// <summary>Absolute URL of the raw /health JSON, for a link in the UI.</summary>
-    public string HealthUrl => new Uri(_http.BaseAddress!, "/health").ToString();
+    public string HealthUrl => new Uri(_http.BaseAddress!, "health").ToString();
 
     public Task<SidecarStateResponse?> GetStateAsync() =>
-        _http.GetFromJsonAsync<SidecarStateResponse>("/state");
+        _http.GetFromJsonAsync<SidecarStateResponse>("state");
 
     public Task<SidecarHealthResponse?> GetHealthAsync() =>
-        _http.GetFromJsonAsync<SidecarHealthResponse>("/health");
+        _http.GetFromJsonAsync<SidecarHealthResponse>("health");
 
     /// <summary>Null while the sidecar is not set up (it answers 404).</summary>
     public async Task<SidecarInfoResponse?> GetInfoAsync()
     {
-        var resp = await _http.GetAsync("/info");
+        var resp = await _http.GetAsync("info");
         if (!resp.IsSuccessStatusCode) return null;
         return await resp.Content.ReadFromJsonAsync<SidecarInfoResponse>();
     }
 
     public Task<SidecarModelsResponse?> GetModelsAsync() =>
-        _http.GetFromJsonAsync<SidecarModelsResponse>("/models");
+        _http.GetFromJsonAsync<SidecarModelsResponse>("models");
 
     public async Task<SidecarCommandResponse> SendCommandAsync(
         string action, double? value = null, int? probe = null, bool confirm = false)
@@ -141,7 +141,7 @@ public class GrillRpcService
         if (probe is not null) body["probe"] = probe;
         if (confirm) body["confirm"] = true;
 
-        var resp = await _http.PostAsJsonAsync("/command", body);
+        var resp = await _http.PostAsJsonAsync("command", body);
         return await resp.Content.ReadFromJsonAsync<SidecarCommandResponse>()
                ?? new SidecarCommandResponse { ok = false, error = "Empty reply from sidecar" };
     }
@@ -162,7 +162,7 @@ public class GrillRpcService
         if (!string.IsNullOrWhiteSpace(model)) body["model"] = model;
         if (grillId is not null) body["grill_id"] = grillId;
 
-        var resp = await _http.PostAsJsonAsync("/setup", body);
+        var resp = await _http.PostAsJsonAsync("setup", body);
         return await resp.Content.ReadFromJsonAsync<SidecarSetupResponse>()
                ?? new SidecarSetupResponse { ok = false, error = "Empty reply from sidecar" };
     }
