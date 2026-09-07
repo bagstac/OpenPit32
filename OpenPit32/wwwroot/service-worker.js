@@ -3,3 +3,8 @@
 // wouldn't be reflected on the first load after each rebuild). The real
 // worker for published/Docker builds is service-worker.published.js.
 self.addEventListener('fetch', () => { });
+
+// Push notifications (grill alarms) work the same in dev as in production —
+// only the offline asset cache above is dev-specific — so both workers share
+// this handling. See push-worker.js.
+self.importScripts('./push-worker.js');

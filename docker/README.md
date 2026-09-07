@@ -42,10 +42,11 @@ git pull   # or re-copy the changed files
 docker compose up -d --build
 ```
 
-The grill password and the login's signing key both live in the
-`grill-data` volume, not the image, so a rebuild doesn't lose either.
-`docker compose down -v` does — only use `-v` if you want to re-run setup
-and force a fresh login for everyone.
+The grill password, the login's signing key, and the alarms feature's VAPID
+key pair + push subscriptions all live in the `grill-data` volume, not the
+image, so a rebuild doesn't lose any of them. `docker compose down -v` does
+— only use `-v` if you want to re-run setup, force a fresh login for
+everyone, and have every browser re-subscribe to notifications.
 
 ## Exposing it over the internet (e.g. a Cloudflare Tunnel)
 

@@ -15,6 +15,15 @@ http://127.0.0.1:8091 with CORS for the local web app:
                            one-time: fetch the grill password from the Pit
                            Boss account, save it to .grill_env, reconnect
 
+    GET  /push/vapid-public-key -> {publicKey} for PushManager.subscribe()
+    POST /push/subscribe        -> a browser's PushSubscription.toJSON()
+    POST /push/unsubscribe      -> {endpoint}
+    GET  /alarms                -> {alarms: [...]}
+    POST /alarms                -> {kind: "temp", sensor, comparison, target, label?}
+                                    or {kind: "timer", duration_seconds, label?}
+    DELETE /alarms/{id}         -> cancel one alarm
+                           See scripts/alarms.py for the alarm/push model.
+
 Path to the grill: pytboss BleConnection -> habluetooth/bleak-esphome ->
 ESPHome native API -> ESP32 running `bluetooth_proxy` (esphome/grill-proxy.yaml)
 -> grill GATT (Mongoose OS RPC service). It answers even with the controller
@@ -69,6 +78,7 @@ from pytboss.exceptions import Error, Unauthorized, UnsupportedOperation
 from pytboss.grills import get_grills
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import alarms  # noqa: E402
 import esphome_ble  # noqa: E402
 import pitboss_cloud  # noqa: E402
 
@@ -443,7 +453,8 @@ class GrillBridge:
         return {"ok": True, "action": action}
 
 
-def make_app(bridge: GrillBridge, auth_username: str | None = None,
+def make_app(bridge: GrillBridge, store: alarms.AlarmStore,
+            auth_username: str | None = None,
             auth_password: str | None = None, auth_secret: bytes | None = None,
             ) -> web.Application:
     allowed_origins = {
@@ -459,7 +470,7 @@ def make_app(bridge: GrillBridge, auth_username: str | None = None,
         origin = request.headers.get("Origin", "")
         ok = origin in allowed_origins or origin.startswith("http://localhost:")
         return ({"Access-Control-Allow-Origin": origin,
-                 "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                 "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
                  "Access-Control-Allow-Headers": "Content-Type"} if ok else {})
 
     @web.middleware
@@ -619,6 +630,63 @@ def make_app(bridge: GrillBridge, auth_username: str | None = None,
         resp.del_cookie(SESSION_COOKIE, path="/")
         raise resp
 
+    async def vapid_public_key(request):
+        return web.json_response({"publicKey": store.vapid_public_key})
+
+    async def push_subscribe(request):
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return web.json_response({"ok": False, "error": "invalid JSON"},
+                                     status=400)
+        try:
+            store.add_subscription(body)
+        except alarms.AlarmError as ex:
+            return web.json_response({"ok": False, "error": str(ex)}, status=400)
+        return web.json_response({"ok": True})
+
+    async def push_unsubscribe(request):
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return web.json_response({"ok": False, "error": "invalid JSON"},
+                                     status=400)
+        endpoint = body.get("endpoint")
+        if endpoint:
+            store.remove_subscription(endpoint)
+        return web.json_response({"ok": True})
+
+    async def list_alarms(request):
+        return web.json_response({"alarms": store.list_alarms()})
+
+    async def add_alarm(request):
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return web.json_response({"ok": False, "error": "invalid JSON"},
+                                     status=400)
+        kind = (body.get("kind") or "").strip().lower()
+        label = body.get("label")
+        try:
+            if kind == "temp":
+                alarm = store.add_temp_alarm(
+                    body.get("sensor"), body.get("comparison"),
+                    body.get("target"), label)
+            elif kind == "timer":
+                alarm = store.add_timer_alarm(body.get("duration_seconds"), label)
+            else:
+                return web.json_response(
+                    {"ok": False, "error": f"unknown alarm kind {kind!r}"},
+                    status=400)
+        except (alarms.AlarmError, TypeError, ValueError) as ex:
+            return web.json_response({"ok": False, "error": str(ex)}, status=400)
+        return web.json_response({"ok": True, "alarm": alarm})
+
+    async def delete_alarm(request):
+        removed = store.remove_alarm(request.match_info["alarm_id"])
+        return web.json_response({"ok": removed},
+                                 status=200 if removed else 404)
+
     async def auth_check(request):
         # nginx auth_request target (docker/nginx.conf): status code only,
         # body/headers are discarded. Fails closed if login isn't configured
@@ -636,6 +704,12 @@ def make_app(bridge: GrillBridge, auth_username: str | None = None,
     app.router.add_get("/probe-targets", probe_targets)
     app.router.add_post("/command", command)
     app.router.add_post("/setup", setup)
+    app.router.add_get("/push/vapid-public-key", vapid_public_key)
+    app.router.add_post("/push/subscribe", push_subscribe)
+    app.router.add_post("/push/unsubscribe", push_unsubscribe)
+    app.router.add_get("/alarms", list_alarms)
+    app.router.add_post("/alarms", add_alarm)
+    app.router.add_delete("/alarms/{alarm_id}", delete_alarm)
     app.router.add_get("/login", login_page)
     app.router.add_post("/login", login_submit)
     app.router.add_get("/logout", logout)
@@ -686,7 +760,10 @@ async def main():
             "deny; fine for local dev, but docker/nginx.conf's login gate "
             "won't let anyone in until these are set")
 
-    app = make_app(bridge, auth_username, auth_password, auth_secret)
+    store = alarms.AlarmStore()
+    monitor_task = asyncio.create_task(store.monitor(bridge))
+
+    app = make_app(bridge, store, auth_username, auth_password, auth_secret)
     runner = web.AppRunner(app)
     await runner.setup()
     bind_host = os.environ.get("GRILL_SIDECAR_HOST", "127.0.0.1")
@@ -697,6 +774,7 @@ async def main():
     try:
         await asyncio.Event().wait()
     finally:
+        monitor_task.cancel()
         await bridge.stop()
         await runner.cleanup()
 

@@ -100,6 +100,40 @@ public class SidecarSetupResponse
     public bool connected { get; set; }
 }
 
+/// <summary>An alarm as stored by scripts/alarms.py — either a "temp" alarm
+/// (sensor/comparison/target set) or a "timer" alarm (duration_seconds/fires_at
+/// set). Dropped from the list server-side once it fires.</summary>
+public class AlarmDto
+{
+    public string id { get; set; } = "";
+    public string kind { get; set; } = ""; // "temp" | "timer"
+    public string label { get; set; } = "";
+    public string? sensor { get; set; }
+    public string? comparison { get; set; } // "at_or_above" | "at_or_below"
+    public double? target { get; set; }
+    public int? duration_seconds { get; set; }
+    /// <summary>Timer alarms only: unix seconds this fires at.</summary>
+    public double? fires_at { get; set; }
+    public double created_at { get; set; }
+}
+
+public class AlarmsResponse
+{
+    public List<AlarmDto> alarms { get; set; } = new();
+}
+
+public class AlarmResponse
+{
+    public bool ok { get; set; }
+    public string? error { get; set; }
+    public AlarmDto? alarm { get; set; }
+}
+
+public class VapidKeyResponse
+{
+    public string publicKey { get; set; } = "";
+}
+
 /// <summary>
 /// Thin client for the local grill sidecar (http://127.0.0.1:8091), which
 /// holds the Bluetooth session and the grill password. This app never sees
@@ -166,4 +200,58 @@ public class GrillRpcService
         return await resp.Content.ReadFromJsonAsync<SidecarSetupResponse>()
                ?? new SidecarSetupResponse { ok = false, error = "Empty reply from sidecar" };
     }
+
+    // ---- Alarms & push (scripts/alarms.py) ----
+
+    public Task<AlarmsResponse?> GetAlarmsAsync() =>
+        _http.GetFromJsonAsync<AlarmsResponse>("alarms");
+
+    public async Task<AlarmResponse> AddTempAlarmAsync(
+        string sensor, string comparison, double target, string? label)
+    {
+        var body = new Dictionary<string, object?>
+        {
+            ["kind"] = "temp",
+            ["sensor"] = sensor,
+            ["comparison"] = comparison,
+            ["target"] = target,
+        };
+        if (!string.IsNullOrWhiteSpace(label)) body["label"] = label;
+        return await PostAlarmAsync(body);
+    }
+
+    public async Task<AlarmResponse> AddTimerAlarmAsync(int durationSeconds, string? label)
+    {
+        var body = new Dictionary<string, object?>
+        {
+            ["kind"] = "timer",
+            ["duration_seconds"] = durationSeconds,
+        };
+        if (!string.IsNullOrWhiteSpace(label)) body["label"] = label;
+        return await PostAlarmAsync(body);
+    }
+
+    private async Task<AlarmResponse> PostAlarmAsync(Dictionary<string, object?> body)
+    {
+        var resp = await _http.PostAsJsonAsync("alarms", body);
+        return await resp.Content.ReadFromJsonAsync<AlarmResponse>()
+               ?? new AlarmResponse { ok = false, error = "Empty reply from sidecar" };
+    }
+
+    public async Task<bool> DeleteAlarmAsync(string id) =>
+        (await _http.DeleteAsync($"alarms/{Uri.EscapeDataString(id)}")).IsSuccessStatusCode;
+
+    /// <summary>Null if the sidecar is unreachable (no key yet to subscribe with).</summary>
+    public async Task<string?> GetVapidPublicKeyAsync()
+    {
+        var resp = await _http.GetFromJsonAsync<VapidKeyResponse>("push/vapid-public-key");
+        return resp?.publicKey;
+    }
+
+    /// <summary>Registers a browser's PushSubscription.toJSON() with the sidecar.</summary>
+    public async Task<bool> SubscribePushAsync(JsonElement subscription) =>
+        (await _http.PostAsJsonAsync("push/subscribe", subscription)).IsSuccessStatusCode;
+
+    public async Task<bool> UnsubscribePushAsync(string endpoint) =>
+        (await _http.PostAsJsonAsync("push/unsubscribe", new { endpoint })).IsSuccessStatusCode;
 }

@@ -1,6 +1,8 @@
 @page "/grill"
+@using System.Text.Json
 @inject GrillRpcService Rpc
-@implements IDisposable
+@inject IJSRuntime JS
+@implements IAsyncDisposable
 
 <PageTitle>Grill — OpenPit32</PageTitle>
 
@@ -170,6 +172,116 @@ else
             </p>
         </div>
     </div>
+
+    <div class="card pb-card mt-4">
+        <div class="card-header">Alarms</div>
+        <div class="card-body">
+            @if (!pushSupported)
+            {
+                <p class="text-muted small mb-3">
+                    This browser can't do push notifications here (no secure context,
+                    or an old browser) — alarms still fire and clear below, but only
+                    while this page is open.
+                </p>
+            }
+            else if (pushPermission != "granted")
+            {
+                <div class="mb-3">
+                    <button class="btn btn-outline-secondary btn-sm" disabled="@notifBusy"
+                            @onclick="EnableNotifications">
+                        Enable notifications
+                    </button>
+                    @if (pushPermission == "denied")
+                    {
+                        <span class="text-muted small ms-2">
+                            Blocked — allow notifications for this site in your browser's settings.
+                        </span>
+                    }
+                </div>
+            }
+            @if (!string.IsNullOrEmpty(notifError))
+            {
+                <div class="alert alert-danger py-2">@notifError</div>
+            }
+
+            @if (alarms.Count > 0)
+            {
+                <ul class="list-group list-group-flush mb-3">
+                    @foreach (var a in alarms)
+                    {
+                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                            <span>
+                                <strong>@a.label</strong>
+                                <span class="text-muted small ms-2">@DescribeAlarm(a)</span>
+                            </span>
+                            <button class="btn btn-sm btn-outline-danger" @onclick="() => RemoveAlarm(a.id)">✕</button>
+                        </li>
+                    }
+                </ul>
+            }
+            else
+            {
+                <p class="text-muted small">No alarms set.</p>
+            }
+
+            @if (!string.IsNullOrEmpty(alarmError))
+            {
+                <div class="alert alert-danger py-2">@alarmError</div>
+            }
+
+            <div class="row g-2 align-items-end">
+                <div class="col-auto">
+                    <label class="form-label small text-muted mb-1">Alarm type</label>
+                    <select class="form-select form-select-sm" @bind="alarmKind">
+                        <option value="temp">Temperature</option>
+                        <option value="timer">Timer</option>
+                    </select>
+                </div>
+                @if (alarmKind == "temp")
+                {
+                    <div class="col-auto">
+                        <label class="form-label small text-muted mb-1">Sensor</label>
+                        <select class="form-select form-select-sm" @bind="alarmSensor">
+                            @foreach (var s in AvailableSensors())
+                            {
+                                <option value="@s.Key">@s.Label</option>
+                            }
+                        </select>
+                    </div>
+                    <div class="col-auto">
+                        <label class="form-label small text-muted mb-1">When it</label>
+                        <select class="form-select form-select-sm" @bind="alarmComparison">
+                            <option value="at_or_above">reaches or exceeds</option>
+                            <option value="at_or_below">drops to or below</option>
+                        </select>
+                    </div>
+                    <div class="col-auto" style="width:6.5rem">
+                        <label class="form-label small text-muted mb-1">Target (@(live?.isFahrenheit == true ? "F" : "C"))</label>
+                        <input type="number" class="form-control form-control-sm" @bind="alarmTargetText" placeholder="e.g. 250" />
+                    </div>
+                }
+                else
+                {
+                    <div class="col-auto" style="width:6.5rem">
+                        <label class="form-label small text-muted mb-1">Minutes</label>
+                        <input type="number" class="form-control form-control-sm" @bind="alarmMinutesText" placeholder="e.g. 45" />
+                    </div>
+                }
+                <div class="col-auto" style="width:10rem">
+                    <label class="form-label small text-muted mb-1">Label (optional)</label>
+                    <input class="form-control form-control-sm" @bind="alarmLabel" placeholder="e.g. Brisket" />
+                </div>
+                <div class="col-auto">
+                    <button class="btn btn-outline-secondary btn-sm" disabled="@alarmBusy" @onclick="AddAlarm">Add Alarm</button>
+                </div>
+            </div>
+            <p class="text-muted small mt-3 mb-0">
+                Alarms are checked and pushed by the grill bridge, so they still fire
+                (as a device notification) if this tab isn't open — as long as the
+                bridge itself keeps running.
+            </p>
+        </div>
+    </div>
 }
 
 @code {
@@ -187,10 +299,52 @@ else
     private System.Threading.Timer? pollTimer;
     private System.Threading.Timer? confirmTimer;
 
-    protected override void OnInitialized()
+    // ---- Alarms card ----
+    private List<AlarmDto> alarms = new();
+    private string? alarmError;
+    private string alarmKind = "temp";
+    private string alarmSensor = "grillTemp";
+    private string alarmComparison = "at_or_above";
+    private string? alarmTargetText;
+    private string? alarmMinutesText;
+    private string? alarmLabel;
+    private bool alarmBusy;
+
+    private IJSObjectReference? pushModule;
+    private bool pushSupported;
+    private string pushPermission = "default";
+    private bool notifBusy;
+    private string? notifError;
+
+    protected override async Task OnInitializedAsync()
     {
         pollTimer = new System.Threading.Timer(_ => _ = InvokeAsync(PollSidecar),
             null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
+
+        try
+        {
+            pushModule = await JS.InvokeAsync<IJSObjectReference>("import", "./js/push.js");
+            pushSupported = await pushModule.InvokeAsync<bool>("isSupported");
+            if (pushSupported)
+            {
+                pushPermission = await pushModule.InvokeAsync<string>("permission");
+                if (pushPermission == "granted")
+                {
+                    // Best-effort: if the browser already holds a subscription
+                    // (e.g. the sidecar's own copy was lost to a volume reset),
+                    // re-register it instead of silently losing this alarm's alerts.
+                    var existing = await pushModule.InvokeAsync<JsonElement?>("getExistingSubscription");
+                    if (existing is { ValueKind: JsonValueKind.Object } sub)
+                    {
+                        await Rpc.SubscribePushAsync(sub);
+                    }
+                }
+            }
+        }
+        catch (JSException)
+        {
+            pushSupported = false;
+        }
     }
 
     private async Task PollSidecar()
@@ -198,6 +352,12 @@ else
         try
         {
             health = await Rpc.GetHealthAsync();
+            if (health is not null)
+            {
+                // Timer alarms need no configured grill, only the clock — refresh
+                // the list regardless of `configured`.
+                alarms = (await Rpc.GetAlarmsAsync())?.alarms ?? alarms;
+            }
             if (health?.configured == true)
             {
                 info ??= await Rpc.GetInfoAsync();
@@ -214,6 +374,122 @@ else
         }
         polledOnce = true;
         StateHasChanged();
+    }
+
+    private async Task EnableNotifications()
+    {
+        if (pushModule is null) return;
+        notifBusy = true;
+        notifError = null;
+        try
+        {
+            pushPermission = await pushModule.InvokeAsync<string>("requestPermission");
+            if (pushPermission != "granted")
+            {
+                if (pushPermission == "denied")
+                    notifError = "Notifications are blocked for this site.";
+                return;
+            }
+            var vapidKey = await Rpc.GetVapidPublicKeyAsync();
+            if (string.IsNullOrEmpty(vapidKey))
+            {
+                notifError = "Could not reach the grill bridge for the push key.";
+                return;
+            }
+            var subscription = await pushModule.InvokeAsync<JsonElement>("subscribe", vapidKey);
+            if (!await Rpc.SubscribePushAsync(subscription))
+                notifError = "The grill bridge rejected the subscription.";
+        }
+        catch (Exception ex)
+        {
+            notifError = "Enabling notifications failed: " + ex.Message;
+        }
+        finally
+        {
+            notifBusy = false;
+        }
+    }
+
+    private async Task AddAlarm()
+    {
+        alarmError = null;
+        AlarmResponse r;
+        if (alarmKind == "temp")
+        {
+            if (!int.TryParse(alarmTargetText, out var target))
+            {
+                alarmError = "Enter a target temperature.";
+                return;
+            }
+            alarmBusy = true;
+            try { r = await Rpc.AddTempAlarmAsync(alarmSensor, alarmComparison, target, alarmLabel); }
+            finally { alarmBusy = false; }
+        }
+        else
+        {
+            if (!int.TryParse(alarmMinutesText, out var minutes) || minutes <= 0)
+            {
+                alarmError = "Enter a number of minutes.";
+                return;
+            }
+            alarmBusy = true;
+            try { r = await Rpc.AddTimerAlarmAsync(minutes * 60, alarmLabel); }
+            finally { alarmBusy = false; }
+        }
+        if (!r.ok)
+        {
+            alarmError = r.error ?? "Could not add the alarm.";
+            return;
+        }
+        alarmTargetText = null;
+        alarmMinutesText = null;
+        alarmLabel = null;
+        await RefreshAlarms();
+    }
+
+    private async Task RemoveAlarm(string id)
+    {
+        await Rpc.DeleteAlarmAsync(id);
+        await RefreshAlarms();
+    }
+
+    private async Task RefreshAlarms()
+    {
+        try { alarms = (await Rpc.GetAlarmsAsync())?.alarms ?? alarms; }
+        catch { /* PollSidecar's own error banner already covers connectivity */ }
+        StateHasChanged();
+    }
+
+    private IEnumerable<(string Key, string Label)> AvailableSensors()
+    {
+        yield return ("grillTemp", "Grill Temp");
+        yield return ("smokerActTemp", "Smoker Temp");
+        var probes = info?.meat_probes is > 0 ? info!.meat_probes : 4;
+        for (int i = 1; i <= probes; i++) yield return ($"p{i}Temp", $"Probe {i}");
+    }
+
+    private static string SensorLabel(string? sensor) => sensor switch
+    {
+        "grillTemp" => "Grill Temp",
+        "smokerActTemp" => "Smoker Temp",
+        "p1Temp" => "Probe 1",
+        "p2Temp" => "Probe 2",
+        "p3Temp" => "Probe 3",
+        "p4Temp" => "Probe 4",
+        _ => sensor ?? "Sensor",
+    };
+
+    private static string DescribeAlarm(AlarmDto a)
+    {
+        if (a.kind == "timer")
+        {
+            var remaining = a.fires_at is { } f
+                ? TimeSpan.FromSeconds(Math.Max(0, f - DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
+                : TimeSpan.Zero;
+            return $"{remaining:hh\\:mm\\:ss} remaining";
+        }
+        var cmp = a.comparison == "at_or_above" ? "≥" : "≤";
+        return $"{SensorLabel(a.sensor)} {cmp} {a.target:0}°";
     }
 
     private string LinkLabel => health switch
@@ -336,9 +612,14 @@ else
             ? v.ToString()
             : fw.ToString();
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
         pollTimer?.Dispose();
         confirmTimer?.Dispose();
+        if (pushModule is not null)
+        {
+            try { await pushModule.DisposeAsync(); }
+            catch (JSDisconnectedException) { /* page is already unloading */ }
+        }
     }
 }

@@ -10,6 +10,9 @@ a small web app on your PC, via an ESP32 sitting next to the grill.
 - No Pit Boss cloud dependency at run time; the cloud is used exactly once, to
   fetch the grill's Bluetooth password from your account
 - Link diagnostics page (BLE and WiFi signal, proxy status)
+- Alarms: set a target temperature (grill/smoker/any probe) or a countdown
+  timer and get a push notification when it's reached — works even if the
+  tab isn't open, as long as the sidecar is running
 - Installable as a PWA (add to home screen / desktop) for a native-app feel
 - Optional Docker deployment with a real login form (password-manager
   friendly) for exposing it beyond your LAN — see
@@ -113,6 +116,12 @@ on one host (skip the venvs/`.NET SDK` above). See
 | GET | `/models` | grill models pytboss knows for the PBV2 board |
 | POST | `/command` | `{"action": "set_temp", "value": 225}` · `power_on` / `power_off` need `"confirm": true` · `prime_on/off`, `light_on/off`, `set_probe` |
 | POST | `/setup` | `{"email","password","country"?,"grill_id"?,"model"?}` — one-time password fetch |
+| GET | `/push/vapid-public-key` | `{publicKey}` for the browser's `PushManager.subscribe()` |
+| POST | `/push/subscribe` | a browser's `PushSubscription.toJSON()` |
+| POST | `/push/unsubscribe` | `{"endpoint"}` |
+| GET | `/alarms` | `{alarms: [...]}` — active temp/timer alarms |
+| POST | `/alarms` | `{"kind":"temp","sensor","comparison","target","label"?}` or `{"kind":"timer","duration_seconds","label"?}` |
+| DELETE | `/alarms/{id}` | cancel one alarm |
 
 Binds to 127.0.0.1 by default (`GRILL_SIDECAR_HOST` to change it); CORS is
 allowed for `http://localhost:*` plus whatever `GRILL_SIDECAR_ORIGINS` lists.

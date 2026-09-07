@@ -6,6 +6,8 @@
 # one deliberately.
 pytboss==2026.8.6
 aiohttp==3.14.3
+pywebpush==2.5.0  # VAPID web push for grill alarms (scripts/alarms.py); pulls
+                  # in py-vapid and cryptography
 bleak==3.0.2
 bleak-retry-connector==4.7.0
 bleak-esphome==4.1.0

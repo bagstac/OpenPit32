@@ -41,6 +41,12 @@ services:
       # and persisted in the grill-data volume, so restarts don't log
       # everyone out.
       AUTH_SECRET: ${AUTH_SECRET:-}
+      # Grill/timer alarms (scripts/alarms.py): Web Push over VAPID, no
+      # third-party push service account needed. The key pair is generated
+      # once and persisted in the grill-data volume alongside the grill
+      # password. VAPID_SUBJECT just identifies the sender to push services
+      # (a mailto: URI is conventional) — optional, defaults to a placeholder.
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-}
     volumes:
       - grill-data:/data
     restart: unless-stopped
