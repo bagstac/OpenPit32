@@ -3,11 +3,28 @@
 Read this first, then PLAN.md (history) and PROTOCOL.md (protocol facts).
 The README at the repo root is the user-facing setup guide.
 
-Updated 2026-09-05 (publish prep): BLE via the ESP32 proxy is the only grill
-transport. The cloud-relay transport, the account login UI and all
-reverse-engineering artifacts were removed. The Pit Boss cloud is touched
-exactly once, by the "Pit Boss account" dialog / `scripts/pitboss_cloud.py`,
+Updated 2026-09-07: BLE via the ESP32 proxy is the only grill transport. The
+cloud-relay transport, the account login UI and all reverse-engineering
+artifacts were removed (2026-09-05 publish prep). The Pit Boss cloud is
+touched exactly once, by the "Pit Boss account" dialog / `scripts/pitboss_cloud.py`,
 to fetch the grill's Bluetooth password.
+
+Since publish prep, three more things landed: the app is an installable PWA
+(manifest + service worker, flame-and-ripples icon set); a Docker deployment
+(`docker-compose.yml`, `docker/`) runs it as two containers behind nginx,
+single-origin (`/api/` reverse-proxied to the sidecar); and that Docker
+deployment gates itself with a real login form + signed session cookie
+(`scripts/grill_sidecar.py`'s `/login`, `/logout`, `/auth-check`), not a
+browser Basic Auth popup, so a password manager can fill it. One such
+deployment is exposed at `openpit32.codingattempts.com` via a Cloudflare
+Tunnel running on a second host, config-file style (not the Zero Trust
+dashboard), sharing a tunnel with an unrelated hostname — see
+`docker/README.md` for the auth/tunnel setup and `docker/nginx.conf`'s
+comments for the reverse-proxy details (notably: nginx's own `$scheme` is
+always `http` since it never terminates TLS itself, so the login-redirect
+Location header has to derive the external scheme from
+`X-Forwarded-Proto` via a `map`, not `$scheme`, or it wrongly redirects an
+HTTPS tunnel visitor to `http://`).
 
 ## TL;DR status
 - Web client controls the grill over BLE through an ESP32 ESPHome
@@ -20,19 +37,28 @@ to fetch the grill's Bluetooth password.
   (idf v5.5.1, app pbz_firmware). The grill's BLE address is random and
   rotates — match by the advertised name (= board id `PBV2-…`).
 
-## Services to run (2 processes)
+## Services to run (2 processes, bare-metal)
 1. Sidecar: `.\.venv312\Scripts\python.exe scripts\grill_sidecar.py`
    → http://127.0.0.1:8091 (GET /health /state /info /models /probe-targets,
-   POST /command, POST /setup). Reads scripts/.grill_env (SECRET — never
-   print/read it into chat): GRILL_PROXY_HOST/KEY required; GRILL_BOARD_ID /
-   GRILL_PASSWORD / GRILL_MODEL filled in by /setup. Starts fine without
-   them (`configured: false`).
+   POST /command, POST /setup; plus /login /logout /auth-check, only
+   meaningful when AUTH_USERNAME/AUTH_PASSWORD are set — see below). Reads
+   scripts/.grill_env (SECRET — never print/read it into chat):
+   GRILL_PROXY_HOST/KEY required; GRILL_BOARD_ID / GRILL_PASSWORD /
+   GRILL_MODEL filled in by /setup. Starts fine without them
+   (`configured: false`).
 2. Web app: `dotnet run --project OpenPit32\OpenPit32.csproj --urls http://localhost:5219`
 3. Open http://localhost:5219. First run: "Fetch grill password" → the dialog
    posts the Pit Boss account email/password to the sidecar's /setup, which
    logs in once, saves board id + password + model to .grill_env and
    connects. Afterwards the Home card → /grill (status + controls),
    /health (link diagnostics).
+
+Alternative: `docker compose up -d --build` runs both as containers behind
+nginx on one host (docker/README.md) — same sidecar, same API, plus the
+login gate. `OpenPit32/Program.cs` picks the sidecar base URL at compile
+time via the `DOCKER_DEPLOY` constant (`docker/web.Dockerfile` sets it),
+not at runtime, after two runtime-detection approaches both proved
+unreliable (see PLAN.md history if resurrecting this).
 
 ## Architecture
 OpenPit32 (Blazor WASM) → GrillRpcService (typed HttpClient) → sidecar
@@ -89,13 +115,20 @@ grill GATT (Mongoose OS RPC service).
    never print them. The sidecar never logs the grill or account password.
 
 ## Files map
-- scripts/: grill_sidecar.py (bridge + HTTP API), esphome_ble.py (proxy
-  helper), pitboss_cloud.py (one-time password fetch; CLI + used by /setup),
-  proxy_scan.py (what the ESP32 hears), ble_probe.py (RPC smoke test),
-  ble_scan.py (PC adapter scan), .grill_env.example.
+- scripts/: grill_sidecar.py (bridge + HTTP API, incl. the login/session
+  routes), esphome_ble.py (proxy helper), pitboss_cloud.py (one-time
+  password fetch; CLI + used by /setup), proxy_scan.py (what the ESP32
+  hears), ble_probe.py (RPC smoke test), ble_scan.py (PC adapter scan),
+  .grill_env.example.
 - esphome/: grill-proxy.yaml, secrets.yaml.example.
 - OpenPit32/: Pages (Home, GrillDetail `/grill`, BridgeHealth `/health`),
-  Layout (MainLayout, NavMenu, SetupDialog), Services/GrillRpcService.cs.
+  Layout (MainLayout, NavMenu, SetupDialog), Services/GrillRpcService.cs,
+  Services/IncludeCredentialsHandler.cs (makes WASM's HttpClient send the
+  session cookie on background /api/ calls — top-level nav does this on its
+  own, background fetches don't).
+- docker/: nginx.conf (single-origin reverse proxy + auth gate),
+  web.Dockerfile, sidecar.Dockerfile, README.md (deploy + auth setup),
+  .env.example. docker-compose.yml lives at the repo root.
 - docs/: STATE.md (this), PLAN.md (history), PROTOCOL.md.
 - requirements.txt (runtime, .venv312), requirements-esphome.txt (tooling, .venv).
 

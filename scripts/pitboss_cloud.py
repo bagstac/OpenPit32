@@ -58,7 +58,7 @@ def _headers(country: str, token: str | None = None) -> dict:
         "X-Localization": "en",
         "x-country": country,
         "x-store": "PB",
-        "User-Agent": "PitBossAlarms/1.0 (grill-password-fetch)",
+        "User-Agent": "OpenPit32/1.0 (grill-password-fetch)",
     }
     if token:
         h["Authorization"] = "Bearer " + token

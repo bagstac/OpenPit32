@@ -10,6 +10,10 @@ a small web app on your PC, via an ESP32 sitting next to the grill.
 - No Pit Boss cloud dependency at run time; the cloud is used exactly once, to
   fetch the grill's Bluetooth password from your account
 - Link diagnostics page (BLE and WiFi signal, proxy status)
+- Installable as a PWA (add to home screen / desktop) for a native-app feel
+- Optional Docker deployment with a real login form (password-manager
+  friendly) for exposing it beyond your LAN — see
+  [docker/README.md](docker/README.md)
 
 Unofficial, unaffiliated with Dansons / Pit Boss. It talks to a real appliance
 that makes fire — see [Safety](#safety).
