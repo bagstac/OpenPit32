@@ -35,17 +35,31 @@ Deployment: GRILL_SIDECAR_HOST binds the HTTP server (default
 scripts/pitboss_cloud.py at a mounted volume instead of a path
 next to this script, so a password fetched via /setup survives a
 container restart. See docker/ and docker-compose.yml.
+
+Login: GET/POST /login and GET /logout back the app's own login page
+(behind docker/nginx.conf's auth_request, not used for a bare-metal
+run), plus GET /auth-check for nginx to call. A signed cookie, not
+Basic Auth, so a browser password manager can see this as an ordinary
+form and offer to save/fill it. AUTH_USERNAME/AUTH_PASSWORD (from the
+environment or .grill_env) gate it; unset, /auth-check always denies
+rather than accidentally leaving a deployment open. AUTH_SECRET signs
+the session cookie — generate one and set it explicitly to invalidate
+every session at once (e.g. after changing the password); left unset,
+one is created on first run and persisted next to .grill_env.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
 import os
+import secrets
 import sys
 import time
+from html import escape
 from pathlib import Path
 
 from aiohttp import web
@@ -74,10 +88,105 @@ BLE_BACKOFF_MAX = 60.0
 # a moment later recomputes the key, so one such rejection is not an error.
 AUTH_RETRY_DELAY = 1.0
 
+SESSION_COOKIE = "openpit32_session"
+SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 days — a password manager should
+                                     # only need to fill this once in a while
+LOGIN_FAIL_DELAY = 1.0  # blunts trivial brute-forcing without real rate limiting
+
 
 def setting(env: dict, key: str, default=None):
     """Environment variable, else .grill_env, else default."""
     return os.environ.get(key) or env.get(key) or default
+
+
+def _auth_secret_path() -> Path:
+    return pitboss_cloud.ENV_PATH.parent / ".auth_secret"
+
+
+def load_or_create_auth_secret(configured: str | None) -> bytes:
+    """AUTH_SECRET from settings, else one persisted next to .grill_env.
+
+    Persisting (rather than regenerating every start) matters: a fresh
+    secret invalidates every session cookie signed with the old one,
+    logging everyone out on each restart otherwise.
+    """
+    if configured:
+        return configured.encode("utf-8")
+    path = _auth_secret_path()
+    if path.exists():
+        return bytes.fromhex(path.read_text(encoding="utf-8").strip())
+    secret = secrets.token_bytes(32)
+    path.write_text(secret.hex(), encoding="utf-8")
+    return secret
+
+
+def _sign(secret: bytes, *parts: str) -> str:
+    return hmac.new(secret, ":".join(parts).encode("utf-8"), "sha256").hexdigest()
+
+
+def make_session_cookie(secret: bytes, username: str) -> str:
+    expires = str(int(time.time()) + SESSION_MAX_AGE)
+    return f"{expires}.{_sign(secret, username, expires)}"
+
+
+def session_cookie_valid(secret: bytes, username: str, cookie: str | None) -> bool:
+    if not cookie or "." not in cookie:
+        return False
+    expires, _, sig = cookie.partition(".")
+    if not expires.isdigit() or int(expires) < time.time():
+        return False
+    return hmac.compare_digest(sig, _sign(secret, username, expires))
+
+
+LOGIN_PAGE = """\
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenPit32 — Log in</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{
+    background: #1b1a1d; color: #e8e6e3; font-family: system-ui, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; margin: 0;
+  }}
+  form {{
+    background: #232226; border-radius: 12px; padding: 2rem;
+    width: 100%; max-width: 320px; box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  }}
+  h1 {{ font-size: 1.25rem; margin: 0 0 1.25rem; color: #ff6a2b; }}
+  label {{ display: block; font-size: .85rem; color: #9aa0a6; margin: .75rem 0 .25rem; }}
+  input {{
+    width: 100%; box-sizing: border-box; padding: .5rem .6rem;
+    border-radius: 6px; border: 1px solid #3a393e; background: #1b1a1d;
+    color: #e8e6e3; font-size: 1rem;
+  }}
+  button {{
+    width: 100%; margin-top: 1.5rem; padding: .6rem; border: none;
+    border-radius: 6px; background: #ff6a2b; color: #1b1a1d;
+    font-weight: 600; font-size: 1rem; cursor: pointer;
+  }}
+  button:hover {{ background: #ff8248; }}
+  .error {{ color: #ff8080; font-size: .85rem; margin-top: 1rem; }}
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h1>OpenPit32</h1>
+  <input type="hidden" name="next" value="{next_url}">
+  <label for="username">Username</label>
+  <input id="username" name="username" autocomplete="username" required autofocus>
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <button type="submit">Log in</button>
+  {error_html}
+</form>
+</body>
+</html>
+"""
 
 
 class GrillBridge:
@@ -334,7 +443,9 @@ class GrillBridge:
         return {"ok": True, "action": action}
 
 
-def make_app(bridge: GrillBridge) -> web.Application:
+def make_app(bridge: GrillBridge, auth_username: str | None = None,
+            auth_password: str | None = None, auth_secret: bytes | None = None,
+            ) -> web.Application:
     allowed_origins = {
         o.strip()
         for o in os.environ.get(
@@ -468,6 +579,56 @@ def make_app(bridge: GrillBridge) -> web.Application:
                                   "nickname": result["nickname"], "model": model,
                                   "connected": bridge.is_connected()})
 
+    def _safe_next(raw: str | None) -> str:
+        # Only an on-site path is safe to redirect to — an absolute URL in
+        # "next" could send a just-authenticated browser somewhere else.
+        return raw if raw and raw.startswith("/") and not raw.startswith("//") else "/"
+
+    async def login_page(request):
+        return web.Response(
+            text=LOGIN_PAGE.format(
+                next_url=escape(_safe_next(request.query.get("next")), quote=True),
+                error_html=('<p class="error">Wrong username or password.</p>'
+                           if request.query.get("error") else "")),
+            content_type="text/html")
+
+    async def login_submit(request):
+        if not auth_username or not auth_password:
+            return web.Response(
+                text="Login is not configured — set AUTH_USERNAME and "
+                     "AUTH_PASSWORD (see docker/README.md).",
+                status=500)
+        body = await request.post()
+        username = str(body.get("username") or "")
+        password = str(body.get("password") or "")
+        next_url = _safe_next(str(body.get("next") or ""))
+        ok = (hmac.compare_digest(username, auth_username)
+              and hmac.compare_digest(password, auth_password))
+        del password, body
+        if not ok:
+            _LOGGER.info("login failed for username %r", username)
+            await asyncio.sleep(LOGIN_FAIL_DELAY)
+            raise web.HTTPFound(f"/login?error=1&next={next_url}")
+        resp = web.HTTPFound(next_url)
+        resp.set_cookie(SESSION_COOKIE, make_session_cookie(auth_secret, auth_username),
+                        max_age=SESSION_MAX_AGE, httponly=True, samesite="Lax", path="/")
+        raise resp
+
+    async def logout(request):
+        resp = web.HTTPFound("/login")
+        resp.del_cookie(SESSION_COOKIE, path="/")
+        raise resp
+
+    async def auth_check(request):
+        # nginx auth_request target (docker/nginx.conf): status code only,
+        # body/headers are discarded. Fails closed if login isn't configured
+        # at all, rather than leaving a misconfigured deployment wide open.
+        if not auth_username or not auth_password:
+            return web.Response(status=401)
+        cookie = request.cookies.get(SESSION_COOKIE)
+        ok = session_cookie_valid(auth_secret, auth_username, cookie)
+        return web.Response(status=204 if ok else 401)
+
     app.router.add_get("/health", health)
     app.router.add_get("/state", state)
     app.router.add_get("/info", info)
@@ -475,6 +636,10 @@ def make_app(bridge: GrillBridge) -> web.Application:
     app.router.add_get("/probe-targets", probe_targets)
     app.router.add_post("/command", command)
     app.router.add_post("/setup", setup)
+    app.router.add_get("/login", login_page)
+    app.router.add_post("/login", login_submit)
+    app.router.add_get("/logout", logout)
+    app.router.add_get("/auth-check", auth_check)
     return app
 
 
@@ -512,7 +677,16 @@ async def main():
         bridge.model = model
         status = "NOT SET UP — open the web UI and sign in to fetch the grill password"
 
-    app = make_app(bridge)
+    auth_username = setting(env, "AUTH_USERNAME")
+    auth_password = setting(env, "AUTH_PASSWORD")
+    auth_secret = load_or_create_auth_secret(setting(env, "AUTH_SECRET"))
+    if not (auth_username and auth_password):
+        _LOGGER.warning(
+            "AUTH_USERNAME/AUTH_PASSWORD not set — /auth-check will always "
+            "deny; fine for local dev, but docker/nginx.conf's login gate "
+            "won't let anyone in until these are set")
+
+    app = make_app(bridge, auth_username, auth_password, auth_secret)
     runner = web.AppRunner(app)
     await runner.setup()
     bind_host = os.environ.get("GRILL_SIDECAR_HOST", "127.0.0.1")
