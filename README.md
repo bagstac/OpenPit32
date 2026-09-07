@@ -13,7 +13,9 @@ a small web app on your PC, via an ESP32 sitting next to the grill.
 - Alarms: set a target temperature (grill/smoker/any probe) or a countdown
   timer and get a push notification when it's reached — works even if the
   tab isn't open, as long as the sidecar is running
-- Installable as a PWA (add to home screen / desktop) for a native-app feel
+- Installable as a PWA (add to home screen / desktop) for a native-app feel;
+  a redeploy takes over any open copy immediately rather than requiring
+  everyone to close and reopen it first
 - Optional Docker deployment with a real login form (password-manager
   friendly) for exposing it beyond your LAN — see
   [docker/README.md](docker/README.md)

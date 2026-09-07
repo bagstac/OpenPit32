@@ -26,6 +26,13 @@ async function onInstall() {
         .filter(asset => !offlineAssetsExclude.some(pattern => pattern.test(asset.url)))
         .map(asset => new Request(asset.url, { integrity: asset.hash, cache: 'no-cache' }));
     await caches.open(cacheName).then(cache => cache.addAll(assetsRequests));
+
+    // Take over as soon as this version finishes installing rather than
+    // waiting for every open tab to close first (the default) — Blazor
+    // fingerprints framework files per publish, so a browser stuck on an old
+    // worker after a redeploy ends up fetching files that no longer exist
+    // and the app fails to load until someone manually clears site storage.
+    self.skipWaiting();
 }
 
 async function onActivate() {
@@ -35,6 +42,10 @@ async function onActivate() {
     await Promise.all(cacheKeys
         .filter(key => key.startsWith(cacheNamePrefix) && key !== cacheName)
         .map(key => caches.delete(key)));
+
+    // Pairs with skipWaiting() above: control already-open tabs immediately
+    // instead of only new navigations.
+    await self.clients.claim();
 }
 
 async function onFetch(event) {

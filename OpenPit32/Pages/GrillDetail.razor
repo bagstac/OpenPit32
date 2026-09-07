@@ -184,19 +184,24 @@ else
                     while this page is open.
                 </p>
             }
-            else if (pushPermission != "granted")
+            else if (pushSubscribed)
+            {
+                <p class="text-muted small mb-3">✓ Notifications are enabled on this device.</p>
+            }
+            else if (pushPermission == "denied")
+            {
+                <p class="text-muted small mb-3">
+                    Notifications are blocked for this site — allow them in your browser's
+                    site settings, then reload this page.
+                </p>
+            }
+            else
             {
                 <div class="mb-3">
                     <button class="btn btn-outline-secondary btn-sm" disabled="@notifBusy"
                             @onclick="EnableNotifications">
                         Enable notifications
                     </button>
-                    @if (pushPermission == "denied")
-                    {
-                        <span class="text-muted small ms-2">
-                            Blocked — allow notifications for this site in your browser's settings.
-                        </span>
-                    }
                 </div>
             }
             @if (!string.IsNullOrEmpty(notifError))
@@ -313,6 +318,12 @@ else
     private IJSObjectReference? pushModule;
     private bool pushSupported;
     private string pushPermission = "default";
+    // Whether the sidecar currently holds a working subscription for this
+    // device — NOT the same as pushPermission == "granted": permission can
+    // be granted while the underlying PushSubscription is gone (e.g. site
+    // storage was cleared, or the sidecar's own volume was reset), and the
+    // card must still offer a way back in rather than showing nothing.
+    private bool pushSubscribed;
     private bool notifBusy;
     private string? notifError;
 
@@ -336,7 +347,7 @@ else
                     var existing = await pushModule.InvokeAsync<JsonElement?>("getExistingSubscription");
                     if (existing is { ValueKind: JsonValueKind.Object } sub)
                     {
-                        await Rpc.SubscribePushAsync(sub);
+                        pushSubscribed = await Rpc.SubscribePushAsync(sub);
                     }
                 }
             }
@@ -397,7 +408,8 @@ else
                 return;
             }
             var subscription = await pushModule.InvokeAsync<JsonElement>("subscribe", vapidKey);
-            if (!await Rpc.SubscribePushAsync(subscription))
+            pushSubscribed = await Rpc.SubscribePushAsync(subscription);
+            if (!pushSubscribed)
                 notifError = "The grill bridge rejected the subscription.";
         }
         catch (Exception ex)

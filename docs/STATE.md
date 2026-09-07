@@ -98,6 +98,18 @@ grill GATT (Mongoose OS RPC service).
 - Readings at the test spot: WiFi -58…-63 dBm (fine); BLE varied -62…-87
   between reconnects — placement facing the controller matters.
 
+## Verified 2026-09-07: alarms + push, deployed to the Pi
+- Deployed the alarms feature (feature/grill-alarms) to the standing Docker
+  host at `bsbagley@192.168.1.172` (`~/openpit32`, `docker compose up -d
+  --build`) for real-device testing before merging, per the Docker
+  deployment flow in docker/README.md.
+- End to end on a real phone (Android Chrome, over the Cloudflare Tunnel
+  domain — plain-HTTP LAN access is not a secure context and push silently
+  cannot work there): Enable Notifications subscribed against a real
+  `fcm.googleapis.com` endpoint; a 60 s test timer alarm fired and cleared
+  itself on schedule; the sidecar logged no push-delivery errors.
+- Found and fixed two bugs during this pass — see Gotchas #8 and #9 below.
+
 ## Gotchas (do not relearn)
 1. Blazor timer polls don't re-render on their own: end timer-driven
    methods with an explicit StateHasChanged().
@@ -121,6 +133,22 @@ grill GATT (Mongoose OS RPC service).
    resolve from Windows — use the IP.
 7. Secrets: scripts/.grill_env and esphome/secrets.yaml are git-ignored;
    never print them. The sidecar never logs the grill or account password.
+8. PWA service worker updates: without `skipWaiting()` (on install) and
+   `clients.claim()` (on activate), a browser that already has this app's
+   service worker keeps serving the OLD cached shell after a redeploy until
+   every open tab/PWA window is fully closed — Blazor fingerprints framework
+   files per publish, so the stale shell fetches files that no longer exist
+   and the app looks like it's simply broken (seen in Chrome on Android
+   right after a rebuild; Vivaldi worked because it had never cached this
+   origin before). Both service workers now call both, so a redeploy takes
+   over immediately instead of requiring a manual "clear site data".
+9. `Notification.permission == "granted"` is not the same as "a working
+   PushSubscription exists" — clearing site storage (gotcha #8's fix) or a
+   sidecar volume reset can drop the subscription while the OS-level
+   permission stays granted. GrillDetail.razor tracks `pushSubscribed`
+   separately (confirmed by the sidecar accepting POST /push/subscribe) so
+   the Alarms card always offers a way back in instead of silently hiding
+   the button with the permission already granted.
 
 ## Files map
 - scripts/: grill_sidecar.py (bridge + HTTP API, incl. the login/session
