@@ -339,17 +339,10 @@ else
             if (pushSupported)
             {
                 pushPermission = await pushModule.InvokeAsync<string>("permission");
-                if (pushPermission == "granted")
-                {
-                    // Best-effort: if the browser already holds a subscription
-                    // (e.g. the sidecar's own copy was lost to a volume reset),
-                    // re-register it instead of silently losing this alarm's alerts.
-                    var existing = await pushModule.InvokeAsync<JsonElement?>("getExistingSubscription");
-                    if (existing is { ValueKind: JsonValueKind.Object } sub)
-                    {
-                        pushSubscribed = await Rpc.SubscribePushAsync(sub);
-                    }
-                }
+                // Whether a subscription is actually registered — not just
+                // whether permission is granted — is checked and kept in
+                // sync on every poll tick by RecheckPushSubscription(),
+                // starting with the very first tick pollTimer just queued.
             }
         }
         catch (JSException)
@@ -369,6 +362,7 @@ else
                 // the list regardless of `configured`.
                 alarms = (await Rpc.GetAlarmsAsync())?.alarms ?? alarms;
             }
+            await RecheckPushSubscription();
             if (health?.configured == true)
             {
                 info ??= await Rpc.GetInfoAsync();
@@ -385,6 +379,32 @@ else
         }
         polledOnce = true;
         StateHasChanged();
+    }
+
+    /// <summary>
+    /// Runs every poll tick once a subscription exists: re-registers the
+    /// browser's current PushSubscription with the sidecar (a cheap no-op
+    /// there if nothing changed — see AlarmStore.add_subscription) so a
+    /// subscription the sidecar dropped as dead (push service said 404/410)
+    /// self-heals as long as the browser's own copy is still good, and flips
+    /// pushSubscribed back off if the browser's copy is gone entirely — a
+    /// real gap found in testing: the card used to keep claiming
+    /// notifications were enabled long after the subscription behind them
+    /// had quietly been dropped, with nothing on screen to say so.
+    /// </summary>
+    private async Task RecheckPushSubscription()
+    {
+        if (!pushSupported || pushModule is null || pushPermission != "granted") return;
+        try
+        {
+            var existing = await pushModule.InvokeAsync<JsonElement?>("getExistingSubscription");
+            pushSubscribed = existing is { ValueKind: JsonValueKind.Object } sub
+                && await Rpc.SubscribePushAsync(sub);
+        }
+        catch
+        {
+            // Best-effort — a failed recheck shouldn't disrupt the rest of the poll.
+        }
     }
 
     private async Task EnableNotifications()

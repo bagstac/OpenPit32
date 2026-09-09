@@ -129,7 +129,16 @@ class AlarmStore:
         keys = subscription.get("keys") or {}
         if not endpoint or not keys.get("p256dh") or not keys.get("auth"):
             raise AlarmError("subscription needs endpoint and keys.p256dh/auth")
-        self._subscriptions[endpoint] = {"endpoint": endpoint, "keys": keys}
+        entry = {"endpoint": endpoint, "keys": keys}
+        if self._subscriptions.get(endpoint) == entry:
+            # No-op re-registration: GrillDetail.razor re-POSTs its current
+            # subscription on every poll tick to self-heal a subscription the
+            # sidecar dropped as dead while the browser's copy is still good
+            # (see the dead-subscription log below) — skip the disk write
+            # when nothing actually changed, or that would hit the SD card
+            # every 5 seconds for the life of the page.
+            return
+        self._subscriptions[endpoint] = entry
         _save_json(SUBSCRIPTIONS_PATH, list(self._subscriptions.values()))
 
     def remove_subscription(self, endpoint: str) -> None:
@@ -206,7 +215,17 @@ class AlarmStore:
             except WebPushException as ex:
                 status = getattr(ex.response, "status_code", None)
                 if status in (404, 410):
-                    dead.append(endpoint)  # browser unsubscribed / cleared data
+                    # The push service itself says this registration is gone
+                    # (browser unsubscribed, cleared site data, or the OS
+                    # revoked it) — not a bug here, but worth a WARNING (not
+                    # INFO, which the default log level hides) since it
+                    # silently ends alarm notifications for that device until
+                    # GrillDetail.razor's periodic re-subscribe check notices
+                    # the browser has no subscription and re-shows the button.
+                    _LOGGER.warning(
+                        "dropping a push subscription: the push service "
+                        "reported it gone (HTTP %s) while sending %r", status, tag)
+                    dead.append(endpoint)
                 else:
                     _LOGGER.warning("push to a subscriber failed: %s", ex)
         for endpoint in dead:

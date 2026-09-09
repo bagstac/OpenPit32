@@ -377,6 +377,14 @@ class GrillBridge:
         The grill pushes state on its own (see _on_state), so a failure here
         only means the push wins — it must not raise a banner for a command
         that already succeeded.
+
+        Catches Exception broadly, not just pytboss's own Error hierarchy: a
+        BLE hiccup right after a command can surface as a raw bleak.BleakError
+        or a lower-level ConnectionResetError instead (seen in practice — a
+        mid-command reconnect races this refresh), and either one escaping
+        here previously left POST /command's caller with an unhandled 500
+        instead of the success response for a command that had already gone
+        through, showing as a spurious "sidecar error" on the Controls card.
         """
         for _attempt in range(5):
             try:
@@ -386,7 +394,13 @@ class GrillBridge:
                     self.state_at = time.time()
                     self.last_error = None
                     return
-            except Error:
+            except Exception as ex:  # noqa: BLE001 - deliberately broad, see above
+                # WARNING (not INFO, which the default level hides): worth
+                # seeing in logs even though the command itself still went
+                # through — this is exactly what a "sidecar error" report on
+                # the Controls card turns out to be.
+                _LOGGER.warning("post-command refresh failed (command still "
+                                "applied): %s: %s", type(ex).__name__, ex)
                 return
             await asyncio.sleep(2)
 
