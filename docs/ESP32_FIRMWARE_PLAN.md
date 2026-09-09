@@ -31,42 +31,43 @@ everything that follows.
 4. **Static files: a bare-bones container on the Pi** (nginx, no app code),
    not an external static host — keeps the existing Cloudflare Tunnel /
    Docker Compose deployment model unchanged.
-5. **Open, not yet decided: how the login gate itself is implemented.**
-   Recommended below: Cloudflare Access in front of the tunnel hostname,
-   which would let the web-app container be pure static files + reverse
-   proxy, no server process of its own at all. Falling back to porting
-   today's custom login page (a ~150-line aiohttp process, everything
-   grill-specific stripped out) is entirely reasonable if you'd rather keep
-   the current password-manager-friendly form — tell me which before Phase
-   6 below, since it decides whether the web-app container runs one process
-   or two.
+5. **Login stays on the web app** (decided 2026-09-09) — keep today's custom
+   login page rather than switching to Cloudflare Access. The web-app
+   container runs nginx plus a small login-only process: today's
+   `scripts/grill_sidecar.py` login/session code (`/login`, `/logout`,
+   `/auth-check`, the signed-cookie logic), everything grill-specific
+   stripped out — roughly 150 lines. Password-manager-friendly form,
+   30-day sessions, and the `AUTH_SECRET` invalidation story all carry over
+   unchanged from today's implementation.
 
 ## Target architecture
 
 ```
-Browser ──HTTPS──> Cloudflare Tunnel ──> nginx (Pi, one container)
+Browser ──HTTPS──> Cloudflare Tunnel ──> nginx (Pi, "web" container)
                                             │  serves static Blazor files
-                                            │  login gate (see decision 5)
                                             │  proxy_pass /api/* ──────────┐
-                                            │                              ▼
-                                            │                    ESP32 (custom firmware)
-                                            │                              │
-                                            │                              ├─ BLE session + Pit Boss RPC protocol
-                                            │                              ├─ REST JSON API (mirrors today's sidecar)
-                                            │                              ├─ alarm monitor loop
-                                            │                              ├─ Telegram POST on alarm fire
-                                            │                              └─ one-time cloud password fetch
-                                            ▼
-                                      no sidecar container — docker-compose.yml drops to one service
+                                            ▼                              ▼
+                                    auth-check ──────>          ESP32 (custom firmware)
+                                    (login/session,                       │
+                                     tiny process,                        ├─ BLE session + Pit Boss RPC protocol
+                                     "web" or its own                     ├─ REST JSON API (mirrors today's sidecar)
+                                     small container)                     ├─ alarm monitor loop
+                                                                          ├─ Telegram POST on alarm fire
+                                                                          └─ one-time cloud password fetch
 ```
 
-nginx keeps doing exactly what it does today; the only change is what
+nginx keeps doing exactly what it does today; the only real change is what
 `proxy_pass` points at. Because the ESP32's REST API mirrors the sidecar's
 existing shape, **`OpenPit32/Services/GrillRpcService.cs` and the rest of the
 Blazor frontend need no changes** — only `docker/nginx.conf`'s `set $sidecar`
-target moves from the sidecar container to the ESP32's LAN address/port.
-The ESP32 never needs its own CORS or auth handling: nginx (plus Cloudflare,
-per decision 5) is the only thing that ever reaches it.
+target moves from the sidecar container to the ESP32's LAN address/port. The
+ESP32 never needs its own CORS or auth handling: nginx is the only thing
+that ever reaches it, and by the time a request gets there it has already
+passed the login gate. `docker-compose.yml` goes from two services (web +
+sidecar) to two services of a different shape (web + a much smaller
+login-only auth process) — not the zero-app-code outcome Cloudflare Access
+would have given, but keeps today's password-manager-friendly login exactly
+as it is, which is what was decided.
 
 ## Protocol groundwork already done
 
@@ -231,17 +232,15 @@ firmware has proven itself, given what's at stake if it's wrong.
 6. Add the alarm monitor loop + Telegram `notify()`.
 7. Add the `/setup` endpoint (cloud password fetch, run from the ESP32) and
    NVS persistence for password + alarms + Telegram config.
-8. Decide and implement the login-gate approach (decision 5 above); collapse
-   `docker-compose.yml` to one service; remove the Python BLE stack and the
-   frontend's push/notification code.
+8. Port the login-only process (decision 5) from today's
+   `grill_sidecar.py`; remove the Python BLE stack and the frontend's
+   push/notification code.
 9. Update `README.md`, `docs/STATE.md`, `docs/PROTOCOL.md` to describe the
    new architecture; retire this file's "not yet started" framing once
    Phase 1 begins.
 
 ## Still open
 
-- Login-gate mechanism (decision 5) — Cloudflare Access vs. a ported
-  minimal login microservice.
 - Exact NVS storage layout for alarms/config (a flat JSON blob is likely
   fine at this scale; not decided).
 - Whether `/probe-targets` (reading configured probe targets via
