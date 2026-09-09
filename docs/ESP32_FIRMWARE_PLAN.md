@@ -56,6 +56,17 @@ everything that follows.
    actually fires a notification instead of sitting inert). Revisit if a
    future need shows up that the alarms feature doesn't cover — e.g.
    wanting the *official* Pit Boss app to display a target this app set.
+7. **NVS layout: one JSON blob for the alarms list** (decided 2026-09-09),
+   for now. A single key (e.g. `alarms`) holds the whole array as a JSON
+   string, rewritten on every add/remove/fire — a direct port of what
+   `scripts/alarms.py` already does with `alarms.json` today. Config values
+   (grill password, Telegram bot token, Telegram chat id) each get their
+   own individual string key. Considered and set aside: a key per alarm
+   (avoids rewriting the whole list, but needs a second key just to track
+   which alarm-keys exist) and a fixed-size binary struct array (marginally
+   more efficient, but commits to a max alarm count up front and loses
+   JSON's inspectability) — neither is worth the complexity at the scale
+   this runs at (a handful of alarms, changed rarely).
 
 ## Target architecture
 
@@ -256,7 +267,5 @@ firmware has proven itself, given what's at stake if it's wrong.
    new architecture; retire this file's "not yet started" framing once
    Phase 1 begins.
 
-## Still open
-
-- Exact NVS storage layout for alarms/config (a flat JSON blob is likely
-  fine at this scale; not decided).
+All decisions this plan depended on are now made (see "Decisions made"
+above) — nothing left open. Ready for Phase 1 whenever you want to start.
