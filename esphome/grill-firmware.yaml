@@ -1,0 +1,54 @@
+# Phase 1 (docs/ESP32_FIRMWARE_PLAN.md): the grill talks Mongoose OS RPC
+# directly to THIS ESP32 — no PC-side sidecar, no generic bluetooth_proxy
+# hop. Deliberately a separate file from esphome/grill-proxy.yaml, not an
+# edit to it: that one keeps working as an instant rollback (reflash it)
+# until this firmware has proven itself on the bench, per the plan's
+# rollout notes. Do not point this at the grill's real ESP32 without
+# reading that plan first — same hardware notes apply (BOOT/EN dance for
+# the first USB flash, OTA after).
+#
+# This phase only proves the BLE transport: connect by advertised name,
+# discover the RPC/debug-log service, register for notifications, and log
+# one RPC.Ping round trip. No auth, no MCU commands, no state decoding yet
+# — those are later phases once this is confirmed working on real hardware.
+
+esphome:
+  name: grill-firmware
+  friendly_name: Grill Firmware (dev)
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 15min
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+  level: DEBUG
+  logs:
+    pitboss_grill: DEBUG
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+    continuous: true
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+pitboss_grill:
+  id: grill
+  name_prefix: "PBV2-"
