@@ -43,6 +43,15 @@ esp32_ble_tracker:
   scan_parameters:
     active: true
     continuous: true
+  # Confirmed the grill advertises loudly and correctly (RSSI ~-32dBm,
+  # matched by name every ~20-30ms) — removed the debug on_ble_advertise
+  # lambda that proved it. It logged every advertisement at INFO level,
+  # which combined with pitboss_grill's own per-call debug logging almost
+  # certainly caused the WiFi/API instability seen next: this ESP32's
+  # single 2.4GHz radio is shared between BLE and WiFi, and hundreds of
+  # log lines per second competing for the same core/UART starves the
+  # network stack. Lesson for later phases: keep any BLE-scan-frequency
+  # logging heavily rate-limited or one-shot, never per-advertisement.
 
 external_components:
   - source:

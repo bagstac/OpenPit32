@@ -67,6 +67,12 @@ class PitbossGrill : public BLEClientBase {
   uint8_t notifies_expected_{0};
   uint8_t notifies_confirmed_{0};
 
+  // Ongoing bench liveness indicator (see the periodic "status" log in
+  // setup()): a plain counter rather than a per-call log line, both to
+  // avoid flooding the log at the BLE stack's own event rate and to stay
+  // immune to any possibility of a dropped/throttled log line.
+  uint32_t gattc_call_count_{0};
+
   // In-flight reply reassembly: an rx_ctl notification announces a 4-byte
   // length, then that many bytes are read back off rpc_data one GATT read at
   // a time (the characteristic is too small to carry the whole reply).

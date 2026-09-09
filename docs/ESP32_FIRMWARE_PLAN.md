@@ -7,7 +7,53 @@ of the Bluetooth protocol, command dispatch, alarm evaluation, and alerting.
 Current state / why the sidecar exists at all today: `docs/STATE.md`.
 Protocol facts this plan leans on: `docs/PROTOCOL.md`.
 
-This is a plan, not yet started. Nothing here has been implemented.
+Phase 1 (below) is implemented and bench-verified against the real grill;
+everything past it is still ahead.
+
+## Verified 2026-09-09: Phase 1, native BLE connect + RPC.Ping
+
+`esphome/components/pitboss_grill` (custom ESPHome external component) and
+`esphome/grill-firmware.yaml` (a separate file from `grill-proxy.yaml` on
+purpose — see "Rollout plan" below), OTA-flashed to the real grill-proxy
+ESP32 and run against the actual grill:
+
+- Connects by advertised-name prefix (`PBV2-`), matching this project's
+  existing name-based approach rather than a fixed MAC, since the grill's
+  BLE address rotates.
+- Discovers the Mongoose OS RPC-over-GATT service and the debug-log
+  service; registers for notifications on both.
+- The debug-log channel streams the grill's own `<==PB: FE0B...` /
+  `<==PB: FE0C...` push frames live and continuously — the same status/
+  temperature push traffic `docs/PROTOCOL.md` describes.
+- The RPC channel completes a full, repeated `RPC.Ping` round trip (write
+  the chunked request, get the length notification, reassemble the chunked
+  read reply): `{"id":1,"result":{"channel_info":"*","rssi":-70},
+  "src":"PBV2-9451DC46B934"}` — a real reply from the real board id, RSSI
+  varying between calls as expected.
+
+**One real bug found and fixed along the way, worth remembering**:
+`esphome::esp32_ble::ESPBTUUID::from_raw()` does a plain `memcpy` of the 16
+raw bytes with no byte-order conversion. BLE's own wire format for a
+128-bit UUID is byte-reversed relative to the human-readable/RFC4122 string
+form; Python's `uuid.UUID(bytes=...)` (what `pytboss`'s `_uuid()` builds on)
+uses the string-order convention, and `bleak` does the reversal internally
+when it hands the UUID to the OS Bluetooth stack. `from_raw()` alone
+connected and completed service discovery just fine (state legitimately
+reached `ESTABLISHED`) but silently resolved zero characteristics — every
+handle stayed `0x0000` because the service/characteristic UUID lookups
+never matched. `ESPBTUUID::from_raw_reversed()` is the one that matches
+what's actually on the wire; switching to it fixed every lookup at once.
+Anyone porting more of `pytboss`'s raw-16-byte Mongoose UUIDs to C++ later
+needs this same conversion — see the `mongoose_uuid()` helper in
+`pitboss_grill.cpp`.
+
+Separately, worth remembering for future bench sessions: don't leave more
+than one `esphome logs` connection open against the same device — its API
+server caps at 5 connections, and stale watchers left over from earlier
+test cycles (plus the Pi sidecar's own reconnect attempts once this ESP32
+stops running `bluetooth_proxy`) exhausted that limit twice during this
+session, producing a rapid-reconnect symptom that looked like a firmware
+crash but wasn't one.
 
 ## Decisions made (2026-09-09)
 
@@ -245,9 +291,13 @@ Keep `esphome/grill-proxy.yaml` (today's `bluetooth_proxy` config) working
 as a fallback — e.g. a second yaml, or flip a config flag — until the new
 firmware has proven itself, given what's at stake if it's wrong.
 
-1. **Bench de-risking**: native BLE connect + GATT service discovery +
-   an unauthenticated `RPC.Ping`/`Sys.GetInfo` round trip, logged over
-   serial. Proves the framing before anything grill-specific.
+1. ✅ **Done (2026-09-09)** — **Bench de-risking**: native BLE connect + GATT
+   service discovery + an unauthenticated `RPC.Ping` round trip. See
+   "Verified" above; logged over the network API rather than serial in the
+   end (no USB access to the deployed board), which cost real debugging
+   time chasing timing artifacts in one-shot logs before switching to
+   periodic/counter-based diagnostics — worth doing that from the start
+   next time.
 2. Port the auth codec; call authenticated `PB.GetState`; log the decoded
    JSON and diff it against what the current sidecar logs for the same
    moment.

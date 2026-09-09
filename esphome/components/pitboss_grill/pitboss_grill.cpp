@@ -20,6 +20,19 @@ static const std::string CHAR_RPC_RX_CTL = "_mOS_RPC_rx_ctl_";
 static const std::string SERVICE_DEBUG = "_mOS_DBG_SVC_ID_";
 static const std::string CHAR_DEBUG_LOG = "0mOS_DBG_log___0";
 
+// BLE's own wire format for a 128-bit UUID is byte-reversed relative to its
+// human-readable/RFC4122 string form; Python's uuid.UUID(bytes=...) (what
+// pytboss's _uuid() builds on) uses that string-order convention, and bleak
+// does the reversal for you when it hands the UUID to the OS Bluetooth
+// stack. ESPBTUUID::from_raw() does a plain memcpy with no such reversal.
+// Confirmed on the bench: from_raw() left every characteristic handle at
+// 0x0000 despite a real, established connection and completed service
+// discovery; switching to from_raw_reversed() resolved all four handles
+// and a full RPC.Ping round trip immediately followed.
+static ESPBTUUID mongoose_uuid(const std::string &raw16) {
+  return ESPBTUUID::from_raw_reversed(reinterpret_cast<const uint8_t *>(raw16.data()));
+}
+
 // A frame is a chunked GATT write: 4-byte big-endian length on the "ctl"
 // characteristic, then the JSON body in <=20-byte pieces on "data" — ports
 // pytboss/ble.py's _encode_len()/_send_prepared_command().
@@ -28,6 +41,33 @@ static const size_t RPC_CHUNK_SIZE = 20;
 void PitbossGrill::setup() {
   BLEClientBase::setup();
   this->set_auto_connect(true);
+
+  // Periodic rather than one-shot, and via the global scheduler rather than
+  // loop() (which BLEClientBase disables once state reaches IDLE, since
+  // parse_device() dispatch doesn't need per-tick polling): a one-shot log
+  // here reliably lands in the instant right after boot, before a network
+  // log client has finished the WiFi/API handshake to see it. Useful
+  // ongoing bench visibility, not just a one-time check.
+  this->set_interval("status", 10000, [this]() {
+    ESP_LOGD(TAG, "status: state=%d rpc_data=0x%04x rpc_tx_ctl=0x%04x rpc_rx_ctl=0x%04x "
+                  "debug_log=0x%04x notifies=%d/%d gattc_calls=%u",
+             static_cast<int>(this->state()), this->rpc_data_handle_, this->rpc_tx_ctl_handle_,
+             this->rpc_rx_ctl_handle_, this->debug_log_handle_, this->notifies_confirmed_,
+             this->notifies_expected_, this->gattc_call_count_);
+  });
+
+  // Phase 1's own bench check (docs/ESP32_FIRMWARE_PLAN.md): repeats
+  // RPC.Ping on the actual RPC write/notify/read channel — a different,
+  // more demanding path than the debug-log notify-only channel the status
+  // log above already shows live — so a real reply here is direct, ongoing
+  // confirmation the full command round trip still works, not just a
+  // connection. Later phases replace this with real commands; harmless to
+  // leave running until then.
+  this->set_interval("ping", 15000, [this]() {
+    if (this->state() == espbt::ClientState::ESTABLISHED && this->notifies_confirmed_ >= this->notifies_expected_) {
+      this->send_ping_();
+    }
+  });
 }
 
 void PitbossGrill::loop() { BLEClientBase::loop(); }
@@ -43,6 +83,19 @@ bool PitbossGrill::parse_device(const espbt::ESPBTDevice &device) {
   // the grill's BLE address is random and rotates between connections (see
   // docs/PROTOCOL.md), exactly why the sidecar's esphome_ble.find_grill()
   // does the same thing today.
+  // Temporary diagnostic, rate-limited to once: parse_device() logging
+  // nothing at all (even for a non-match) can't distinguish "never called"
+  // from "guard rejected it" — this answers that unconditionally, without
+  // logging on every advertisement (the grill re-advertises every ~20-30ms,
+  // and that volume of logging is almost certainly what destabilized the
+  // WiFi/API connection in the previous build).
+  static bool logged_first_parse_device = false;
+  if (!logged_first_parse_device) {
+    logged_first_parse_device = true;
+    ESP_LOGD(TAG, "first parse_device() call: name='%s' state=%d", device.get_name().c_str(),
+             static_cast<int>(this->state()));
+  }
+
   if (this->state() != espbt::ClientState::IDLE)
     return false;
   const std::string &name = device.get_name();
@@ -57,10 +110,10 @@ bool PitbossGrill::parse_device(const espbt::ESPBTDevice &device) {
 }
 
 void PitbossGrill::resolve_characteristics_() {
-  auto *data_chr = this->get_characteristic(ESPBTUUID::from_raw(SERVICE_RPC), ESPBTUUID::from_raw(CHAR_RPC_DATA));
-  auto *tx_ctl_chr = this->get_characteristic(ESPBTUUID::from_raw(SERVICE_RPC), ESPBTUUID::from_raw(CHAR_RPC_TX_CTL));
-  auto *rx_ctl_chr = this->get_characteristic(ESPBTUUID::from_raw(SERVICE_RPC), ESPBTUUID::from_raw(CHAR_RPC_RX_CTL));
-  auto *debug_chr = this->get_characteristic(ESPBTUUID::from_raw(SERVICE_DEBUG), ESPBTUUID::from_raw(CHAR_DEBUG_LOG));
+  auto *data_chr = this->get_characteristic(mongoose_uuid(SERVICE_RPC), mongoose_uuid(CHAR_RPC_DATA));
+  auto *tx_ctl_chr = this->get_characteristic(mongoose_uuid(SERVICE_RPC), mongoose_uuid(CHAR_RPC_TX_CTL));
+  auto *rx_ctl_chr = this->get_characteristic(mongoose_uuid(SERVICE_RPC), mongoose_uuid(CHAR_RPC_RX_CTL));
+  auto *debug_chr = this->get_characteristic(mongoose_uuid(SERVICE_DEBUG), mongoose_uuid(CHAR_DEBUG_LOG));
 
   if (data_chr == nullptr || tx_ctl_chr == nullptr || rx_ctl_chr == nullptr || debug_chr == nullptr) {
     ESP_LOGE(TAG, "Grill did not expose the expected Mongoose OS RPC/debug service — "
@@ -96,8 +149,8 @@ void PitbossGrill::register_for_notifications_() {
 }
 
 void PitbossGrill::write_rpc_command_(const std::string &json) {
-  auto *data_chr = this->get_characteristic(ESPBTUUID::from_raw(SERVICE_RPC), ESPBTUUID::from_raw(CHAR_RPC_DATA));
-  auto *tx_ctl_chr = this->get_characteristic(ESPBTUUID::from_raw(SERVICE_RPC), ESPBTUUID::from_raw(CHAR_RPC_TX_CTL));
+  auto *data_chr = this->get_characteristic(mongoose_uuid(SERVICE_RPC), mongoose_uuid(CHAR_RPC_DATA));
+  auto *tx_ctl_chr = this->get_characteristic(mongoose_uuid(SERVICE_RPC), mongoose_uuid(CHAR_RPC_TX_CTL));
   if (data_chr == nullptr || tx_ctl_chr == nullptr) {
     ESP_LOGE(TAG, "Cannot send RPC command — characteristics not resolved");
     return;
@@ -186,7 +239,9 @@ void PitbossGrill::on_debug_log_(const uint8_t *data, uint16_t len) {
 
 bool PitbossGrill::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                                        esp_ble_gattc_cb_param_t *param) {
-  if (!BLEClientBase::gattc_event_handler(event, gattc_if, param))
+  this->gattc_call_count_++;  // liveness indicator, see the header comment
+  bool accepted = BLEClientBase::gattc_event_handler(event, gattc_if, param);
+  if (!accepted)
     return false;
 
   switch (event) {
