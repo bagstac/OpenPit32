@@ -28,17 +28,34 @@ everything that follows.
    now**, explicitly as a placeholder to prove the pattern out — the plan
    below keeps the sending code to one small, swappable function so moving
    to ntfy.sh or Pushover later is a one-function change, not a redesign.
-4. **Static files: a bare-bones container on the Pi** (nginx, no app code),
-   not an external static host — keeps the existing Cloudflare Tunnel /
-   Docker Compose deployment model unchanged.
+4. **Static files: a bare-bones container on the Pi** (nginx), not an
+   external static host — keeps the existing Cloudflare Tunnel / Docker
+   Compose deployment model unchanged.
 5. **Login stays on the web app** (decided 2026-09-09) — keep today's custom
-   login page rather than switching to Cloudflare Access. The web-app
-   container runs nginx plus a small login-only process: today's
+   login page rather than switching to Cloudflare Access. The web-app side
+   runs nginx plus a small login-only process: today's
    `scripts/grill_sidecar.py` login/session code (`/login`, `/logout`,
    `/auth-check`, the signed-cookie logic), everything grill-specific
    stripped out — roughly 150 lines. Password-manager-friendly form,
    30-day sessions, and the `AUTH_SECRET` invalidation story all carry over
-   unchanged from today's implementation.
+   unchanged from today's implementation. ("Bare-bones" in decision 4 above
+   meant no *grill* logic, not literally zero server code — this login
+   process is the one exception.)
+6. **Probe-target setting is not being ported** (decided 2026-09-09).
+   Purpose, for future reference: it lets you store a desired temperature
+   for a meat probe on the grill's own controller (e.g. "probe 1 → 203°F"),
+   which the official Pit Boss app shows next to that probe's live reading.
+   On this board it is **not enforced by the grill** — it's a generic
+   "virtual data" scratch value (`PB.Get/SetVirtualData`) the firmware just
+   remembers and hands back, not something that triggers a shutoff or alert
+   on its own; some other boards wire it to a real MCU command, PBV2
+   doesn't. Today's sidecar only ever reads this back (`GET /probe-targets`)
+   — nothing in this app has ever written it — and it's functionally
+   superseded by this project's own alarms feature (a probe-sensor alarm
+   gets you the same "tell me when the meat hits X" outcome, except it
+   actually fires a notification instead of sitting inert). Revisit if a
+   future need shows up that the alarms feature doesn't cover — e.g.
+   wanting the *official* Pit Boss app to display a target this app set.
 
 ## Target architecture
 
@@ -243,6 +260,3 @@ firmware has proven itself, given what's at stake if it's wrong.
 
 - Exact NVS storage layout for alarms/config (a flat JSON blob is likely
   fine at this scale; not decided).
-- Whether `/probe-targets` (reading configured probe targets via
-  `PB.Get/SetVirtualData`) is worth porting — not currently exposed in the
-  Blazor UI, so may be dropped rather than ported.
