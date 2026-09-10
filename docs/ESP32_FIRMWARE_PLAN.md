@@ -7,8 +7,8 @@ of the Bluetooth protocol, command dispatch, alarm evaluation, and alerting.
 Current state / why the sidecar exists at all today: `docs/STATE.md`.
 Protocol facts this plan leans on: `docs/PROTOCOL.md`.
 
-Phases 1 and 2 (below) are implemented and bench-verified against the real
-grill; everything past that is still ahead.
+Phases 1 through 3 (below) are implemented and bench-verified against the
+real grill; everything past that is still ahead.
 
 ## Verified 2026-09-09: Phase 1, native BLE connect + RPC.Ping
 
@@ -97,6 +97,43 @@ completion event (see `write_next_rpc_chunk_()`/`on_rpc_write_complete_()`)
 instead of firing them in a loop. Anyone adding a request with a longer
 body later should keep using that same event-paced path rather than
 looping over `write_value()` directly.
+
+## Verified 2026-09-09: Phase 3, status/temperature decoding
+
+`pitboss_grill.cpp`'s `parse_status_frame_()`/`parse_temperature_frame_()`
+decode the sc_11/sc_12 (FE0B/FE0C) frames into a new `GrillState` struct
+(`pitboss_grill.h`), exposed via `grill_state()`. The decode is ported from
+pytboss's `grills.json` **"PBV2"** control board entry specifically (the
+board `scripts/grill_sidecar.py`'s `CONTROL_BOARD` names) — not a general
+decode: `grills.json` ships ~20 control boards as vendor JavaScript
+(evaluated through a JS interpreter in `pytboss/grills.py`), each reading
+different byte offsets, and this project only ever talks to one grill.
+Fields are only pulled from wherever PBV2's own routine actually reads them
+— e.g. probe/chamber temperatures come from FE0C only, since PBV2's FE0B
+routine leaves that block commented out.
+
+Both frame sources are wired to the same decoders: the authenticated
+`PB.GetState` reply (`on_get_state_reply_()`, every 15s) and the grill's own
+unauthenticated debug-log pushes (`on_debug_log_()`, `<==PB: FE0B…`/`<==PB:
+FE0C…` lines, arriving every few seconds) — so `grill_state()` stays current
+between polls rather than only updating once per cycle.
+
+OTA-flashed and run against the real grill (bench: mains-powered, module
+off, no probes connected):
+
+- Status decodes correctly: `on=0 fan=0 igniter=0 auger=0 light=0 prime=0
+  no_pellets=0 errs(...)=0/0/0/0/0/0/0/0` — matches the bench's actual
+  state (grill on mains but not switched on at the module).
+- Temperatures decode correctly: `Temps (F): grill=71/140 smoker=71 p1=-1
+  p2=-1 p3=-1 p4=0` — grill ambient/setpoint and smoker sensor read real
+  values, disconnected probes 1-3 report `-1` (not a bogus temperature),
+  and probe 4 (present but reading near-zero on the bench) comes through as
+  `0`. Independently hand-verified against the same captured hex frames
+  before flashing.
+- Ran stable for the full observation window with both decoders firing
+  continuously (unauthenticated pushes every few seconds, authenticated
+  `PB.GetState` every 15s) — `gattc_calls` climbed steadily (24→71+) with no
+  crashes, disconnects, or dropped writes.
 
 ## Decisions made (2026-09-09)
 
@@ -346,8 +383,9 @@ firmware has proven itself, given what's at stake if it's wrong.
    JSON. See "Verified" above — including a real BLE write-pacing bug
    found and fixed along the way, worth reading before touching
    `write_rpc_command_()`.
-3. Wire status/temperature decoding (the `sc_11`/`sc_12` frames' bit-level
-   fields — see "Verified" above) into the component's internal state.
+3. ✅ **Done (2026-09-09)** — **Status/temperature decoding**: decode the
+   `sc_11`/`sc_12` (FE0B/FE0C) frames' bit-level fields into the
+   component's internal state. See "Verified" above.
 4. Add the REST endpoints (`/health`, `/state`, `/info`) — read-only —
    and repoint nginx's `proxy_pass` at the ESP32 to confirm the Blazor app
    renders live data with zero frontend changes.
@@ -364,5 +402,5 @@ firmware has proven itself, given what's at stake if it's wrong.
    Phase 1 begins.
 
 All decisions this plan depended on are now made (see "Decisions made"
-above) — nothing left open. Phases 1 and 2 are done; ready for Phase 3
-(status/temperature decoding) whenever you want to start.
+above) — nothing left open. Phases 1 through 3 are done; ready for Phase 4
+(REST endpoints) whenever you want to start.

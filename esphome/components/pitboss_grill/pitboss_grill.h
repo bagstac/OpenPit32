@@ -10,14 +10,15 @@
 // Phase 1: connect, discover the RPC/debug-log characteristics, register
 // for notifications, round-trip one unauthenticated RPC.Ping. Phase 2 adds
 // the auth codec (pytboss/codec.py's timed_key()/encode(), ported to C++)
-// and an authenticated PB.GetState call — both bench-verified against real
-// hardware as of 2026-09-09.
+// and an authenticated PB.GetState call. Phase 3 decodes the sc_11/sc_12
+// (FE0B/FE0C) status/temperature frames into GrillState below — both the
+// authenticated PB.GetState reply and the grill's own unauthenticated
+// debug-log pushes carry the same two frames, decoded the same way. All
+// three phases are bench-verified against real hardware as of 2026-09-09.
 //
 // NOT yet implemented here (later phases): MCU commands (set-temperature,
-// turn-on/off) and bit-level decoding of the sc_11/sc_12 (FE0B/FE0C)
-// status/temperature frames into ESPHome entities — see
-// on_get_state_reply_()/on_debug_log_() for where those raw frames already
-// surface today, logged but not parsed.
+// turn-on/off), and exposing GrillState as actual ESPHome entities /
+// REST endpoints rather than just an internal struct + log lines.
 
 #ifdef USE_ESP32
 
@@ -58,6 +59,60 @@ class PitbossGrill : public BLEClientBase {
   /// flow run from the ESP32 itself.
   void set_grill_password(const std::string &password) { this->grill_password_ = password; }
 
+  // Decoded status/temperature state — the bit-level fields inside the
+  // sc_11/sc_12 (FE0B/FE0C) frames, decoded per this project's specific
+  // control board (see parse_status_frame_()/parse_temperature_frame_() in
+  // the .cpp, ported from pytboss's grills.json "PBV2" control board entry).
+  // A different control board reads different byte offsets — grills.json
+  // ships ~20 of them as vendor JS, run through pytboss's own JS
+  // interpreter — so this is deliberately hardcoded to the one board this
+  // project's grill uses (scripts/grill_sidecar.py's CONTROL_BOARD), not a
+  // general decode.
+  struct GrillState {
+    bool has_status{false};
+    bool has_temperatures{false};
+
+    // -- from the FE0B status frame --
+    bool module_is_on{false};
+    bool err1{false};
+    bool err2{false};
+    bool err3{false};
+    bool high_temp_err{false};
+    bool fan_err{false};
+    bool hot_err{false};
+    bool motor_err{false};
+    bool no_pellets{false};
+    bool er_l{false};
+    bool fan_state{false};
+    bool hot_state{false};
+    bool motor_state{false};
+    bool light_state{false};
+    bool prime_state{false};
+    uint8_t recipe_step{0};
+    uint32_t recipe_time_s{0};
+
+    // -- from the FE0C temperature frame --
+    // Degrees, in whatever unit the grill itself is set to (is_fahrenheit
+    // says which — both frames are converted to match it, mirroring
+    // pytboss's own ftoc() step). -1 means "no reading": a disconnected
+    // probe, or the grill's own 960 sentinel — see convert_temperature_()
+    // in the .cpp. p1-p4 are meat probes; the rest are the chamber itself.
+    int16_t p1_temp{-1};
+    int16_t p2_temp{-1};
+    int16_t p3_temp{-1};
+    int16_t p4_temp{-1};
+    int16_t smoker_act_temp{-1};
+    int16_t grill_temp{-1};
+    int16_t grill_set_temp{-1};
+    bool is_fahrenheit{true};
+  };
+
+  /// Latest decoded status/temperature state — see GrillState above. Updated
+  /// from both the 15s authenticated PB.GetState cycle and the grill's own
+  /// unauthenticated debug-log pushes, whichever arrives; has_status/
+  /// has_temperatures are false until the first frame of each kind lands.
+  const GrillState &grill_state() const { return this->grill_state_; }
+
  protected:
   void resolve_characteristics_();
   void register_for_notifications_();
@@ -74,6 +129,8 @@ class PitbossGrill : public BLEClientBase {
   void write_rpc_command_(const std::string &json);
   void write_next_rpc_chunk_();
   void on_rpc_write_complete_(uint16_t handle, esp_gatt_status_t status);
+  void parse_status_frame_(const std::string &hex);
+  void parse_temperature_frame_(const std::string &hex);
 
   std::string name_prefix_{"PBV2-"};
   std::string grill_password_;
@@ -117,6 +174,8 @@ class PitbossGrill : public BLEClientBase {
   std::string rpc_write_json_;
   size_t rpc_write_offset_{0};
   bool rpc_write_in_progress_{false};
+
+  GrillState grill_state_;
 };
 
 }  // namespace pitboss_grill

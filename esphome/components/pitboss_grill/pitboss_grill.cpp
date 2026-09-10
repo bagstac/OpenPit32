@@ -5,6 +5,7 @@
 #include <esp_random.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #ifdef USE_ESP32
 
@@ -94,6 +95,28 @@ static std::vector<uint8_t> pb_encode(const std::string &data, const std::vector
   return ret;
 }
 
+// Splits a hex string into its byte values, one per two hex chars — port of
+// pytboss's parseHexMessage(). No validity checking: callers only ever pass
+// sc_11/sc_12 or a debug-log push, both of which are either empty or a
+// well-formed hex string the grill itself produced.
+static std::vector<uint8_t> parse_hex_bytes(const std::string &hex) {
+  std::vector<uint8_t> out;
+  out.reserve(hex.size() / 2);
+  for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+    out.push_back(static_cast<uint8_t>(strtoul(hex.substr(i, 2).c_str(), nullptr, 16)));
+  }
+  return out;
+}
+
+// Port of pytboss's convertTemperature(): three decimal digits packed one
+// per byte, big-endian (e.g. bytes 0,7,1 -> 71). 960 is the grill's own
+// "disconnected probe" sentinel (digits 9-6-0) — returned here as -1 rather
+// than a magic number the caller has to know about.
+static int16_t convert_temperature(const std::vector<uint8_t> &parts, size_t start) {
+  int temp = parts[start] * 100 + parts[start + 1] * 10 + parts[start + 2];
+  return temp == 960 ? -1 : static_cast<int16_t>(temp);
+}
+
 static std::string to_hex(const std::vector<uint8_t> &data) {
   static const char *const DIGITS = "0123456789abcdef";
   std::string out;
@@ -154,7 +177,7 @@ void PitbossGrill::setup() {
 void PitbossGrill::loop() { BLEClientBase::loop(); }
 
 void PitbossGrill::dump_config() {
-  ESP_LOGCONFIG(TAG, "Pitboss Grill (Phase 2 — authenticated PB.GetState):");
+  ESP_LOGCONFIG(TAG, "Pitboss Grill (Phase 3 — status/temperature decoding):");
   ESP_LOGCONFIG(TAG, "  Advertised-name prefix: %s", this->name_prefix_.c_str());
 }
 
@@ -376,22 +399,109 @@ void PitbossGrill::on_get_state_reply_(const std::string &json) {
              json.c_str());
     return;
   }
-  // The reply's own top-level fields are "sc_11" (status) and "sc_12"
-  // (temperatures) — the same two raw FE0B/FE0C hex frames already pushed
-  // unauthenticated over the debug-log channel (see docs/PROTOCOL.md
-  // section 2 and the "Debug log:" lines), not named fields like
-  // "moduleIsOn"/"grillTemp" directly. pytboss's PitBoss.get_state() (see
-  // api.py) runs each frame through its per-control-board parse_status()/
-  // parse_temperatures() to get those names; porting that bit-level decode
-  // is Phase 3 (see pitboss_grill.h's header comment). Either frame can
-  // legitimately be blank — the firmware clears both the instant it
-  // forwards a command to the MCU and refills them from the next reply, so
-  // an empty string here isn't an error, just a poll that landed in that
-  // window.
+  // The reply's own top-level fields are "sc_11" (status, FE0B) and "sc_12"
+  // (temperatures, FE0C) — the same two raw frames the grill also *pushes*
+  // unauthenticated over the debug-log channel (see on_debug_log_()); both
+  // sources are decoded the same way, by parse_status_frame_()/
+  // parse_temperature_frame_() below. Either frame can legitimately be
+  // blank here — the firmware clears both the instant it forwards a command
+  // to the MCU and refills them from the next reply — so a blank one isn't
+  // an error, just a poll that landed in that window.
   std::string sc_11 = doc["result"]["sc_11"] | "";
   std::string sc_12 = doc["result"]["sc_12"] | "";
-  ESP_LOGI(TAG, "PB.GetState OK: sc_11(status)=%s sc_12(temps)=%s", sc_11.empty() ? "(blank)" : sc_11.c_str(),
-           sc_12.empty() ? "(blank)" : sc_12.c_str());
+  if (!sc_11.empty())
+    this->parse_status_frame_(sc_11);
+  if (!sc_12.empty())
+    this->parse_temperature_frame_(sc_12);
+  if (sc_11.empty() && sc_12.empty())
+    ESP_LOGD(TAG, "PB.GetState OK, both frames blank (poll landed mid-command)");
+}
+
+// Decodes an FE0B status frame — ported from pytboss's grills.json "PBV2"
+// control board (control_boards.PBV2.status_function; see grills.py for how
+// pytboss itself evaluates it, through a JS interpreter). PBV2's own routine
+// leaves the probe/chamber-temperature block (bytes 2-22) commented out —
+// those all come from the FE0C temperature frame instead, decoded in
+// parse_temperature_frame_() below — so this only ever fills in the
+// on/off/error/state flags and the recipe timer.
+void PitbossGrill::parse_status_frame_(const std::string &hex) {
+  if (hex.compare(0, 4, "FE0B") != 0) {
+    ESP_LOGW(TAG, "Status frame missing FE0B header: %s", hex.c_str());
+    return;
+  }
+  auto parts = parse_hex_bytes(hex);
+  if (parts.size() < 44) {
+    ESP_LOGW(TAG, "Status frame too short (%d bytes, need 44): %s", static_cast<int>(parts.size()), hex.c_str());
+    return;
+  }
+  auto &s = this->grill_state_;
+  s.has_status = true;
+  s.module_is_on = parts[24] == 1;
+  s.err1 = parts[25] == 1;
+  s.err2 = parts[26] == 1;
+  s.err3 = parts[27] == 1;
+  s.high_temp_err = parts[28] == 1;
+  s.fan_err = parts[29] == 1;
+  s.hot_err = parts[30] == 1;
+  s.motor_err = parts[31] == 1;
+  s.no_pellets = parts[32] == 1;
+  s.er_l = parts[33] == 1;
+  s.fan_state = parts[34] == 1;
+  s.hot_state = parts[35] == 1;
+  s.motor_state = parts[36] == 1;
+  s.light_state = parts[37] == 1;
+  s.prime_state = parts[38] == 1;
+  s.recipe_step = parts[40];
+  s.recipe_time_s = static_cast<uint32_t>(parts[41]) * 3600 + parts[42] * 60 + parts[43];
+  ESP_LOGI(TAG, "Status: on=%d fan=%d igniter=%d auger=%d light=%d prime=%d no_pellets=%d "
+                "errs(1/2/3/hi_temp/fan/hot/motor/erL)=%d/%d/%d/%d/%d/%d/%d/%d",
+           s.module_is_on, s.fan_state, s.hot_state, s.motor_state, s.light_state, s.prime_state, s.no_pellets,
+           s.err1, s.err2, s.err3, s.high_temp_err, s.fan_err, s.hot_err, s.motor_err, s.er_l);
+}
+
+// Decodes an FE0C temperature frame — ported from pytboss's grills.json
+// "PBV2" control board (control_boards.PBV2.temperature_function). Values
+// are converted to Celsius when the grill itself is set to Celsius,
+// matching pytboss's own ftoc() step, so grill_state() always reports in
+// whatever unit is_fahrenheit says it's in.
+void PitbossGrill::parse_temperature_frame_(const std::string &hex) {
+  if (hex.compare(0, 4, "FE0C") != 0) {
+    ESP_LOGW(TAG, "Temperature frame missing FE0C header: %s", hex.c_str());
+    return;
+  }
+  auto parts = parse_hex_bytes(hex);
+  if (parts.size() < 27) {
+    ESP_LOGW(TAG, "Temperature frame too short (%d bytes, need 27): %s", static_cast<int>(parts.size()), hex.c_str());
+    return;
+  }
+  auto &s = this->grill_state_;
+  s.has_temperatures = true;
+  s.p1_temp = convert_temperature(parts, 5);
+  s.p2_temp = convert_temperature(parts, 8);
+  s.p3_temp = convert_temperature(parts, 11);
+  s.p4_temp = convert_temperature(parts, 14);
+  s.smoker_act_temp = convert_temperature(parts, 17);
+  s.grill_set_temp = convert_temperature(parts, 20);
+  s.grill_temp = convert_temperature(parts, 23);
+  s.is_fahrenheit = parts[26] == 1;
+  if (!s.is_fahrenheit) {
+    // -1 is the "no reading" sentinel (see convert_temperature()), left
+    // alone rather than run through the conversion below — pytboss's own
+    // vendor JS has a bug here (it compares against 960 *after* that's
+    // already been mapped to null, so the comparison never fires); pytboss
+    // patches it at load time (grills.py's _FTOC_SENTINEL_RE) to skip null
+    // too, which is what this -1 check reproduces.
+    auto ftoc = [](int16_t t) { return t < 0 ? t : static_cast<int16_t>(std::floor((t - 32) / 1.8)); };
+    s.p1_temp = ftoc(s.p1_temp);
+    s.p2_temp = ftoc(s.p2_temp);
+    s.p3_temp = ftoc(s.p3_temp);
+    s.p4_temp = ftoc(s.p4_temp);
+    s.smoker_act_temp = ftoc(s.smoker_act_temp);
+    s.grill_set_temp = ftoc(s.grill_set_temp);
+    s.grill_temp = ftoc(s.grill_temp);
+  }
+  ESP_LOGI(TAG, "Temps (%s): grill=%d/%d smoker=%d p1=%d p2=%d p3=%d p4=%d", s.is_fahrenheit ? "F" : "C", s.grill_temp,
+           s.grill_set_temp, s.smoker_act_temp, s.p1_temp, s.p2_temp, s.p3_temp, s.p4_temp);
 }
 
 void PitbossGrill::request_next_reply_chunk_() {
@@ -466,9 +576,25 @@ void PitbossGrill::on_rpc_read_(const uint8_t *data, uint16_t len) {
 }
 
 void PitbossGrill::on_debug_log_(const uint8_t *data, uint16_t len) {
-  // Not parsed yet (that's the FE0B/FE0C status/temperature work for a
-  // later phase) — logged so a real grill's push traffic is visible now.
   std::string text(reinterpret_cast<const char *>(data), len);
+  while (!text.empty() && (text.back() == '\r' || text.back() == '\n'))
+    text.pop_back();
+  // The grill also *pushes* its own status/temperature frames here
+  // unprompted (docs/PROTOCOL.md section 2), as lines like "<==PB: FE0B...".
+  // Decoded the same way as PB.GetState's sc_11/sc_12 (see
+  // on_get_state_reply_()), so grill_state() stays current between the 15s
+  // GetState polls instead of only updating once per cycle. Anything else
+  // on this channel (Mongoose's own boot/debug chatter) is just logged.
+  size_t frame_pos = text.find("FE0B");
+  if (frame_pos != std::string::npos) {
+    this->parse_status_frame_(text.substr(frame_pos));
+    return;
+  }
+  frame_pos = text.find("FE0C");
+  if (frame_pos != std::string::npos) {
+    this->parse_temperature_frame_(text.substr(frame_pos));
+    return;
+  }
   ESP_LOGD(TAG, "Debug log: %s", text.c_str());
 }
 
