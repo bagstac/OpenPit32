@@ -22,6 +22,10 @@
 // set-temperature) behind the same confirm semantics grill_sidecar.py's
 // bridge.command() enforces today — see handle_command_()'s comment for the
 // full flow. All five phases are bench-verified against real hardware.
+// POST /config (added 2026-09-10, not a numbered phase) makes
+// error_display_threshold_ — how many consecutive PB.GetState rejections
+// before one is shown as an error — a runtime setting instead of a
+// hardcoded constant; see its own comment below.
 //
 // NOT yet implemented here (later phases): the alarm monitor + Telegram
 // notify(), and the /setup cloud-password-fetch + NVS persistence flow.
@@ -38,6 +42,7 @@
 #include <esp_gattc_api.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -196,6 +201,10 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   // the BLE round trip actually completes, mirroring grill_sidecar.py's
   // bridge.command(), which the caller awaits to completion the same way).
   void handle_command_(AsyncWebServerRequest *request);
+  // POST /config — currently just error_display_threshold (see
+  // error_display_threshold_'s comment). Doesn't touch BLE at all, so unlike
+  // handle_command_() this answers synchronously with no defer()/semaphore.
+  void handle_config_(AsyncWebServerRequest *request);
 
   // Phase 4 is the first thing that reads grill_state_/last_error_/board_id_/
   // last_rssi_ from outside the task that writes them — the REST handlers
@@ -222,6 +231,17 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   uint8_t meat_probes_{3};
   web_server_base::WebServerBase *web_server_base_{nullptr};
 
+  // How many consecutive PB.GetState rejections (see get_state_reject_
+  // streak_) are required before one is surfaced as last_error_ — the "5
+  // consecutive cycles" delay requested 2026-09-10, made runtime-adjustable
+  // (POST /config, see handle_config_()) rather than a YAML compile-time
+  // constant so the web app can tune it without a reflash. atomic because
+  // handle_config_() (httpd task) writes it and on_get_state_reply_() (main
+  // loop) reads it — a plain uint8_t would be a real, if narrow, data race.
+  // In-memory only: resets to the default on every boot/reflash, same as
+  // everything else here that isn't yet in the Phase 7 NVS plan.
+  std::atomic<uint8_t> error_display_threshold_{5};
+
   // The grill's full advertised name (e.g. "PBV2-9451DC46B934"), captured in
   // parse_device() — reported by /info as board_id, same as the sidecar's.
   std::string board_id_;
@@ -243,6 +263,17 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   // RPC/decode failure, cleared on the next success. Empty means "no error
   // outstanding", not "never started".
   std::string last_error_;
+
+  // Consecutive PB.GetState rejections (see on_get_state_reply_()) since the
+  // last success — main-loop-only, same as pending_reply_, since it's only
+  // ever touched from there. A single spurious 401 is expected, documented
+  // behavior (docs/PROTOCOL.md: a slow write can land in the wrong 10s auth
+  // key bucket) that self-heals on the very next 15s cycle, so surfacing it
+  // as last_error_ on the first occurrence just flashes a false alarm in the
+  // UI — set_last_error_() is only called once this streak reaches
+  // error_display_threshold_. Does NOT gate the ESP_LOGW in
+  // on_get_state_reply_() itself, which stays unthrottled for diagnostics.
+  uint8_t get_state_reject_streak_{0};
 
   // Only one RPC request is ever in flight at a time (see write_rpc_command_
   // and the reply-reassembly fields below) — this says which one, so

@@ -13,10 +13,13 @@
 #
 # This file is an envsubst *.template (docker/web.Dockerfile copies it into
 # nginx:alpine's /etc/nginx/templates/, which substitutes ${VAR} before
-# nginx starts) so $GRILL_PROXY_HOST only has to be set in one place — the
-# same variable docker-compose.yml already passes to the sidecar for this
-# exact board. Everything else below stays plain nginx syntax: bare
-# $variable (no braces) is an nginx runtime variable, untouched by envsubst.
+# nginx starts) so the GRILL_PROXY_HOST env var only has to be set in one
+# place — the same one docker-compose.yml already passes to the sidecar for
+# this exact board. Everything else below stays plain nginx syntax: bare
+# $variable (no braces) is an nginx runtime variable, but be careful adding
+# more comments here — envsubst substitutes bare $NAME too, for any name
+# that happens to match a real env var, comments included. Only ${...} with
+# braces is intentional in this file.
 #
 # 127.0.0.11 is Docker Compose's embedded DNS; re-resolving per-request
 # (via the $sidecar variable in proxy_pass) rather than once at nginx
@@ -86,11 +89,11 @@ server {
 
     # /health, /state, /info now come straight from the grill's ESP32
     # (Phase 4) instead of the sidecar — same paths, same JSON shapes, still
-    # behind the same login. These three `location =` exact matches take
-    # precedence over the /api/ prefix block below regardless of file order,
-    # so everything else under /api/ (command, setup, alarms, push, models,
-    # probe-targets — not yet ported, rollout items 5-8) keeps going to the
-    # sidecar unchanged.
+    # behind the same login. /config (below) is ESP32-only, no sidecar
+    # equivalent. These `location =` exact matches take precedence over the
+    # /api/ prefix block below regardless of file order, so everything else
+    # under /api/ (command, setup, alarms, push, models, probe-targets — not
+    # yet ported, rollout items 5-8) keeps going to the sidecar unchanged.
     location = /api/health {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
@@ -109,6 +112,17 @@ server {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
         proxy_pass $grill_esp32/info;
+        proxy_set_header Host $host;
+    }
+
+    # POST /config — the ESP32-only error_display_threshold setting (2026-09-10,
+    # not part of the sidecar's API). Same exact-match precedence as the three
+    # above; not covered by /api/ below since that block still targets the
+    # sidecar, which has no /config route.
+    location = /api/config {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/config;
         proxy_set_header Host $host;
     }
 

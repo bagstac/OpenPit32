@@ -64,6 +64,18 @@ public class SidecarInfoResponse
     public List<int>? accepted_setpoints_f { get; set; }
     public bool has_lights { get; set; }
     public int meat_probes { get; set; }
+    /// <summary>ESP32-only (POST /config) — consecutive PB.GetState rejections
+    /// required before the grill link shows a warning. Null when talking to
+    /// the sidecar, which has no such setting.</summary>
+    public int? error_display_threshold { get; set; }
+}
+
+/// <summary>POST /config reply — see SetErrorDisplayThresholdAsync.</summary>
+public class SidecarConfigResponse
+{
+    public bool ok { get; set; }
+    public string? error { get; set; }
+    public int? error_display_threshold { get; set; }
 }
 
 public class SidecarModelsResponse
@@ -178,6 +190,19 @@ public class GrillRpcService
         var resp = await _http.PostAsJsonAsync("command", body);
         return await resp.Content.ReadFromJsonAsync<SidecarCommandResponse>()
                ?? new SidecarCommandResponse { ok = false, error = "Empty reply from sidecar" };
+    }
+
+    /// <summary>
+    /// ESP32-only setting (POST /config): how many consecutive PB.GetState
+    /// rejections are required before GrillDetail.razor shows a link-problem
+    /// warning, instead of flashing one on the first, usually self-healing,
+    /// occurrence. No-op against the sidecar (no such route there).
+    /// </summary>
+    public async Task<SidecarConfigResponse> SetErrorDisplayThresholdAsync(int threshold)
+    {
+        var resp = await _http.PostAsJsonAsync("config", new { error_display_threshold = threshold });
+        return await resp.Content.ReadFromJsonAsync<SidecarConfigResponse>()
+               ?? new SidecarConfigResponse { ok = false, error = "Empty reply from grill bridge" };
     }
 
     /// <summary>

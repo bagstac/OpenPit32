@@ -570,14 +570,23 @@ void PitbossGrill::on_get_state_reply_(const std::string &json) {
     // Per docs/PROTOCOL.md: a slow BLE write can land in the wrong 10s
     // uptime bucket and draw a spurious Unauthorized — not necessarily a
     // wrong password. The next 15s cycle re-derives the key from fresh
-    // uptime, so one rejection here isn't treated as fatal (it does still
-    // surface on /health's last_error until the next cycle clears it).
+    // uptime, so one rejection here isn't treated as fatal. Confirmed live
+    // 2026-09-10: ~1 in 40 cycles, always self-healing on the very next one
+    // — surfacing that as last_error_ (and so /health's/GrillDetail.razor's
+    // link-problem badge) on the first occurrence is a false alarm, so it's
+    // only surfaced once get_state_reject_streak_ reaches
+    // error_display_threshold_ consecutive rejections with no success in
+    // between. The ESP_LOGW below stays unthrottled either way — this only
+    // debounces what reaches the user-facing field.
     ESP_LOGW(TAG, "PB.GetState rejected (bad password, or key-bucket skew — "
                   "next cycle re-derives the key): %s",
              json.c_str());
-    this->set_last_error_("PB.GetState rejected (bad password, or key-bucket skew)");
+    if (++this->get_state_reject_streak_ >= this->error_display_threshold_.load()) {
+      this->set_last_error_("PB.GetState rejected (bad password, or key-bucket skew)");
+    }
     return;
   }
+  this->get_state_reject_streak_ = 0;
   this->clear_last_error_();
   // The reply's own top-level fields are "sc_11" (status, FE0B) and "sc_12"
   // (temperatures, FE0C) — the same two raw frames the grill also *pushes*
@@ -836,7 +845,8 @@ void PitbossGrill::on_debug_log_(const uint8_t *data, uint16_t len) {
 // and set_web_server_base(). Route matching follows the same canHandle()/
 // handleRequest() idiom esphome/components/web_server and .../prometheus
 // use (see web_server_base/web_server_idf.h). GET /health, /state, /info
-// are read-only (Phase 4); POST /command (Phase 5) is the one write route.
+// are read-only (Phase 4); POST /command (Phase 5) and POST /config (the
+// error_display_threshold setting) are the write routes.
 
 bool PitbossGrill::canHandle(AsyncWebServerRequest *request) const {
   char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
@@ -844,7 +854,7 @@ bool PitbossGrill::canHandle(AsyncWebServerRequest *request) const {
   if (request->method() == HTTP_GET)
     return url == "/health" || url == "/state" || url == "/info";
   if (request->method() == HTTP_POST)
-    return url == "/command";
+    return url == "/command" || url == "/config";
   return false;
 }
 
@@ -859,6 +869,8 @@ void PitbossGrill::handleRequest(AsyncWebServerRequest *request) {
     this->handle_info_(request);
   } else if (url == "/command") {
     this->handle_command_(request);
+  } else if (url == "/config") {
+    this->handle_config_(request);
   }
 }
 
@@ -1015,8 +1027,53 @@ void PitbossGrill::handle_info_(AsyncWebServerRequest *request) {
       setpoints.add(f);
     root["has_lights"] = this->has_lights_;
     root["meat_probes"] = this->meat_probes_;
+    // Not part of the sidecar's /info shape — an ESP32-only setting (see
+    // handle_config_()) the web app reads here and writes via POST /config.
+    root["error_display_threshold"] = this->error_display_threshold_.load();
   });
   request->send(200, "application/json", body.c_str());
+}
+
+// POST /config — currently just {error_display_threshold: N}, the number of
+// consecutive PB.GetState rejections (see on_get_state_reply_()) required
+// before one is surfaced as last_error_/health's/state's last_error field,
+// added 2026-09-10 so a single expected, self-healing 401 (key-bucket skew
+// — see docs/PROTOCOL.md) doesn't flash a false-alarm warning in
+// GrillDetail.razor. Unlike handle_command_(), this never touches BLE, so
+// it's a plain synchronous read-validate-write-respond with no defer()/
+// semaphore — error_display_threshold_ being std::atomic is the only
+// cross-task concern (this write, from the httpd task, races
+// on_get_state_reply_()'s read on the main loop). In-memory only, like
+// grill_password_/model_ today — Phase 7's NVS work would persist it too.
+void PitbossGrill::handle_config_(AsyncWebServerRequest *request) {
+  std::string body;
+  if (!read_json_body(request, body)) {
+    request->send(200, "application/json", "{\"ok\":false,\"error\":\"missing or oversized JSON body\"}");
+    return;
+  }
+  JsonDocument doc = esphome::json::parse_json(body);
+  if (doc.isNull()) {
+    request->send(200, "application/json", "{\"ok\":false,\"error\":\"invalid JSON\"}");
+    return;
+  }
+  if (!doc["error_display_threshold"].isNull()) {
+    int requested = doc["error_display_threshold"] | -1;
+    // 1-60: 0 would surface every single rejection immediately (defeating
+    // the point), and 60 is already 15 minutes of nothing-but-failures at
+    // the periodic cycle's 15s cadence — well past "this needs a human".
+    if (requested < 1 || requested > 60) {
+      request->send(
+          200, "application/json",
+          "{\"ok\":false,\"error\":\"error_display_threshold must be between 1 and 60\"}");
+      return;
+    }
+    this->error_display_threshold_.store(static_cast<uint8_t>(requested));
+  }
+  std::string resp = esphome::json::build_json([&](JsonObject root) {
+    root["ok"] = true;
+    root["error_display_threshold"] = this->error_display_threshold_.load();
+  });
+  request->send(200, "application/json", resp.c_str());
 }
 
 // Mirrors grill_sidecar.py's POST /command: body {action, value?, confirm?}

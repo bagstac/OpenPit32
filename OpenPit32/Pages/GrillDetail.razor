@@ -173,6 +173,39 @@ else
         </div>
     </div>
 
+    @if (info?.error_display_threshold is not null)
+    {
+        <div class="card pb-card mt-4">
+            <div class="card-header">Link Settings</div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    A single failed status check is expected occasionally — the grill's
+                    auth key rotates every 10 seconds, and a request that lands right on
+                    that boundary can be rejected even though nothing's actually wrong —
+                    and it clears itself on its own moments later. This sets how many in
+                    a row have to fail before it's shown as a warning above.
+                </p>
+                <div class="row g-2 align-items-end">
+                    <div class="col-auto" style="width:8rem">
+                        <label class="form-label small text-muted mb-1">Consecutive failures</label>
+                        <input type="number" class="form-control form-control-sm" min="1" max="60"
+                               @bind="errorThresholdText" />
+                    </div>
+                    <div class="col-auto">
+                        <button class="btn btn-outline-secondary btn-sm" disabled="@errorThresholdBusy"
+                                @onclick="SaveErrorThreshold">
+                            Save
+                        </button>
+                    </div>
+                </div>
+                @if (!string.IsNullOrEmpty(errorThresholdError))
+                {
+                    <div class="alert alert-danger py-2 mt-2 mb-0">@errorThresholdError</div>
+                }
+            </div>
+        </div>
+    }
+
     <div class="card pb-card mt-4">
         <div class="card-header">Alarms</div>
         <div class="card-body">
@@ -302,6 +335,12 @@ else
     private bool actionFailed;
     private bool actionBusy;
     private System.Threading.Timer? pollTimer;
+
+    // ---- Link Settings card (error_display_threshold, ESP32-only) ----
+    private string? errorThresholdText = "5";
+    private bool errorThresholdLoaded;
+    private bool errorThresholdBusy;
+    private string? errorThresholdError;
     private System.Threading.Timer? confirmTimer;
 
     // ---- Alarms card ----
@@ -372,6 +411,15 @@ else
             if (health?.configured == true)
             {
                 info ??= await Rpc.GetInfoAsync();
+                // Prefill once from the ESP32's current value, not on every
+                // poll — otherwise an in-progress edit (or a save that just
+                // hasn't round-tripped into `info` yet) would keep getting
+                // overwritten out from under the user.
+                if (!errorThresholdLoaded && info?.error_display_threshold is int t)
+                {
+                    errorThresholdText = t.ToString();
+                    errorThresholdLoaded = true;
+                }
                 var resp = await Rpc.GetStateAsync();
                 live = resp?.state;
                 stateAge = resp?.state_age_seconds;
@@ -595,6 +643,39 @@ else
         finally
         {
             actionBusy = false;
+        }
+    }
+
+    private async Task SaveErrorThreshold()
+    {
+        errorThresholdError = null;
+        if (!int.TryParse(errorThresholdText, out var t) || t < 1 || t > 60)
+        {
+            errorThresholdError = "Enter a number between 1 and 60.";
+            return;
+        }
+        errorThresholdBusy = true;
+        try
+        {
+            var r = await Rpc.SetErrorDisplayThresholdAsync(t);
+            if (!r.ok)
+            {
+                errorThresholdError = r.error ?? "Failed to save.";
+            }
+            else if (info is not null)
+            {
+                // So the badge/threshold stay in sync without waiting for the
+                // next poll's round trip back through /info.
+                info.error_display_threshold = r.error_display_threshold ?? t;
+            }
+        }
+        catch (Exception ex)
+        {
+            errorThresholdError = "grill bridge unreachable: " + ex.Message;
+        }
+        finally
+        {
+            errorThresholdBusy = false;
         }
     }
 

@@ -331,6 +331,38 @@ rollout item 4's follow-up note above) — this phase only proved the ESP32
 side directly. Repointing it is a small addition to the same
 `nginx.conf.template` pattern whenever that's wanted.
 
+## 2026-09-10 follow-up: debounce the occasional PB.GetState rejection
+
+Live testing surfaced the spurious-401 case Phase 2 already documented as
+expected (`docs/PROTOCOL.md`: a slow write can land in the wrong 10s auth
+key bucket) — about 1 in 40 cycles in a real observation window, always
+self-healing on the very next 15s cycle — but showing it as `last_error_`
+on the very first occurrence flashed a false-alarm warning in
+`GrillDetail.razor`'s link-problem badge for something that wasn't actually
+a problem.
+
+Fixed by tracking consecutive rejections (`get_state_reject_streak_`,
+main-loop-only) and only calling `set_last_error_()` once the streak
+reaches `error_display_threshold_` (default 5) — the debug log (`ESP_LOGW`)
+stays unthrottled either way, this only debounces what reaches `/health`'s
+and `/state`'s `last_error` field. The threshold is `std::atomic<uint8_t>`
+and runtime-adjustable via a new `POST /config` endpoint (body
+`{"error_display_threshold": N}`, 1-60) rather than a YAML constant, per
+request — `/info` now also reports the current value so the web app can
+show it. `GrillDetail.razor` gained a "Link Settings" card (shown only when
+`info.error_display_threshold` is present, i.e. talking to the ESP32, not
+the sidecar) to read/write it, and `nginx.conf.template` gained a
+`location = /api/config` exact match alongside health/state/info's (no
+sidecar equivalent exists, so it's not covered by the general `/api/`
+block). In-memory only, like everything else here pre-Phase-7 — resets to
+5 on every boot/reflash.
+
+Deliberately scoped to just this one rejection path: the "reply wasn't
+valid JSON" branch right above it, and `/command`'s own synchronous
+rejection replies (missing confirm, unsupported action, etc.), are
+immediate, user-initiated, one-shot responses — debouncing across cycles
+makes sense only for a periodic background poll like this one.
+
 ## Decisions made (2026-09-09)
 
 Asked as clarifying questions before writing this plan; answers below shape
