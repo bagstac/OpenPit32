@@ -91,7 +91,7 @@ pitboss_grill:
   # https://api.telegram.org/bot<TOKEN>/getUpdates to read back the chat id.
   # Both default to "" (no secrets.yaml entry needed to compile) — an alarm
   # still fires and is dropped on schedule either way, it just logs
-  # "no Telegram bot configured" instead of actually notifying. Uncomment
-  # and add both keys to secrets.yaml to turn notifications on:
-  # telegram_bot_token: !secret telegram_bot_token
-  # telegram_chat_id: !secret telegram_chat_id
+  # "no Telegram bot configured" instead of actually notifying. Configured
+  # 2026-09-10 to verify real delivery — both keys are in secrets.yaml.
+  telegram_bot_token: !secret telegram_bot_token
+  telegram_chat_id: !secret telegram_chat_id

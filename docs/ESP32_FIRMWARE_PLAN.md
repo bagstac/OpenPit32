@@ -379,9 +379,12 @@ comparison, missing target, non-positive duration), a real temp alarm
 created with a correct 2026 Unix `created_at`, `DELETE` returning genuine
 `200`/`404` confirmed via a follow-up `GET`, and an 8s timer alarm firing
 and auto-dropping on schedule with the expected log lines (`Alarm fired:
-...` / `... but no Telegram bot configured`). Telegram delivery itself
-isn't proven yet — no bot token configured; see the setup steps in
-`grill-firmware.yaml`'s comment.
+...` / `... but no Telegram bot configured`, with no bot configured yet at
+that point). A real bot token + chat id (via BotFather, per
+`grill-firmware.yaml`'s setup comment) were added to `secrets.yaml`
+afterward and a second live test — a 6s timer alarm — delivered a real
+Telegram message to a real phone, confirming `notify_()`'s HTTPS POST
+works end-to-end, not just the no-bot-configured fallback path.
 
 ## 2026-09-10 follow-up: debounce the occasional PB.GetState rejection
 
@@ -718,8 +721,8 @@ firmware has proven itself, given what's at stake if it's wrong.
    (see the follow-up note right below — read it before touching
    `on_get_time_reply_()`/`send_get_state_()`/`send_mcu_command_()` again).
    nginx's `/api/alarms` isn't repointed yet (still the sidecar); only the
-   ESP32 side was proven this phase. Telegram delivery itself isn't proven
-   live yet — no bot token configured.
+   ESP32 side was proven this phase. Telegram delivery itself is now
+   confirmed live too (real bot, real phone) — see "Verified" above.
 7. Add the `/setup` endpoint (cloud password fetch, run from the ESP32) and
    NVS persistence for password + alarms + Telegram config.
 8. Port the login-only process (decision 5) from today's
