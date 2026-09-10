@@ -1,6 +1,8 @@
 #include "pitboss_grill.h"
 #include "esphome/core/log.h"
+#include "esphome/core/hal.h"
 #include "esphome/components/json/json_util.h"
+#include "esphome/components/wifi/wifi_component.h"
 
 #include <esp_random.h>
 #include <algorithm>
@@ -147,6 +149,12 @@ void PitbossGrill::setup() {
   BLEClientBase::setup();
   this->set_auto_connect(true);
 
+  // Phase 4: register /health, /state, /info on ESPHome's shared httpd
+  // (web_server_base) — same pattern web_server/prometheus/captive_portal
+  // use (base->init() is refcounted, safe to call alongside theirs).
+  this->web_server_base_->init();
+  this->web_server_base_->add_handler(this);
+
   // Periodic rather than one-shot, and via the global scheduler rather than
   // loop() (which BLEClientBase disables once state reaches IDLE, since
   // parse_device() dispatch doesn't need per-tick polling): a one-shot log
@@ -176,8 +184,18 @@ void PitbossGrill::setup() {
 
 void PitbossGrill::loop() { BLEClientBase::loop(); }
 
+void PitbossGrill::set_last_error_(const std::string &message) {
+  LockGuard lock(this->state_mutex_);
+  this->last_error_ = message;
+}
+
+void PitbossGrill::clear_last_error_() {
+  LockGuard lock(this->state_mutex_);
+  this->last_error_.clear();
+}
+
 void PitbossGrill::dump_config() {
-  ESP_LOGCONFIG(TAG, "Pitboss Grill (Phase 3 — status/temperature decoding):");
+  ESP_LOGCONFIG(TAG, "Pitboss Grill (Phase 4 — REST endpoints):");
   ESP_LOGCONFIG(TAG, "  Advertised-name prefix: %s", this->name_prefix_.c_str());
 }
 
@@ -210,6 +228,17 @@ bool PitbossGrill::parse_device(const espbt::ESPBTDevice &device) {
   this->set_state(espbt::ClientState::DISCOVERED);
   this->set_address(device.address_uint64());
   this->set_remote_addr_type(device.get_address_type());
+  // The full advertised name (e.g. "PBV2-9451DC46B934") is this grill's
+  // board id — same string the RPC replies' own "src" field carries, and
+  // what /info reports as board_id. Advertising (and so this callback)
+  // stops once connected, per the usual BLE behavior — see last_rssi_'s
+  // comment in the header for why /health's rssi can go stale.
+  {
+    LockGuard lock(this->state_mutex_);
+    this->board_id_ = name;
+    this->last_rssi_ = device.get_rssi();
+    this->has_rssi_ = true;
+  }
   return true;
 }
 
@@ -368,15 +397,18 @@ void PitbossGrill::on_get_time_reply_(const std::string &json) {
   JsonDocument doc = esphome::json::parse_json(json);
   if (doc.isNull()) {
     ESP_LOGW(TAG, "PB.GetTime reply was not valid JSON: %s", json.c_str());
+    this->set_last_error_("PB.GetTime reply was not valid JSON");
     return;
   }
   if (!doc["error"].isNull()) {
     ESP_LOGW(TAG, "PB.GetTime error: %s", json.c_str());
+    this->set_last_error_("PB.GetTime error");
     return;
   }
   double uptime = doc["result"]["time"] | -1.0;
   if (uptime < 0) {
     ESP_LOGW(TAG, "PB.GetTime reply missing result.time: %s", json.c_str());
+    this->set_last_error_("PB.GetTime reply missing result.time");
     return;
   }
   ESP_LOGD(TAG, "GetTime OK, uptime=%.1f s", uptime);
@@ -387,18 +419,22 @@ void PitbossGrill::on_get_state_reply_(const std::string &json) {
   JsonDocument doc = esphome::json::parse_json(json);
   if (doc.isNull()) {
     ESP_LOGW(TAG, "PB.GetState reply was not valid JSON: %s", json.c_str());
+    this->set_last_error_("PB.GetState reply was not valid JSON");
     return;
   }
   if (!doc["error"].isNull()) {
     // Per docs/PROTOCOL.md: a slow BLE write can land in the wrong 10s
     // uptime bucket and draw a spurious Unauthorized — not necessarily a
     // wrong password. The next 15s cycle re-derives the key from fresh
-    // uptime, so one rejection here isn't treated as fatal.
+    // uptime, so one rejection here isn't treated as fatal (it does still
+    // surface on /health's last_error until the next cycle clears it).
     ESP_LOGW(TAG, "PB.GetState rejected (bad password, or key-bucket skew — "
                   "next cycle re-derives the key): %s",
              json.c_str());
+    this->set_last_error_("PB.GetState rejected (bad password, or key-bucket skew)");
     return;
   }
+  this->clear_last_error_();
   // The reply's own top-level fields are "sc_11" (status, FE0B) and "sc_12"
   // (temperatures, FE0C) — the same two raw frames the grill also *pushes*
   // unauthenticated over the debug-log channel (see on_debug_log_()); both
@@ -434,8 +470,11 @@ void PitbossGrill::parse_status_frame_(const std::string &hex) {
     ESP_LOGW(TAG, "Status frame too short (%d bytes, need 44): %s", static_cast<int>(parts.size()), hex.c_str());
     return;
   }
+  LockGuard lock(this->state_mutex_);
   auto &s = this->grill_state_;
   s.has_status = true;
+  this->last_frame_millis_ = millis();
+  this->has_frame_millis_ = true;
   s.module_is_on = parts[24] == 1;
   s.err1 = parts[25] == 1;
   s.err2 = parts[26] == 1;
@@ -474,8 +513,11 @@ void PitbossGrill::parse_temperature_frame_(const std::string &hex) {
     ESP_LOGW(TAG, "Temperature frame too short (%d bytes, need 27): %s", static_cast<int>(parts.size()), hex.c_str());
     return;
   }
+  LockGuard lock(this->state_mutex_);
   auto &s = this->grill_state_;
   s.has_temperatures = true;
+  this->last_frame_millis_ = millis();
+  this->has_frame_millis_ = true;
   s.p1_temp = convert_temperature(parts, 5);
   s.p2_temp = convert_temperature(parts, 8);
   s.p3_temp = convert_temperature(parts, 11);
@@ -598,6 +640,183 @@ void PitbossGrill::on_debug_log_(const uint8_t *data, uint16_t len) {
   ESP_LOGD(TAG, "Debug log: %s", text.c_str());
 }
 
+// -- REST endpoints (Phase 4) --
+//
+// Registered on ESPHome's shared httpd via web_server_base — see setup()
+// and set_web_server_base(). Route matching follows the same canHandle()/
+// handleRequest() idiom esphome/components/web_server and .../prometheus
+// use (see web_server_base/web_server_idf.h): canHandle() only ever sees
+// GET (the sidecar's /health, /state, /info are all read-only; write
+// commands are Phase 5+), so handleRequest() doesn't need to re-check it.
+
+bool PitbossGrill::canHandle(AsyncWebServerRequest *request) const {
+  if (request->method() != HTTP_GET)
+    return false;
+  char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
+  StringRef url = request->url_to(url_buf);
+  return url == "/health" || url == "/state" || url == "/info";
+}
+
+void PitbossGrill::handleRequest(AsyncWebServerRequest *request) {
+  char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
+  StringRef url = request->url_to(url_buf);
+  if (url == "/health") {
+    this->handle_health_(request);
+  } else if (url == "/state") {
+    this->handle_state_(request);
+  } else if (url == "/info") {
+    this->handle_info_(request);
+  }
+}
+
+// Mirrors grill_sidecar.py's health(): {configured, connected,
+// proxy_connected, proxy_host, rssi, proxy_wifi_rssi, proxy_uptime_seconds,
+// state_age_seconds, last_error} — see GrillRpcService.cs's
+// SidecarHealthResponse for the exact shape the Blazor frontend expects.
+// proxy_* used to describe a *second* ESP32 (the sidecar's BLE proxy hop);
+// that hop is gone now — this firmware IS that ESP32 — so proxy_connected
+// is unconditionally true and proxy_wifi_rssi/proxy_uptime_seconds map onto
+// this device's own WiFi RSSI/uptime, which is what they always actually
+// measured.
+void PitbossGrill::handle_health_(AsyncWebServerRequest *request) {
+  bool connected = this->state() == espbt::ClientState::ESTABLISHED;
+  // Snapshot everything shared with the BT-stack/main-loop tasks up front,
+  // under the lock, then build the JSON from local copies — see
+  // state_mutex_'s header comment for why this needs a lock at all.
+  bool has_rssi;
+  int8_t rssi = 0;
+  bool has_age;
+  uint32_t frame_millis = 0;
+  std::string last_error;
+  {
+    LockGuard lock(this->state_mutex_);
+    has_rssi = this->has_rssi_;
+    rssi = this->last_rssi_;
+    has_age = this->has_frame_millis_;
+    frame_millis = this->last_frame_millis_;
+    last_error = this->last_error_;
+  }
+  std::string body = esphome::json::build_json([&](JsonObject root) {
+    // Always true today: the grill password is compiled in (set_grill_
+    // password()). Phase 7 makes this conditional once that becomes a
+    // runtime /setup flow instead of a compile-time secret.
+    root["configured"] = true;
+    root["connected"] = connected;
+    root["proxy_connected"] = true;
+    if (has_rssi)
+      root["rssi"] = rssi;
+    if (esphome::wifi::global_wifi_component != nullptr)
+      root["proxy_wifi_rssi"] = esphome::wifi::global_wifi_component->wifi_rssi();
+    root["proxy_uptime_seconds"] = static_cast<int64_t>(millis() / 1000);
+    if (has_age)
+      root["state_age_seconds"] = (millis() - frame_millis) / 1000.0;
+    if (!last_error.empty())
+      root["last_error"] = last_error;
+  });
+  request->send(200, "application/json", body.c_str());
+}
+
+// Mirrors grill_sidecar.py's state(): {state, state_age_seconds, last_error}
+// — see GrillRpcService.cs's SidecarStateResponse/SidecarState. "state" is
+// null (omitted) until both the status and temperature frames have decoded
+// at least once, same as bridge.state being None until the sidecar's first
+// merged decode — a partial object (e.g. temperatures with default/zeroed
+// status flags) would just be misleading. -1 temperatures (see
+// convert_temperature()) come through as JSON null via add_temp() below,
+// matching pytboss's own null-for-disconnected-probe convention.
+void PitbossGrill::handle_state_(AsyncWebServerRequest *request) {
+  // Snapshot under the lock (see state_mutex_'s header comment), then build
+  // the JSON from the local copy — grill_state_ itself is written from both
+  // the BT-stack task (debug-log pushes) and the main loop (deferred
+  // GetState replies), neither of which is this httpd request's own task.
+  GrillState s;
+  bool has_age;
+  uint32_t frame_millis = 0;
+  std::string last_error;
+  {
+    LockGuard lock(this->state_mutex_);
+    s = this->grill_state_;
+    has_age = this->has_frame_millis_;
+    frame_millis = this->last_frame_millis_;
+    last_error = this->last_error_;
+  }
+  bool has_state = s.has_status && s.has_temperatures;
+  std::string body = esphome::json::build_json([&](JsonObject root) {
+    if (has_state) {
+      JsonObject state = root["state"].to<JsonObject>();
+      auto add_temp = [&](const char *key, int16_t t) {
+        if (t >= 0)
+          state[key] = t;
+      };
+      state["moduleIsOn"] = s.module_is_on;
+      add_temp("grillTemp", s.grill_temp);
+      add_temp("grillSetTemp", s.grill_set_temp);
+      add_temp("smokerActTemp", s.smoker_act_temp);
+      add_temp("p1Temp", s.p1_temp);
+      add_temp("p2Temp", s.p2_temp);
+      add_temp("p3Temp", s.p3_temp);
+      add_temp("p4Temp", s.p4_temp);
+      state["fanState"] = s.fan_state;
+      state["hotState"] = s.hot_state;
+      state["motorState"] = s.motor_state;
+      state["lightState"] = s.light_state;
+      state["primeState"] = s.prime_state;
+      state["isFahrenheit"] = s.is_fahrenheit;
+      state["noPellets"] = s.no_pellets;
+      state["err1"] = s.err1;
+      state["err2"] = s.err2;
+      state["err3"] = s.err3;
+      state["highTempErr"] = s.high_temp_err;
+      state["fanErr"] = s.fan_err;
+      state["hotErr"] = s.hot_err;
+      state["motorErr"] = s.motor_err;
+      state["erL"] = s.er_l;
+      // Not part of GrillRpcService.cs's SidecarState yet — harmless extra
+      // fields, ignored by System.Text.Json's default deserialization.
+      state["recipeStep"] = s.recipe_step;
+      state["recipeTimeSeconds"] = s.recipe_time_s;
+    }
+    if (has_age)
+      root["state_age_seconds"] = (millis() - frame_millis) / 1000.0;
+    if (!last_error.empty())
+      root["last_error"] = last_error;
+  });
+  request->send(200, "application/json", body.c_str());
+}
+
+// Mirrors grill_sidecar.py's info(): {configured, board_id, model, firmware,
+// accepted_setpoints_f, has_lights, meat_probes} — see GrillRpcService.cs's
+// SidecarInfoResponse. Unlike the sidecar, this never 404s (configured is
+// always true here — see handle_health_()). "firmware" (the sidecar's own
+// one-time Pit Boss cloud fetch) and "accepted_setpoints_f" (Phase 5's
+// set-temperature) aren't ported yet, so they're left out entirely;
+// GrillDetail.razor's `info.firmware is { } fw` check already treats a
+// missing/null value as "nothing to show". has_lights/meat_probes are
+// hardcoded to this specific tested unit (see docs/ESP32_FIRMWARE_PLAN.md's
+// "Decisions made" #6 and the command-surface section) — no light, 4 probes.
+void PitbossGrill::handle_info_(AsyncWebServerRequest *request) {
+  // board_id_ is written from parse_device(), on the BLE tracker's own task
+  // — see state_mutex_'s header comment. model_ is set once in setup() from
+  // compile-time config and never mutated again, so it's safe to read
+  // unguarded, but there's no cost to being consistent here either.
+  std::string board_id;
+  {
+    LockGuard lock(this->state_mutex_);
+    board_id = this->board_id_;
+  }
+  std::string body = esphome::json::build_json([&](JsonObject root) {
+    root["configured"] = true;
+    if (!board_id.empty())
+      root["board_id"] = board_id;
+    if (!this->model_.empty())
+      root["model"] = this->model_;
+    root["accepted_setpoints_f"].to<JsonArray>();
+    root["has_lights"] = false;
+    root["meat_probes"] = 4;
+  });
+  request->send(200, "application/json", body.c_str());
+}
+
 bool PitbossGrill::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
                                        esp_ble_gattc_cb_param_t *param) {
   this->gattc_call_count_++;  // liveness indicator, see the header comment
@@ -615,6 +834,7 @@ bool PitbossGrill::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
     case ESP_GATTC_DISCONNECT_EVT:
     case ESP_GATTC_CLOSE_EVT: {
       ESP_LOGW(TAG, "Disconnected from grill");
+      this->set_last_error_("grill BLE link dropped — reconnecting");
       this->rpc_data_handle_ = this->rpc_tx_ctl_handle_ = this->rpc_rx_ctl_handle_ = this->debug_log_handle_ = 0;
       this->notifies_expected_ = this->notifies_confirmed_ = 0;
       this->rpc_reply_in_progress_ = false;
@@ -639,6 +859,7 @@ bool PitbossGrill::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
         // system this class deliberately bypasses) — set our own base
         // class's state instead, which is what connected() checks.
         this->set_state(espbt::ClientState::ESTABLISHED);
+        this->clear_last_error_();
         ESP_LOGI(TAG, "Grill link established — sending RPC.Ping");
         this->send_ping_();
       }

@@ -13,12 +13,17 @@ attach.
 """
 
 import esphome.codegen as cg
-from esphome.components import esp32_ble, esp32_ble_client, esp32_ble_tracker
+from esphome.components import esp32_ble, esp32_ble_client, esp32_ble_tracker, web_server_base
 from esphome.components.esp32_ble import BTLoggers
+from esphome.components.web_server_base import CONF_WEB_SERVER_BASE_ID
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
 
-AUTO_LOAD = ["esp32_ble_client", "json"]
+# web_server_base (not the full web_server: dashboard) gets us ESPHome's
+# shared httpd instance with none of web_server's own entity-dashboard
+# routes — see pitboss_grill.h/.cpp's AsyncWebHandler for what actually
+# gets registered on it (Phase 4: /health, /state, /info).
+AUTO_LOAD = ["esp32_ble_client", "json", "web_server_base"]
 DEPENDENCIES = ["esp32_ble_tracker"]
 
 pitboss_grill_ns = cg.esphome_ns.namespace("pitboss_grill")
@@ -33,6 +38,7 @@ PitbossGrill = pitboss_grill_ns.class_(
 
 CONF_NAME_PREFIX = "name_prefix"
 CONF_GRILL_PASSWORD = "grill_password"
+CONF_MODEL = "model"
 
 CONFIG_SCHEMA = (
     cv.Schema(
@@ -48,6 +54,13 @@ CONFIG_SCHEMA = (
             # persists this to NVS instead of a compile-time secret; for
             # now, bench-testing the auth codec needs it available at all.
             cv.Required(CONF_GRILL_PASSWORD): cv.string_strict,
+            # Reported as-is by /info (scripts/grill_sidecar.py's
+            # DEFAULT_MODEL) — no autodetection, same as the sidecar today.
+            cv.Optional(CONF_MODEL, default="PBV5 P2"): cv.string,
+            # Phase 4: the shared httpd /health, /state, /info register on.
+            cv.GenerateID(CONF_WEB_SERVER_BASE_ID): cv.use_id(
+                web_server_base.WebServerBase
+            ),
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
@@ -64,3 +77,7 @@ async def to_code(config):
     await esp32_ble_tracker.register_client(var, config)
     cg.add(var.set_name_prefix(config[CONF_NAME_PREFIX]))
     cg.add(var.set_grill_password(config[CONF_GRILL_PASSWORD]))
+    cg.add(var.set_model(config[CONF_MODEL]))
+
+    web_server = await cg.get_variable(config[CONF_WEB_SERVER_BASE_ID])
+    cg.add(var.set_web_server_base(web_server))

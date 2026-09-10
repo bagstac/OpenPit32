@@ -13,19 +13,26 @@
 // and an authenticated PB.GetState call. Phase 3 decodes the sc_11/sc_12
 // (FE0B/FE0C) status/temperature frames into GrillState below — both the
 // authenticated PB.GetState reply and the grill's own unauthenticated
-// debug-log pushes carry the same two frames, decoded the same way. All
-// three phases are bench-verified against real hardware as of 2026-09-09.
+// debug-log pushes carry the same two frames, decoded the same way. Phase 4
+// exposes that state over the same three read-only REST routes today's
+// scripts/grill_sidecar.py serves (/health, /state, /info) — registered on
+// ESPHome's own shared httpd (web_server_base), not a second HTTP server —
+// so nginx's proxy_pass can point straight at this ESP32 with zero Blazor
+// frontend changes. All four phases are bench-verified against real
+// hardware as of 2026-09-09.
 //
 // NOT yet implemented here (later phases): MCU commands (set-temperature,
-// turn-on/off), and exposing GrillState as actual ESPHome entities /
-// REST endpoints rather than just an internal struct + log lines.
+// turn-on/off), the alarm monitor + Telegram notify(), and the /setup
+// cloud-password-fetch + NVS persistence flow.
 
 #ifdef USE_ESP32
 
 #include "esphome/core/component.h"
+#include "esphome/core/helpers.h"
 #include "esphome/components/esp32_ble/ble_uuid.h"
 #include "esphome/components/esp32_ble_client/ble_client_base.h"
 #include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
+#include "esphome/components/web_server_base/web_server_base.h"
 
 #include <esp_gattc_api.h>
 #include <string>
@@ -38,11 +45,24 @@ namespace espbt = esphome::esp32_ble_tracker;
 using esphome::esp32_ble::ESPBTUUID;
 using namespace esp32_ble_client;
 
-class PitbossGrill : public BLEClientBase {
+// AsyncWebHandler/AsyncWebServerRequest come from web_server_idf.h's global
+// `using namespace esphome::web_server_idf` (see that header) — unqualified
+// here to match how every other web_server_base consumer (web_server,
+// prometheus, captive_portal) spells them.
+class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
  public:
   void setup() override;
   void loop() override;
   void dump_config() override;
+  // BLEClientBase defaults to setup_priority::BLUETOOTH (350) — fine for
+  // Phases 1-3 (BLE client registration itself happens outside setup(), via
+  // a raw register_client() call esp32_ble_tracker's codegen emits, so
+  // component setup ORDER never mattered there). Phase 4's
+  // web_server_base_->init() does need the network stack up first, though:
+  // running it at BLUETOOTH priority (i.e. before wifi's own setup()) OTA'd
+  // fine but crash-looped the instant the very first real HTTP GET came in.
+  // Same fix/reasoning as esphome/components/prometheus's PrometheusHandler.
+  float get_setup_priority() const override { return setup_priority::WIFI - 1.0f; }
 
   bool parse_device(const espbt::ESPBTDevice &device) override;
   bool gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
@@ -58,6 +78,21 @@ class PitbossGrill : public BLEClientBase {
   /// Phase 7 replaces this compile-time secret with a fetch-and-persist
   /// flow run from the ESP32 itself.
   void set_grill_password(const std::string &password) { this->grill_password_ = password; }
+
+  /// The shared ESPHome httpd instance (see esphome/grill-firmware.yaml's
+  /// `web_server_base:`/`web_server:` block) — REST routes below are
+  /// registered on it in setup(), the same pattern web_server/prometheus/
+  /// captive_portal use, rather than standing up a second HTTP server.
+  void set_web_server_base(web_server_base::WebServerBase *base) { this->web_server_base_ = base; }
+
+  /// The friendly model name this firmware is built for (today's sidecar's
+  /// DEFAULT_MODEL) — reported as-is by /info; no per-grill autodetection
+  /// happens here, same as the sidecar today.
+  void set_model(const std::string &model) { this->model_ = model; }
+
+  // -- AsyncWebHandler (web_server_base's shared httpd) --
+  bool canHandle(AsyncWebServerRequest *request) const override;
+  void handleRequest(AsyncWebServerRequest *request) override;
 
   // Decoded status/temperature state — the bit-level fields inside the
   // sc_11/sc_12 (FE0B/FE0C) frames, decoded per this project's specific
@@ -132,8 +167,59 @@ class PitbossGrill : public BLEClientBase {
   void parse_status_frame_(const std::string &hex);
   void parse_temperature_frame_(const std::string &hex);
 
+  // REST handlers — see docs/ESP32_FIRMWARE_PLAN.md's rollout plan item 4.
+  // Field names/shapes deliberately mirror scripts/grill_sidecar.py's
+  // /health, /state, /info exactly (see OpenPit32/Services/GrillRpcService.cs
+  // for the Blazor-side DTOs this has to match) so nginx can point at this
+  // ESP32 instead of the sidecar with zero frontend changes.
+  void handle_health_(AsyncWebServerRequest *request);
+  void handle_state_(AsyncWebServerRequest *request);
+  void handle_info_(AsyncWebServerRequest *request);
+
+  // Phase 4 is the first thing that reads grill_state_/last_error_/board_id_/
+  // last_rssi_ from outside the task that writes them — the REST handlers
+  // above run on esp_http_server's own httpd task, while writers span the
+  // BT stack's task (gattc_event_handler()/on_debug_log_() run there
+  // directly, not deferred — see on_rpc_read_()'s comment on why *that*
+  // defer exists, which is stack depth, not thread-safety) and the main
+  // loop task (deferred GetState replies). Three FreeRTOS tasks touching
+  // non-trivial (heap-backed std::string) fields with no synchronization is
+  // a real crash risk, not a theoretical one — confirmed on the bench
+  // 2026-09-09: the very first real HTTP request after adding /health
+  // crash-looped the device. set_last_error_()/clear_last_error_() and the
+  // LockGuards in parse_device()/parse_status_frame_()/
+  // parse_temperature_frame_()/handle_*_() are the fix.
+  void set_last_error_(const std::string &message);
+  void clear_last_error_();
+
+  Mutex state_mutex_;
+
   std::string name_prefix_{"PBV2-"};
   std::string grill_password_;
+  std::string model_;
+  web_server_base::WebServerBase *web_server_base_{nullptr};
+
+  // The grill's full advertised name (e.g. "PBV2-9451DC46B934"), captured in
+  // parse_device() — reported by /info as board_id, same as the sidecar's.
+  std::string board_id_;
+
+  // Grill BLE advertisement RSSI — only updated by parse_device(), which
+  // (like the rest of BLE advertising) goes quiet once connected; matches
+  // the sidecar's own "rssi" field and its same staleness caveat (see
+  // /health's dump in docs/ESP32_FIRMWARE_PLAN.md's Phase 1 notes).
+  int8_t last_rssi_{0};
+  bool has_rssi_{false};
+
+  // millis() timestamp of the last successfully decoded status/temperature
+  // frame (either source) — /health and /state report age off this, mirror
+  // of bridge.state_at in grill_sidecar.py.
+  uint32_t last_frame_millis_{0};
+  bool has_frame_millis_{false};
+
+  // Mirrors bridge.last_error in grill_sidecar.py: the most recent
+  // RPC/decode failure, cleared on the next success. Empty means "no error
+  // outstanding", not "never started".
+  std::string last_error_;
 
   // Only one RPC request is ever in flight at a time (see write_rpc_command_
   // and the reply-reassembly fields below) — this says which one, so

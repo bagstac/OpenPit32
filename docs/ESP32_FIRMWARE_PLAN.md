@@ -7,7 +7,7 @@ of the Bluetooth protocol, command dispatch, alarm evaluation, and alerting.
 Current state / why the sidecar exists at all today: `docs/STATE.md`.
 Protocol facts this plan leans on: `docs/PROTOCOL.md`.
 
-Phases 1 through 3 (below) are implemented and bench-verified against the
+Phases 1 through 4 (below) are implemented and bench-verified against the
 real grill; everything past that is still ahead.
 
 ## Verified 2026-09-09: Phase 1, native BLE connect + RPC.Ping
@@ -134,6 +134,82 @@ off, no probes connected):
   continuously (unauthenticated pushes every few seconds, authenticated
   `PB.GetState` every 15s) — `gattc_calls` climbed steadily (24→71+) with no
   crashes, disconnects, or dropped writes.
+
+## Verified 2026-09-10: Phase 4, REST endpoints
+
+`pitboss_grill.h`/`.cpp` now implement `AsyncWebHandler` directly and
+register `/health`, `/state`, `/info` on ESPHome's shared `web_server_base`
+httpd (`web_server_base_->init()`/`add_handler(this)` in `setup()` — the
+same pattern `esphome/components/prometheus` uses, not a second HTTP
+server). Field names and shapes deliberately mirror
+`scripts/grill_sidecar.py`'s handlers exactly — see
+`OpenPit32/Services/GrillRpcService.cs`'s `SidecarHealthResponse`/
+`SidecarStateResponse`/`SidecarInfoResponse` for the DTOs this has to match
+— so the Blazor frontend needs zero changes once nginx points here. Some
+`/health` fields shift meaning now that this ESP32 plays both of the old
+architecture's proxy roles: `proxy_connected` is unconditionally `true` and
+`proxy_wifi_rssi`/`proxy_uptime_seconds` report this device's own WiFi
+RSSI/uptime (previously a *second*, now-removed ESP32's) — see the comment
+above `handle_health_()`. `configured` is unconditionally `true` for now
+(the grill password is still compile-time — Phase 7 makes this conditional).
+`/info`'s `firmware` and `accepted_setpoints_f` aren't populated yet
+(Phase 5/7); `GrillDetail.razor` already treats their absence as "nothing to
+show".
+
+**Two real bugs found and fixed getting this onto real hardware, both worth
+reading before touching this component again**:
+
+1. `PitbossGrill` inherits `BLEClientBase`, whose default
+   `get_setup_priority()` is `setup_priority::BLUETOOTH` (350) — *higher*
+   than `wifi:`'s own (250), meaning `setup()` (and so
+   `web_server_base_->init()`) ran *before* WiFi's own setup(). The very
+   first real HTTP GET after OTA-flashing this crash-looped the device
+   every time, reliably. Fixed by overriding `get_setup_priority()` to
+   `setup_priority::WIFI - 1.0f` — the exact same fix (and reasoning)
+   `esphome/components/prometheus`'s `PrometheusHandler` already uses for
+   the identical problem. (BLE client registration itself doesn't depend on
+   this ordering — `esp32_ble_tracker.register_client()`'s codegen emits a
+   raw call outside any component's `setup()` — so moving our own setup()
+   later cost nothing there.)
+2. Once REST handlers exist, `grill_state_`/`last_error_`/`board_id_`
+   (`std::string`/struct fields) get read from the httpd task — a *third*
+   FreeRTOS task touching state that was already being written from two
+   others (the BT stack's own task, via `gattc_event_handler()`/
+   `on_debug_log_()`, which are NOT deferred to the main loop — only
+   `on_rpc_read_()`'s reply dispatch is, and that's for stack-depth reasons,
+   not thread safety; and the main loop task, via deferred `PB.GetState`
+   replies) with zero synchronization the whole time. This is a real crash
+   risk for heap-backed types like `std::string`, not just a theoretical
+   one: after the priority fix above, hardware still crashed on the first
+   `/health` hit, and once it had, the device's network/httpd stack never
+   recovered on its own — it stopped accepting new HTTP/OTA connections
+   entirely (looked like a reboot loop from the reconnect noise, but the
+   ~30-150ms reconnect cadence was too fast for an actual reboot; it needed
+   a manual power cycle to clear). Fixed with an `esphome::Mutex`/
+   `LockGuard` (`state_mutex_`) guarding every field touched from more than
+   one task — see `set_last_error_()`/`clear_last_error_()` and the
+   snapshot-under-lock-then-build-JSON pattern in `handle_health_()`/
+   `handle_state_()`/`handle_info_()`.
+
+OTA-flashed and re-verified after the fixes:
+
+- `curl http://<esp32>/health|/state|/info` all return correct, real data:
+  `{"configured":true,"connected":true,"proxy_connected":true,"rssi":-41,
+  "proxy_wifi_rssi":-56,"proxy_uptime_seconds":20,"state_age_seconds":1.1}`,
+  `{"configured":true,"board_id":"PBV2-9451DC46B934","model":"PBV5 P2",
+  "accepted_setpoints_f":[],"has_lights":false,"meat_probes":4}`,
+  `{"state":{"moduleIsOn":false,"grillTemp":68,"grillSetTemp":140,
+  "smokerActTemp":68,"p4Temp":0,...},"state_age_seconds":1.5}` — matching
+  the Phase 3 bench readings (disconnected probes 1-3 omitted as `null`, as
+  intended).
+- 60 back-to-back requests across all three endpoints, then a further
+  30-request burst run concurrently with live BLE traffic, all returned
+  `200` with no dropped connections.
+- Live logs during and after that traffic show continuous, correctly
+  decoded status/temperature frames every ~2s and `gattc_calls` climbing
+  steadily (262→272+) with no disconnects, resets, or dropped writes — the
+  race-condition fix holds under real concurrent HTTP+BLE load, not just in
+  isolation.
 
 ## Decisions made (2026-09-09)
 
@@ -386,9 +462,12 @@ firmware has proven itself, given what's at stake if it's wrong.
 3. ✅ **Done (2026-09-09)** — **Status/temperature decoding**: decode the
    `sc_11`/`sc_12` (FE0B/FE0C) frames' bit-level fields into the
    component's internal state. See "Verified" above.
-4. Add the REST endpoints (`/health`, `/state`, `/info`) — read-only —
-   and repoint nginx's `proxy_pass` at the ESP32 to confirm the Blazor app
-   renders live data with zero frontend changes.
+4. ✅ **Done (2026-09-10)** — **REST endpoints**: `/health`, `/state`,
+   `/info` — read-only. See "Verified" above. Repointing nginx's
+   `proxy_pass` at the ESP32 is deliberately deferred — `/login`/`/logout`/
+   `/auth-check` still need the sidecar's login process, which doesn't move
+   over until rollout item 8, and repointing now would break login on the
+   live deployment.
 5. Add `turn-on`/`turn-off`/`set-temperature` behind the same confirm
    semantics the sidecar enforces today.
 6. Add the alarm monitor loop + Telegram `notify()`.
@@ -402,5 +481,5 @@ firmware has proven itself, given what's at stake if it's wrong.
    Phase 1 begins.
 
 All decisions this plan depended on are now made (see "Decisions made"
-above) — nothing left open. Phases 1 through 3 are done; ready for Phase 4
-(REST endpoints) whenever you want to start.
+above) — nothing left open. Phases 1 through 4 are done; ready for Phase 5
+(turn-on/turn-off/set-temperature) whenever you want to start.
