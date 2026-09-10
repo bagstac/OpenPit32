@@ -18,12 +18,13 @@
 // scripts/grill_sidecar.py serves (/health, /state, /info) — registered on
 // ESPHome's own shared httpd (web_server_base), not a second HTTP server —
 // so nginx's proxy_pass can point straight at this ESP32 with zero Blazor
-// frontend changes. All four phases are bench-verified against real
-// hardware as of 2026-09-09.
+// frontend changes. Phase 5 adds POST /command (turn-on/turn-off/
+// set-temperature) behind the same confirm semantics grill_sidecar.py's
+// bridge.command() enforces today — see handle_command_()'s comment for the
+// full flow. All five phases are bench-verified against real hardware.
 //
-// NOT yet implemented here (later phases): MCU commands (set-temperature,
-// turn-on/off), the alarm monitor + Telegram notify(), and the /setup
-// cloud-password-fetch + NVS persistence flow.
+// NOT yet implemented here (later phases): the alarm monitor + Telegram
+// notify(), and the /setup cloud-password-fetch + NVS persistence flow.
 
 #ifdef USE_ESP32
 
@@ -35,6 +36,8 @@
 #include "esphome/components/web_server_base/web_server_base.h"
 
 #include <esp_gattc_api.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <string>
 #include <vector>
 
@@ -166,8 +169,10 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   void send_get_state_cycle_();
   void send_get_time_();
   void send_get_state_(double uptime);
+  void send_mcu_command_(double uptime);
   void on_get_time_reply_(const std::string &json);
   void on_get_state_reply_(const std::string &json);
+  void on_mcu_command_reply_(const std::string &json);
   void on_rpc_notify_(const uint8_t *data, uint16_t len);
   void on_rpc_read_(const uint8_t *data, uint16_t len);
   void on_debug_log_(const uint8_t *data, uint16_t len);
@@ -186,6 +191,11 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   void handle_health_(AsyncWebServerRequest *request);
   void handle_state_(AsyncWebServerRequest *request);
   void handle_info_(AsyncWebServerRequest *request);
+  // Phase 5: POST /command — turn-on/turn-off/set-temperature. See the .cpp
+  // for the full flow (it blocks the calling httpd task on a semaphore until
+  // the BLE round trip actually completes, mirroring grill_sidecar.py's
+  // bridge.command(), which the caller awaits to completion the same way).
+  void handle_command_(AsyncWebServerRequest *request);
 
   // Phase 4 is the first thing that reads grill_state_/last_error_/board_id_/
   // last_rssi_ from outside the task that writes them — the REST handlers
@@ -238,8 +248,16 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   // and the reply-reassembly fields below) — this says which one, so
   // on_rpc_read_'s completion handler knows how to interpret the reply
   // without needing to track/match request ids of our own.
-  enum class PendingReply { NONE, PING, GET_TIME, GET_STATE };
+  enum class PendingReply { NONE, PING, GET_TIME, GET_STATE, MCU_COMMAND };
   PendingReply pending_reply_{PendingReply::NONE};
+
+  // GET_TIME is a shared first step (every authenticated call needs a fresh
+  // uptime to derive its key) — this says what on_get_time_reply_() should
+  // do once it lands: continue the periodic GetState cycle (the default), or
+  // send the MCU command handle_command_() queued in command_pending_hex_.
+  // Main-loop-only, like pending_reply_ itself — see handle_command_()'s
+  // comment for why the httpd task never touches this directly.
+  PendingReply pending_after_time_{PendingReply::GET_STATE};
 
   // Mongoose OS RPC-over-GATT + debug-log characteristic handles, resolved
   // once per connection from ESP_GATTC_SEARCH_CMPL_EVT.
@@ -273,6 +291,21 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   std::string rpc_write_json_;
   size_t rpc_write_offset_{0};
   bool rpc_write_in_progress_{false};
+
+  // Phase 5 (POST /command) — see handle_command_() in the .cpp for the full
+  // flow. command_mutex_ serializes concurrent POST /command requests (only
+  // one physical BLE link exists to drive); command_done_sem_ is how the
+  // httpd task, blocked waiting for a command's real result, is woken by the
+  // main-loop task once on_mcu_command_reply_() (or a timeout) has one.
+  // command_pending_hex_/command_result_error_/command_retried_ are only
+  // ever written by the main loop and only ever read by the httpd task after
+  // the semaphore wakes it — that handoff is the synchronization, so neither
+  // needs state_mutex_.
+  Mutex command_mutex_;
+  SemaphoreHandle_t command_done_sem_{nullptr};
+  std::string command_pending_hex_;
+  std::string command_result_error_;
+  bool command_retried_{false};
 
   GrillState grill_state_;
 };

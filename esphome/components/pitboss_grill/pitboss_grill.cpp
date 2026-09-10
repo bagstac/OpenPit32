@@ -4,8 +4,10 @@
 #include "esphome/components/json/json_util.h"
 #include "esphome/components/wifi/wifi_component.h"
 
+#include <esp_http_server.h>
 #include <esp_random.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 
@@ -53,6 +55,29 @@ static const size_t RPC_CHUNK_SIZE = 20;
 // only, not needed here).
 static const uint8_t CODEC_KEY[8] = {0x8F, 0x80, 0x19, 0xCF, 0x77, 0x6C, 0xFE, 0xB7};
 static const size_t CODEC_PADDING_LEN = 16;
+
+// Phase 5's fixed MCU commands — pytboss's grills.json "PBV2" control board
+// entry, hardcoded per docs/PROTOCOL.md's "command surface" note (this
+// project only ever talks to one grill model/board; a different one needs
+// its own table). turn-on has no declared slug on ANY of pytboss's 137
+// models — see turn_grill_on()'s docstring in pytboss/api.py for why FE0101FF
+// is used anyway (proven working on real hardware, collides with no other
+// command). turn-off is universal (FE0102FF, "turn-off" slug).
+static const char *const CMD_TURN_ON = "FE0101FF";
+static const char *const CMD_TURN_OFF = "FE0102FF";
+
+// Grill setpoints the PBV2 board honours for this model (PBV5 P2) — pytboss's
+// grills.json temp_increment, 130-420F in 5-degree steps. Fixed here for the
+// same reason the commands above are: this project is pinned to one grill.
+// A value outside this list is rejected by the board, so incoming
+// set-temperature requests are snapped to the nearest entry here first,
+// exactly like pytboss's own accepted_setpoints()/set_grill_temperature().
+static const int16_t ACCEPTED_SETPOINTS_F[] = {
+    130, 135, 140, 145, 150, 155, 160, 165, 170, 175, 180, 185, 190, 195, 200, 205, 210, 215, 220,
+    225, 230, 235, 240, 245, 250, 255, 260, 265, 270, 275, 280, 285, 290, 295, 300, 305, 310, 315,
+    320, 325, 330, 335, 340, 345, 350, 355, 360, 365, 370, 375, 380, 385, 390, 395, 400, 405, 410,
+    415, 420,
+};
 
 // Port of timed_key(): derives the per-request key from the grill's own
 // uptime, in 10s buckets. Repeatedly pops an element out of a shrinking
@@ -145,9 +170,107 @@ static std::string build_rpc_request(int id, const std::string &method, const st
   });
 }
 
+// Builds {"id","method":"PB.SendMCUCommand","params":{"command","psw"}} —
+// matches pytboss/api.py's _send_hex_command(): every MCU command carries
+// the same encoded-grill-password "psw" PB.GetState does, just alongside a
+// "command" field instead of alone.
+static std::string build_mcu_command_request(int id, const std::string &command_hex, const std::string &psw_hex) {
+  return esphome::json::build_json([&](JsonObject root) {
+    root["id"] = id;
+    root["method"] = "PB.SendMCUCommand";
+    JsonObject params = root["params"].to<JsonObject>();
+    params["command"] = command_hex;
+    params["psw"] = psw_hex;
+  });
+}
+
+static std::string to_lower_trim(const std::string &s) {
+  size_t start = s.find_first_not_of(" \t\r\n");
+  if (start == std::string::npos)
+    return "";
+  size_t end = s.find_last_not_of(" \t\r\n");
+  std::string out = s.substr(start, end - start + 1);
+  std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return std::tolower(c); });
+  return out;
+}
+
+// Snaps `requested` (in the grill's current display unit) to the nearest
+// setpoint ACCEPTED_SETPOINTS_F's board actually honours, then builds the
+// "set-temperature" MCU command — a direct port of pytboss's grills.json
+// PBV2 command function:
+//   let temp = arguments[1] === false
+//     ? Math.round(((arguments[0] * 1.8) + 32) / 5) * 5 : arguments[0];
+//   ... 'FE0501' + formatHex(hundreds) + formatHex(tens) + formatHex(ones) + 'FF'
+// The wire command always carries a Fahrenheit value (arguments[1] is only
+// true/false to tell the board's own routine whether to convert first) — so
+// this always resolves to a Fahrenheit snap, converting back if the grill is
+// in Celsius, matching pytboss's set_grill_temperature()/accepted_setpoints().
+// This grill declares no celsius_temp_increment of its own, so — like
+// pytboss — the Celsius table here is derived from ACCEPTED_SETPOINTS_F via
+// floor((f-32)/1.8), not a second hardcoded list.
+static std::string build_set_temperature_command(double requested, bool fahrenheit) {
+  int snapped_f;
+  if (fahrenheit) {
+    int best = ACCEPTED_SETPOINTS_F[0];
+    double best_diff = std::fabs(requested - best);
+    for (int16_t f : ACCEPTED_SETPOINTS_F) {
+      double diff = std::fabs(requested - f);
+      if (diff < best_diff) {
+        best_diff = diff;
+        best = f;
+      }
+    }
+    snapped_f = best;
+  } else {
+    int best_c = static_cast<int>(std::floor((ACCEPTED_SETPOINTS_F[0] - 32) / 1.8));
+    double best_diff = std::fabs(requested - best_c);
+    for (int16_t f : ACCEPTED_SETPOINTS_F) {
+      int c = static_cast<int>(std::floor((f - 32) / 1.8));
+      double diff = std::fabs(requested - c);
+      if (diff < best_diff) {
+        best_diff = diff;
+        best_c = c;
+      }
+    }
+    snapped_f = static_cast<int>(std::lround((best_c * 1.8 + 32) / 5.0)) * 5;
+  }
+  uint8_t hundreds = (snapped_f / 100) % 10;
+  uint8_t tens = (snapped_f / 10) % 10;
+  uint8_t ones = snapped_f % 10;
+  return "FE0501" + to_hex({hundreds, tens, ones}) + "FF";
+}
+
+// Reads a POST body directly off the raw httpd_req_t. Needed because the
+// ESP-IDF web_server_idf backend only parses
+// application/x-www-form-urlencoded bodies into arg()/getParam() (see
+// AsyncWebServer::request_post_handler()) — a JSON body (what
+// GrillRpcService.cs's PostAsJsonAsync sends) falls through to the plain
+// GET-style handler with the body still unread on the socket, so it has to
+// be pulled here instead. Capped well above any real /command payload;
+// oversized or unreadable bodies fail rather than blocking on a partial read.
+static bool read_json_body(AsyncWebServerRequest *request, std::string &out) {
+  size_t len = request->contentLength();
+  if (len == 0 || len > 512)
+    return false;
+  out.resize(len);
+  httpd_req_t *raw = *request;
+  size_t received = 0;
+  while (received < len) {
+    int r = httpd_req_recv(raw, &out[received], len - received);
+    if (r <= 0)
+      return false;
+    received += static_cast<size_t>(r);
+  }
+  return true;
+}
+
 void PitbossGrill::setup() {
   BLEClientBase::setup();
   this->set_auto_connect(true);
+
+  // Phase 5: the httpd task waiting inside handle_command_() is woken by
+  // this once the main loop has a real result — see that method's comment.
+  this->command_done_sem_ = xSemaphoreCreateBinary();
 
   // Phase 4: register /health, /state, /info on ESPHome's shared httpd
   // (web_server_base) — same pattern web_server/prometheus/captive_portal
@@ -195,7 +318,7 @@ void PitbossGrill::clear_last_error_() {
 }
 
 void PitbossGrill::dump_config() {
-  ESP_LOGCONFIG(TAG, "Pitboss Grill (Phase 4 — REST endpoints):");
+  ESP_LOGCONFIG(TAG, "Pitboss Grill (Phase 5 — turn-on/turn-off/set-temperature):");
   ESP_LOGCONFIG(TAG, "  Advertised-name prefix: %s", this->name_prefix_.c_str());
 }
 
@@ -393,6 +516,19 @@ void PitbossGrill::send_get_state_(double uptime) {
   this->write_rpc_command_(build_rpc_request(3, "PB.GetState", to_hex(encoded)));
 }
 
+// Phase 5: same auth codec as send_get_state_ above (every authenticated RPC
+// encodes the grill password the same way, regardless of method), but with
+// "command" alongside "psw" and PB.SendMCUCommand instead of PB.GetState.
+// command_pending_hex_ is set by handle_command_()'s defer() before this
+// runs — see on_get_time_reply_() for how a GetTime cycle routes here
+// instead of into the periodic send_get_state_().
+void PitbossGrill::send_mcu_command_(double uptime) {
+  auto key = timed_key(uptime);
+  auto encoded = pb_encode(this->grill_password_, key);
+  this->pending_reply_ = PendingReply::MCU_COMMAND;
+  this->write_rpc_command_(build_mcu_command_request(4, this->command_pending_hex_, to_hex(encoded)));
+}
+
 void PitbossGrill::on_get_time_reply_(const std::string &json) {
   JsonDocument doc = esphome::json::parse_json(json);
   if (doc.isNull()) {
@@ -412,7 +548,15 @@ void PitbossGrill::on_get_time_reply_(const std::string &json) {
     return;
   }
   ESP_LOGD(TAG, "GetTime OK, uptime=%.1f s", uptime);
-  this->send_get_state_(uptime);
+  // pending_after_time_ is NOT reset here — a retried MCU command (see
+  // on_mcu_command_reply_()) calls send_get_time_() again and needs to land
+  // back here a second time. Only on_mcu_command_reply_() itself resets it,
+  // once it's actually done (success or final failure).
+  if (this->pending_after_time_ == PendingReply::MCU_COMMAND) {
+    this->send_mcu_command_(uptime);
+  } else {
+    this->send_get_state_(uptime);
+  }
 }
 
 void PitbossGrill::on_get_state_reply_(const std::string &json) {
@@ -451,6 +595,36 @@ void PitbossGrill::on_get_state_reply_(const std::string &json) {
     this->parse_temperature_frame_(sc_12);
   if (sc_11.empty() && sc_12.empty())
     ESP_LOGD(TAG, "PB.GetState OK, both frames blank (poll landed mid-command)");
+}
+
+// Completes the Phase 5 command flow handle_command_() started: wakes the
+// httpd task blocked on command_done_sem_ with a real result, one way or
+// the other. A rejected command gets exactly one retry — like
+// on_get_state_reply_()'s comment above, a slow write can land in the wrong
+// 10s key bucket and draw a spurious Unauthorized that isn't a bad password
+// at all, and every MCU command this project sends (on/off/absolute
+// setpoint) is idempotent, so retrying cannot double-apply anything. Only
+// resets pending_after_time_ once truly done — see on_get_time_reply_()'s
+// comment for why the retry path must not reset it early.
+void PitbossGrill::on_mcu_command_reply_(const std::string &json) {
+  JsonDocument doc = esphome::json::parse_json(json);
+  bool rejected = doc.isNull() || !doc["error"].isNull();
+  if (rejected && !this->command_retried_) {
+    ESP_LOGW(TAG, "MCU command rejected, retrying once (key-bucket skew, not necessarily a bad password): %s",
+             json.c_str());
+    this->command_retried_ = true;
+    this->send_get_time_();
+    return;
+  }
+  this->pending_after_time_ = PendingReply::GET_STATE;
+  if (rejected) {
+    ESP_LOGW(TAG, "MCU command failed after retry: %s", json.c_str());
+    this->command_result_error_ = "grill rejected the command (bad password, or key-bucket skew)";
+  } else {
+    ESP_LOGI(TAG, "MCU command accepted: %s", this->command_pending_hex_.c_str());
+    this->command_result_error_.clear();
+  }
+  xSemaphoreGive(this->command_done_sem_);
 }
 
 // Decodes an FE0B status frame — ported from pytboss's grills.json "PBV2"
@@ -579,7 +753,20 @@ void PitbossGrill::on_rpc_read_(const uint8_t *data, uint16_t len) {
     this->rpc_reply_in_progress_ = false;
     // Also clear this, or send_get_state_cycle_()'s in-flight guard would
     // wrongly believe a reply is still pending forever after a truncation.
+    PendingReply kind = this->pending_reply_;
     this->pending_reply_ = PendingReply::NONE;
+    // A truncation mid-command must not leave pending_after_time_ pointing
+    // at MCU_COMMAND with a now-abandoned command_pending_hex_ — the next
+    // *periodic* GetTime cycle would otherwise reissue that stale command
+    // with no caller waiting on it. Waking handle_command_() here (instead
+    // of leaving it to the 8s timeout) also fails it fast.
+    if (this->pending_after_time_ == PendingReply::MCU_COMMAND) {
+      this->pending_after_time_ = PendingReply::GET_STATE;
+      if (kind == PendingReply::GET_TIME || kind == PendingReply::MCU_COMMAND) {
+        this->command_result_error_ = "BLE link dropped mid-command";
+        xSemaphoreGive(this->command_done_sem_);
+      }
+    }
     return;
   }
   this->rpc_reply_buffer_.insert(this->rpc_reply_buffer_.end(), data, data + len);
@@ -604,6 +791,9 @@ void PitbossGrill::on_rpc_read_(const uint8_t *data, uint16_t len) {
           break;
         case PendingReply::GET_STATE:
           this->on_get_state_reply_(reply);
+          break;
+        case PendingReply::MCU_COMMAND:
+          this->on_mcu_command_reply_(reply);
           break;
         case PendingReply::PING:
         case PendingReply::NONE:
@@ -645,16 +835,17 @@ void PitbossGrill::on_debug_log_(const uint8_t *data, uint16_t len) {
 // Registered on ESPHome's shared httpd via web_server_base — see setup()
 // and set_web_server_base(). Route matching follows the same canHandle()/
 // handleRequest() idiom esphome/components/web_server and .../prometheus
-// use (see web_server_base/web_server_idf.h): canHandle() only ever sees
-// GET (the sidecar's /health, /state, /info are all read-only; write
-// commands are Phase 5+), so handleRequest() doesn't need to re-check it.
+// use (see web_server_base/web_server_idf.h). GET /health, /state, /info
+// are read-only (Phase 4); POST /command (Phase 5) is the one write route.
 
 bool PitbossGrill::canHandle(AsyncWebServerRequest *request) const {
-  if (request->method() != HTTP_GET)
-    return false;
   char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
   StringRef url = request->url_to(url_buf);
-  return url == "/health" || url == "/state" || url == "/info";
+  if (request->method() == HTTP_GET)
+    return url == "/health" || url == "/state" || url == "/info";
+  if (request->method() == HTTP_POST)
+    return url == "/command";
+  return false;
 }
 
 void PitbossGrill::handleRequest(AsyncWebServerRequest *request) {
@@ -666,6 +857,8 @@ void PitbossGrill::handleRequest(AsyncWebServerRequest *request) {
     this->handle_state_(request);
   } else if (url == "/info") {
     this->handle_info_(request);
+  } else if (url == "/command") {
+    this->handle_command_(request);
   }
 }
 
@@ -788,10 +981,12 @@ void PitbossGrill::handle_state_(AsyncWebServerRequest *request) {
 // accepted_setpoints_f, has_lights, meat_probes} — see GrillRpcService.cs's
 // SidecarInfoResponse. Unlike the sidecar, this never 404s (configured is
 // always true here — see handle_health_()). "firmware" (the sidecar's own
-// one-time Pit Boss cloud fetch) and "accepted_setpoints_f" (Phase 5's
-// set-temperature) aren't ported yet, so they're left out entirely;
-// GrillDetail.razor's `info.firmware is { } fw` check already treats a
-// missing/null value as "nothing to show". has_lights_/meat_probes_ are
+// one-time Pit Boss cloud fetch) isn't ported yet, so it's left out
+// entirely; GrillDetail.razor's `info.firmware is { } fw` check already
+// treats a missing/null value as "nothing to show". accepted_setpoints_f is
+// ACCEPTED_SETPOINTS_F as-is (Phase 5) — always Fahrenheit regardless of the
+// grill's current display unit, matching the sidecar's own
+// `boss.accepted_setpoints(fahrenheit=True)`. has_lights_/meat_probes_ are
 // set once in setup() from YAML config (see __init__.py) — no
 // autodetection here either, same as the sidecar's pytboss-spec lookup.
 // Bug found 2026-09-10, live on the real deployment: this used to hardcode
@@ -815,11 +1010,147 @@ void PitbossGrill::handle_info_(AsyncWebServerRequest *request) {
       root["board_id"] = board_id;
     if (!this->model_.empty())
       root["model"] = this->model_;
-    root["accepted_setpoints_f"].to<JsonArray>();
+    JsonArray setpoints = root["accepted_setpoints_f"].to<JsonArray>();
+    for (int16_t f : ACCEPTED_SETPOINTS_F)
+      setpoints.add(f);
     root["has_lights"] = this->has_lights_;
     root["meat_probes"] = this->meat_probes_;
   });
   request->send(200, "application/json", body.c_str());
+}
+
+// Mirrors grill_sidecar.py's POST /command: body {action, value?, confirm?}
+// (no "probe" — set_probe/probe targets are decision 6 in
+// docs/ESP32_FIRMWARE_PLAN.md, not being ported), reply
+// {ok, error?, action} — see GrillRpcService.cs's SendCommandAsync/
+// SidecarCommandResponse for the exact shape the Blazor frontend expects.
+// Only power_on/power_off/set_temp exist for this grill: light_on/light_off/
+// prime_on/prime_off/set_probe are real sidecar actions, but this grill has
+// no light (has_lights: false) and PBV2 declares no primer-motor slug (see
+// docs/PROTOCOL.md's "command surface" note) — reported as "unsupported on
+// this grill" rather than the sidecar's silent light no-op, since nothing in
+// the UI can reach them for this grill anyway.
+//
+// power_on/power_off require confirm: true, exactly like
+// grill_sidecar.py's bridge.command() — this is the safety gate
+// docs/ESP32_FIRMWARE_PLAN.md's "Risks" section calls out by name
+// ("keep the confirm-before-power-on UX exactly as it is today").
+//
+// Every reply here is HTTP 200, success or not — confirmed live
+// (2026-09-10) that web_server_idf's AsyncWebServerRequest::init_response_()
+// only special-cases 200/404/409 and maps anything else, 400 included, to a
+// misleading 500. GrillRpcService.cs's SendCommandAsync never checks the
+// status code anyway (it deserializes the body and reads "ok"/"error"
+// unconditionally), so status-coding these responses correctly isn't
+// possible on this ESP-IDF backend and isn't needed by the one real caller.
+//
+// The BLE round trip is asynchronous (GetTime -> encode -> write -> wait for
+// the grill's ack, all on the main loop task/BT stack, same as every other
+// RPC in this file) but this handler answers synchronously, the same way
+// the sidecar's bridge.command() is awaited to completion before its caller
+// gets a reply — a caller acting on {"ok": true} needs that to mean the
+// grill actually took the command, not just that it was queued. That means
+// blocking this httpd-task call: command_mutex_ serializes concurrent
+// POST /command calls (only one physical BLE link exists to drive), then
+// this defer()s the actual RPC kickoff onto the main loop — pending_reply_/
+// pending_after_time_/command_pending_hex_ are main-loop-only fields, same
+// as the rest of this file's RPC state, so the httpd task must never touch
+// them directly — and blocks on command_done_sem_, which
+// on_mcu_command_reply_() (or a disconnect/truncation abandoning the
+// command — see gattc_event_handler()/on_rpc_read_()) gives once there's a
+// real result. Known trade-off: ESP-IDF's httpd processes one request at a
+// time (unlike the sidecar's asyncio server, which yields between awaits),
+// so a command in flight also stalls this ESP32's GET /health, /state,
+// /info for the same few seconds. Acceptable for a user-initiated,
+// infrequent action; not something a polling loop should ever trigger.
+void PitbossGrill::handle_command_(AsyncWebServerRequest *request) {
+  std::string body;
+  if (!read_json_body(request, body)) {
+    request->send(200, "application/json", "{\"ok\":false,\"error\":\"missing or oversized JSON body\"}");
+    return;
+  }
+  JsonDocument doc = esphome::json::parse_json(body);
+  if (doc.isNull()) {
+    request->send(200, "application/json", "{\"ok\":false,\"error\":\"invalid JSON\"}");
+    return;
+  }
+  std::string action = to_lower_trim(doc["action"] | "");
+  bool confirm = doc["confirm"] | false;
+  bool has_value = !doc["value"].isNull();
+  double value = doc["value"] | 0.0;
+
+  std::string error;
+  std::string command_hex;
+  if (action == "power_on") {
+    if (!confirm)
+      error = "'power_on' requires confirm: true";
+    else
+      command_hex = CMD_TURN_ON;
+  } else if (action == "power_off") {
+    if (!confirm)
+      error = "'power_off' requires confirm: true";
+    else
+      command_hex = CMD_TURN_OFF;
+  } else if (action == "set_temp") {
+    if (!has_value) {
+      error = "set_temp needs a value";
+    } else {
+      bool fahrenheit;
+      {
+        LockGuard lock(this->state_mutex_);
+        fahrenheit = this->grill_state_.is_fahrenheit;
+      }
+      command_hex = build_set_temperature_command(value, fahrenheit);
+    }
+  } else if (action.empty()) {
+    error = "missing action";
+  } else {
+    error = "unsupported on this grill: " + action;
+  }
+
+  if (error.empty() && this->state() != espbt::ClientState::ESTABLISHED)
+    error = "grill not connected";
+
+  if (!error.empty()) {
+    std::string resp = esphome::json::build_json([&](JsonObject root) {
+      root["ok"] = false;
+      root["error"] = error;
+    });
+    request->send(200, "application/json", resp.c_str());
+    return;
+  }
+
+  // One command at a time on the single physical BLE link.
+  LockGuard cmd_lock(this->command_mutex_);
+  xSemaphoreTake(this->command_done_sem_, 0);  // drain a stale signal left by a prior timeout
+  this->command_result_error_.clear();
+  this->command_retried_ = false;
+
+  this->defer([this, command_hex]() {
+    if (this->pending_reply_ != PendingReply::NONE) {
+      // The periodic 15s GetState cycle (or, in principle, another command)
+      // was already mid-flight when this one was deferred in — vanishingly
+      // unlikely given command_mutex_ above, but fail loudly rather than
+      // stomp on it.
+      this->command_result_error_ = "grill busy — try again";
+      xSemaphoreGive(this->command_done_sem_);
+      return;
+    }
+    this->command_pending_hex_ = command_hex;
+    this->pending_after_time_ = PendingReply::MCU_COMMAND;
+    this->send_get_time_();
+  });
+
+  bool completed = xSemaphoreTake(this->command_done_sem_, pdMS_TO_TICKS(8000)) == pdTRUE;
+  std::string result_error = completed ? this->command_result_error_ : std::string("timed out waiting for grill");
+
+  std::string resp = esphome::json::build_json([&](JsonObject root) {
+    root["ok"] = result_error.empty();
+    if (!result_error.empty())
+      root["error"] = result_error;
+    root["action"] = action;
+  });
+  request->send(200, "application/json", resp.c_str());
 }
 
 bool PitbossGrill::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
@@ -844,6 +1175,19 @@ bool PitbossGrill::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       this->notifies_expected_ = this->notifies_confirmed_ = 0;
       this->rpc_reply_in_progress_ = false;
       this->rpc_write_in_progress_ = false;
+      // Without this, a disconnect mid-command left pending_reply_/
+      // pending_after_time_ stuck forever: nothing else clears them, so
+      // every later GetState cycle would see "a reply is still in flight"
+      // and no-op permanently, and any handle_command_() blocked on
+      // command_done_sem_ would just time out with the link still marked
+      // busy instead of recovering once it reconnects.
+      bool was_command = this->pending_after_time_ == PendingReply::MCU_COMMAND;
+      this->pending_reply_ = PendingReply::NONE;
+      this->pending_after_time_ = PendingReply::GET_STATE;
+      if (was_command) {
+        this->command_result_error_ = "grill BLE link dropped mid-command";
+        xSemaphoreGive(this->command_done_sem_);
+      }
       break;
     }
     case ESP_GATTC_SEARCH_CMPL_EVT: {

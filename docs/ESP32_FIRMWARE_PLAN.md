@@ -248,6 +248,89 @@ Fixed by promoting `has_lights`/`meat_probes` from hardcoded literals in
 spec — the same pattern `model` already used. OTA-flashed and confirmed
 live: `curl http://<esp32>/info` now returns `"meat_probes":3`.
 
+## Verified 2026-09-10: Phase 5, turn-on/turn-off/set-temperature
+
+`pitboss_grill.h`/`.cpp` add `POST /command`, mirroring
+`scripts/grill_sidecar.py`'s exact contract — body `{action, value?,
+confirm?}`, reply `{ok, error?, action}` (see `GrillRpcService.cs`'s
+`SendCommandAsync`/`SidecarCommandResponse`) — so `GrillDetail.razor`'s
+existing double-click confirm UX needed zero changes. Only `power_on`,
+`power_off`, and `set_temp` exist for this grill: `light_on`/`light_off`/
+`prime_on`/`prime_off`/`set_probe` are real sidecar actions, but this grill
+has no light and PBV2 declares no primer-motor slug (see "Protocol
+groundwork" above), so they're reported as "unsupported on this grill"
+rather than the sidecar's silent light no-op. `power_on`/`power_off` require
+`confirm: true`, exactly like `bridge.command()` today — the safety gate
+this plan's "Risks" section calls out by name.
+
+Commands are sent as authenticated `PB.SendMCUCommand` (`{"command":
+hex,"psw": ...}`), reusing the same auth codec `PB.GetState` already uses.
+Fixed commands: `turn-on` → `FE0101FF` (undocumented in pytboss's own
+tables — no board declares a slug for it — but proven working per
+`turn_grill_on()`'s docstring in pytboss/api.py), `turn-off` → `FE0102FF`.
+`set-temperature` snaps the requested value to this grill's real accepted
+setpoints (130-420°F in 5° steps, ported from pytboss's `grills.json`
+`temp_increment` for "PBV5 P2") and builds `FE0501<hundreds><tens><ones>FF`
+— a direct port of the PBV2 board's own command function. `/info`'s
+`accepted_setpoints_f` is now populated with this same list (previously an
+empty array, Phase 4's placeholder).
+
+Because the REST handler must answer synchronously — a caller acting on
+`{"ok": true}` needs that to mean the grill actually took the command, not
+just that it was queued, matching `bridge.command()` being awaited to
+completion today — the httpd task blocks on a FreeRTOS semaphore until the
+async GetTime→encode→write→ack round trip (on the main loop/BT stack, same
+as every other RPC in this file) actually completes, with a single retry on
+rejection (same key-bucket-skew tolerance `PB.GetState` already has) and an
+8s timeout. `command_mutex_` serializes concurrent `POST /command` calls —
+only one physical BLE link exists to drive.
+
+**One real bug found and fixed getting this onto real hardware**: every
+non-200/404/409 status code passed to `AsyncWebServerRequest::send()` gets
+silently remapped to `500` by web_server_idf's `init_response_()` — a `400`
+for a rejected command (missing `confirm`, unknown action, etc.) came back
+as a misleading `500 Internal Server Error` with the correct JSON body still
+in the response. Since `GrillRpcService.cs`'s `SendCommandAsync` never
+checks the HTTP status code anyway (it deserializes the body and reads
+`ok`/`error` unconditionally), the fix was to stop trying to status-code
+`/command`'s replies at all — every reply is `200`, success or not, and the
+body's `ok` field is the only signal that matters. Worth remembering for any
+future REST route on this ESP-IDF web server backend: only 200/404/409 are
+real status codes here.
+
+**One known trade-off, not a bug**: ESP-IDF's httpd processes one request at
+a time, unlike the sidecar's asyncio server (which yields between awaits),
+so a command in flight also stalls this ESP32's `GET /health`/`/state`/
+`/info` for the same few seconds. Acceptable for a user-initiated,
+infrequent action — not something a polling loop should ever trigger.
+
+OTA-flashed and verified against the real, live production grill (not just
+the bench) — 2026-09-10, with explicit sign-off before the power-on step
+specifically, since that ignites a real fire in an unattended appliance:
+
+- `POST /command` with no `confirm` on `power_on`/`power_off` is rejected
+  (`"'power_on' requires confirm: true"`), same for an unsupported action
+  (`light_on`, `set_probe`) and a `set_temp` with no `value` — none of these
+  touch the BLE link at all.
+- `set_temp` to 225°F: `{"ok":true}`, and `/state`'s `grillSetTemp` moved
+  130→225 within the next debug-log push (~2s), confirming the real MCU
+  command round-tripped and the board actually applied it.
+- `power_off` while already off: `{"ok":true}` (idempotent, as designed).
+- `power_on` (confirm: true): `{"ok":true}`, and `/state` showed the grill's
+  real startup sequence within seconds — `moduleIsOn:true`, igniter and fan
+  on, auger cycling — a real ignition, not a simulated one. (The controller
+  itself resets the setpoint to its 130°F startup default on power-on,
+  independent of whatever was set beforehand — normal Pit Boss behavior, not
+  something this firmware controls.)
+- `power_off` again immediately after: `{"ok":true}`, `moduleIsOn:false`
+  confirmed (fan continued briefly on its own — the controller's normal
+  post-shutdown cool-down cycle).
+
+Not yet repointed: nginx's `/api/command` still goes to the sidecar (see
+rollout item 4's follow-up note above) — this phase only proved the ESP32
+side directly. Repointing it is a small addition to the same
+`nginx.conf.template` pattern whenever that's wanted.
+
 ## Decisions made (2026-09-09)
 
 Asked as clarifying questions before writing this plan; answers below shape
@@ -506,8 +589,12 @@ firmware has proven itself, given what's at stake if it's wrong.
    live on the real Pi — see the follow-up note right below. `/login`/
    `/logout`/`/auth-check` and everything else under `/api/` still go to
    the sidecar; that's rollout item 8, not done yet.
-5. Add `turn-on`/`turn-off`/`set-temperature` behind the same confirm
-   semantics the sidecar enforces today.
+5. ✅ **Done (2026-09-10)** — **`turn-on`/`turn-off`/`set-temperature`**
+   behind the same confirm semantics the sidecar enforces today. See
+   "Verified" above — including a real HTTP-status-code bug found and fixed
+   along the way, worth reading before adding another write route on this
+   web server backend. nginx's `/api/command` isn't repointed yet (still the
+   sidecar); only the ESP32 side was proven this phase.
 6. Add the alarm monitor loop + Telegram `notify()`.
 7. Add the `/setup` endpoint (cloud password fetch, run from the ESP32) and
    NVS persistence for password + alarms + Telegram config.
@@ -519,5 +606,5 @@ firmware has proven itself, given what's at stake if it's wrong.
    Phase 1 begins.
 
 All decisions this plan depended on are now made (see "Decisions made"
-above) — nothing left open. Phases 1 through 4 are done; ready for Phase 5
-(turn-on/turn-off/set-temperature) whenever you want to start.
+above) — nothing left open. Phases 1 through 5 are done; ready for Phase 6
+(alarm monitor + Telegram `notify()`) whenever you want to start.

@@ -10,13 +10,15 @@
 # Phase 1 proved the BLE transport (connect, discover, notify, unauth'd
 # RPC.Ping). Phase 2 added the auth codec and authenticated PB.GetState.
 # Phase 3 decoded the sc_11/sc_12 (FE0B/FE0C) frames into internal state.
-# Phase 4 (this revision) serves that state over /health, /state, /info —
-# the pitboss_grill component registers those routes on the web_server_base
-# httpd instance it auto-loads, no separate `web_server_base:`/`web_server:`
-# block needed here. grill_password below is the same secret as
-# scripts/.grill_env's GRILL_PASSWORD on the Pi (Phase 7 moves
+# Phase 4 serves that state over /health, /state, /info — the pitboss_grill
+# component registers those routes on the web_server_base httpd instance it
+# auto-loads, no separate `web_server_base:`/`web_server:` block needed here.
+# Phase 5 (this revision) adds POST /command: turn-on/turn-off/
+# set-temperature, behind the same confirm semantics grill_sidecar.py's
+# bridge.command() enforces today. grill_password below is the same secret
+# as scripts/.grill_env's GRILL_PASSWORD on the Pi (Phase 7 moves
 # fetching/storing it onto the ESP32 itself instead of a compile-time
-# secret). No MCU commands (turn-on/off, set-temperature) yet — Phase 5.
+# secret).
 
 esphome:
   name: grill-firmware
