@@ -791,9 +791,14 @@ void PitbossGrill::handle_state_(AsyncWebServerRequest *request) {
 // one-time Pit Boss cloud fetch) and "accepted_setpoints_f" (Phase 5's
 // set-temperature) aren't ported yet, so they're left out entirely;
 // GrillDetail.razor's `info.firmware is { } fw` check already treats a
-// missing/null value as "nothing to show". has_lights/meat_probes are
-// hardcoded to this specific tested unit (see docs/ESP32_FIRMWARE_PLAN.md's
-// "Decisions made" #6 and the command-surface section) — no light, 4 probes.
+// missing/null value as "nothing to show". has_lights_/meat_probes_ are
+// set once in setup() from YAML config (see __init__.py) — no
+// autodetection here either, same as the sidecar's pytboss-spec lookup.
+// Bug found 2026-09-10, live on the real deployment: this used to hardcode
+// meat_probes to 4 here; PBV5 P2 actually has 3 (pytboss's grills.json
+// spec, and docs/PLAN.md's "Decisions made" #8), so the Live Status card
+// was rendering a Probe 4 the grill doesn't have. Fixed by making both
+// fields real config instead of literals baked into this handler.
 void PitbossGrill::handle_info_(AsyncWebServerRequest *request) {
   // board_id_ is written from parse_device(), on the BLE tracker's own task
   // — see state_mutex_'s header comment. model_ is set once in setup() from
@@ -811,8 +816,8 @@ void PitbossGrill::handle_info_(AsyncWebServerRequest *request) {
     if (!this->model_.empty())
       root["model"] = this->model_;
     root["accepted_setpoints_f"].to<JsonArray>();
-    root["has_lights"] = false;
-    root["meat_probes"] = 4;
+    root["has_lights"] = this->has_lights_;
+    root["meat_probes"] = this->meat_probes_;
   });
   request->send(200, "application/json", body.c_str());
 }

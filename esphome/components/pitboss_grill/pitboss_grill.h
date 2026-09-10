@@ -90,6 +90,17 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   /// happens here, same as the sidecar today.
   void set_model(const std::string &model) { this->model_ = model; }
 
+  /// This grill's fixed hardware capabilities, reported as-is by /info —
+  /// same numbers the sidecar got from pytboss's grills.json spec for this
+  /// model (no autodetection here either). Defaults below match "PBV5 P2"
+  /// specifically; a different model must set both explicitly in YAML.
+  /// Getting meat_probes wrong doesn't just misreport a number: it's the
+  /// probe count GrillDetail.razor's AvailableSensors() loops over to
+  /// decide how many probe cards to render, so a real hardware bug here
+  /// simply prints a "Probe N" the physical grill doesn't have.
+  void set_has_lights(bool has_lights) { this->has_lights_ = has_lights; }
+  void set_meat_probes(uint8_t meat_probes) { this->meat_probes_ = meat_probes; }
+
   // -- AsyncWebHandler (web_server_base's shared httpd) --
   bool canHandle(AsyncWebServerRequest *request) const override;
   void handleRequest(AsyncWebServerRequest *request) override;
@@ -197,6 +208,8 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   std::string name_prefix_{"PBV2-"};
   std::string grill_password_;
   std::string model_;
+  bool has_lights_{false};
+  uint8_t meat_probes_{3};
   web_server_base::WebServerBase *web_server_base_{nullptr};
 
   // The grill's full advertised name (e.g. "PBV2-9451DC46B934"), captured in

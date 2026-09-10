@@ -197,7 +197,9 @@ OTA-flashed and re-verified after the fixes:
   `{"configured":true,"connected":true,"proxy_connected":true,"rssi":-41,
   "proxy_wifi_rssi":-56,"proxy_uptime_seconds":20,"state_age_seconds":1.1}`,
   `{"configured":true,"board_id":"PBV2-9451DC46B934","model":"PBV5 P2",
-  "accepted_setpoints_f":[],"has_lights":false,"meat_probes":4}`,
+  "accepted_setpoints_f":[],"has_lights":false,"meat_probes":4}` (see the
+  2026-09-10 update below — `meat_probes` here was wrong and has since been
+  fixed to `3`),
   `{"state":{"moduleIsOn":false,"grillTemp":68,"grillSetTemp":140,
   "smokerActTemp":68,"p4Temp":0,...},"state_age_seconds":1.5}` — matching
   the Phase 3 bench readings (disconnected probes 1-3 omitted as `null`, as
@@ -210,6 +212,41 @@ OTA-flashed and re-verified after the fixes:
   steadily (262→272+) with no disconnects, resets, or dropped writes — the
   race-condition fix holds under real concurrent HTTP+BLE load, not just in
   isolation.
+
+## 2026-09-10 follow-up: nginx repointed, meat_probes bug found live
+
+`docker/nginx.conf.template` (envsubst template now, not a static
+`docker/nginx.conf`) adds `location = /api/health` / `/api/state` /
+`/api/info` blocks proxying straight to the ESP32 (`$grill_esp32`, built
+from the `GRILL_PROXY_HOST` env var — the same one the sidecar already used
+for this board, so there's one source of truth instead of a second
+hardcoded IP). Everything else under `/api/`, plus `/login`/`/logout`/
+`/auth-check`, is untouched. Deployed to the real Pi
+(`bsbagley@192.168.1.172`, `~/openpit32` — an `scp`'d tree, not a git
+checkout, so this was a targeted file copy + `docker compose up -d --build
+web`, not `git pull`) and verified end-to-end: logged in through nginx with
+the real credentials and confirmed `/api/health`, `/api/state`, `/api/info`
+all return live ESP32 data through the full auth-gated path, not just
+reachable in isolation.
+
+That real deployment immediately surfaced a second bug: the Live Status
+card was showing a **Probe 4** this grill doesn't have. Root cause —
+`handle_info_()` hardcoded `meat_probes` to `4`, but this exact grill
+(PBV5 P2, board PBV2) has **3** meat probes per pytboss's own `grills.json`
+spec (confirmed by querying it live from inside the sidecar container) and
+per this plan's own "Decisions made" #8 in `docs/PLAN.md`. `4` was carried
+over from a Phase 3 bench note about a `p4Temp` byte reading `0`, without
+checking it against the actual per-model spec — the FE0C frame has a
+`p4Temp` field at the byte level regardless of how many probe jacks the
+grill physically has. `GrillDetail.razor`'s `AvailableSensors()` loops
+`1..meat_probes` to decide how many probe cards to render, so this wasn't
+cosmetic — it rendered a UI element for hardware that isn't there.
+
+Fixed by promoting `has_lights`/`meat_probes` from hardcoded literals in
+`handle_info_()` to real YAML config (`pitboss_grill.h`/`.cpp`,
+`__init__.py`), defaulting to `false`/`3` — matching this grill's actual
+spec — the same pattern `model` already used. OTA-flashed and confirmed
+live: `curl http://<esp32>/info` now returns `"meat_probes":3`.
 
 ## Decisions made (2026-09-09)
 
@@ -463,11 +500,12 @@ firmware has proven itself, given what's at stake if it's wrong.
    `sc_11`/`sc_12` (FE0B/FE0C) frames' bit-level fields into the
    component's internal state. See "Verified" above.
 4. ✅ **Done (2026-09-10)** — **REST endpoints**: `/health`, `/state`,
-   `/info` — read-only. See "Verified" above. Repointing nginx's
-   `proxy_pass` at the ESP32 is deliberately deferred — `/login`/`/logout`/
-   `/auth-check` still need the sidecar's login process, which doesn't move
-   over until rollout item 8, and repointing now would break login on the
-   live deployment.
+   `/info` — read-only. See "Verified" above. nginx's `/api/health`,
+   `/api/state`, `/api/info` now `proxy_pass` straight to the ESP32
+   (`docker/nginx.conf.template`'s `$grill_esp32`), deployed and verified
+   live on the real Pi — see the follow-up note right below. `/login`/
+   `/logout`/`/auth-check` and everything else under `/api/` still go to
+   the sidecar; that's rollout item 8, not done yet.
 5. Add `turn-on`/`turn-off`/`set-temperature` behind the same confirm
    semantics the sidecar enforces today.
 6. Add the alarm monitor loop + Telegram `notify()`.

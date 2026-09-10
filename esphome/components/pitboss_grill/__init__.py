@@ -39,6 +39,8 @@ PitbossGrill = pitboss_grill_ns.class_(
 CONF_NAME_PREFIX = "name_prefix"
 CONF_GRILL_PASSWORD = "grill_password"
 CONF_MODEL = "model"
+CONF_HAS_LIGHTS = "has_lights"
+CONF_MEAT_PROBES = "meat_probes"
 
 CONFIG_SCHEMA = (
     cv.Schema(
@@ -57,6 +59,16 @@ CONFIG_SCHEMA = (
             # Reported as-is by /info (scripts/grill_sidecar.py's
             # DEFAULT_MODEL) — no autodetection, same as the sidecar today.
             cv.Optional(CONF_MODEL, default="PBV5 P2"): cv.string,
+            # Also reported as-is by /info — the sidecar got these from
+            # pytboss's grills.json spec for the model above; defaults here
+            # match that same spec for "PBV5 P2" (board PBV2: no light, 3
+            # meat probes — see docs/PLAN.md's "Decisions made" #8). Getting
+            # meat_probes wrong isn't cosmetic: GrillDetail.razor's
+            # AvailableSensors() uses it to decide how many probe cards to
+            # render, so a wrong count here shows a probe the grill doesn't
+            # have (found live, 2026-09-10 — was hardcoded to 4 in the .cpp).
+            cv.Optional(CONF_HAS_LIGHTS, default=False): cv.boolean,
+            cv.Optional(CONF_MEAT_PROBES, default=3): cv.int_range(min=0, max=8),
             # Phase 4: the shared httpd /health, /state, /info register on.
             cv.GenerateID(CONF_WEB_SERVER_BASE_ID): cv.use_id(
                 web_server_base.WebServerBase
@@ -78,6 +90,8 @@ async def to_code(config):
     cg.add(var.set_name_prefix(config[CONF_NAME_PREFIX]))
     cg.add(var.set_grill_password(config[CONF_GRILL_PASSWORD]))
     cg.add(var.set_model(config[CONF_MODEL]))
+    cg.add(var.set_has_lights(config[CONF_HAS_LIGHTS]))
+    cg.add(var.set_meat_probes(config[CONF_MEAT_PROBES]))
 
     web_server = await cg.get_variable(config[CONF_WEB_SERVER_BASE_ID])
     cg.add(var.set_web_server_base(web_server))
