@@ -7,7 +7,7 @@ of the Bluetooth protocol, command dispatch, alarm evaluation, and alerting.
 Current state / why the sidecar exists at all today: `docs/STATE.md`.
 Protocol facts this plan leans on: `docs/PROTOCOL.md`.
 
-Phases 1 through 4 (below) are implemented and bench-verified against the
+Phases 1 through 7 (below) are implemented and bench-verified against the
 real grill; everything past that is still ahead.
 
 ## Verified 2026-09-09: Phase 1, native BLE connect + RPC.Ping
@@ -450,6 +450,151 @@ debounce work above already happened to hide this from the user-facing
 was real BLE traffic being wasted on every other cycle, not just a cosmetic
 concern.
 
+## Verified 2026-09-10: Phase 7, /setup + NVS persistence
+
+`pitboss_grill.h`/`.cpp` add `POST /setup` — a direct port of
+`scripts/pitboss_cloud.py`'s `fetch_and_save()` onto the ESP32 itself
+(`docs/PROTOCOL.md` section 1: one `POST /login/app`, one
+`GET /customer-grills`, both over `http_request_`) — plus NVS persistence
+for the grill password it fetches, the alarms list, and the Telegram bot
+token/chat id, so none of Phase 6's in-memory-only state resets on a
+reboot/reflash anymore. Field names/shapes deliberately mirror
+`scripts/grill_sidecar.py`'s `setup()` exactly (see `handle_setup_()`'s
+comment for the field-by-field mapping to `GrillRpcService.cs`'s
+`SetupAsync`/`SidecarSetupResponse`), so `SetupDialog.razor` needs zero
+changes to work against the ESP32 once nginx points `/api/setup` here too
+(not done yet — same "ESP32 side proven, nginx repoint deferred" pattern
+Phases 5/6 left for `/command`/`/alarms`).
+
+**Storage**: raw ESP-IDF NVS (`nvs_open()`/`nvs_get_str()`/`nvs_set_str()`),
+not ESPHome's own `ESPPreferences` API — that one's built for small
+fixed-size trivial structs (see `esphome/components/esp32/preferences.h`),
+not the variable-length strings/JSON this needs. One namespace
+(`pitboss_grill`), matching decision #7 below: the grill password, Telegram
+bot token, and Telegram chat id each get their own string key
+(`grill_pw`/`tg_token`/`tg_chat_id`); the alarms list is one JSON-blob key
+(`alarms`) rewritten wholesale on every add/remove/fire
+(`save_alarms_locked_()`), a direct port of how `scripts/alarms.py`'s
+`AlarmStore` already treats `alarms.json`. `load_persisted_state_()` (called
+once from `setup()`, before the BLE stack/httpd/alarm-check interval exist)
+loads all four keys, falling back to the YAML-configured value for the three
+strings when NVS has nothing yet — so a fresh device still boots configured
+if `secrets.yaml` sets `grill_password`, but a `POST /setup` on any device
+permanently takes over from there, surviving even a reflash with different
+(or no) `secrets.yaml` content. `nvs_open()` needs no init step of its own:
+ESPHome's own `esp32::ESP32Preferences` already calls `nvs_flash_init()` from
+`app_main()`, before the logger or any `Component::setup()` runs.
+
+**`configured` is a real field now** — `/health` and `/info` both used to
+hardcode it to `true` (Phase 4's placeholder, since the password was
+compile-time-only back then); it now reflects whether `grill_password_` is
+non-empty, matching `GrillRpcService.cs`'s own doc comment on the field.
+`/info` also gained `telegram_configured` (bot token + chat id both set) —
+an extra field ignored by `System.Text.Json`'s default deserialization, like
+`error_display_threshold` before it, so no C# changes were needed to add it.
+
+**`POST /config` grew two more settable fields**: `telegram_bot_token`/
+`telegram_chat_id`, alongside the existing `error_display_threshold`, each
+persisted to NVS the moment they're set — the same runtime-without-a-reflash
+pattern `error_display_threshold` established 2026-09-10 (see the earlier
+follow-up note), now extended to Telegram config per this plan's "Telegram
+integration" section ("Both values get entered once via the web app's setup
+flow and stored on the ESP32 (NVS)"). No `GrillDetail.razor` UI calls this
+yet for Telegram specifically — same as `error_display_threshold`'s own
+rollout, the backend endpoint came first and a "Link Settings"-style card
+followed later once it existed; curl it directly in the meantime. An empty
+string is a valid, intentional value for either field — it's exactly
+`notify_()`'s existing "no bot configured" no-op case, so this doubles as
+how to turn Telegram delivery back off without a reflash.
+
+**Concurrency**: `grill_password_`/`telegram_bot_token_`/`telegram_chat_id_`
+could only ever be set once, from YAML, before Phase 7 — safe to read
+unguarded anywhere. Now `POST /setup`/`POST /config` can rewrite them at any
+time from the httpd task, while `send_get_state_()`/`send_mcu_command_()`
+(grill password) and `notify_()` (Telegram fields) read them every cycle
+from the main loop — every access outside `setup()`/
+`load_persisted_state_()` itself now goes through `state_mutex_`, the same
+lock already guarding `board_id_`/`last_error_`/`grill_state_`. The two
+cloud HTTPS calls `handle_setup_()` makes are synchronous, blocking that
+httpd request for their combined round trip (typically a couple of seconds,
+two TLS handshakes) — the same "acceptable for a rare, user-initiated,
+one-time action" trade-off `handle_command_()`'s comment already documents
+for BLE commands, applied to a second kind of slow synchronous request on
+this same single-threaded ESP-IDF httpd.
+
+**Not applied**: `POST /setup`'s `model` field is accepted (matching the
+sidecar's request shape, so `SetupDialog.razor`'s model dropdown doesn't
+need to change) but not acted on — this firmware's setpoints/lights/probe
+count (`ACCEPTED_SETPOINTS_F`, `has_lights_`, `meat_probes_`) are all fixed
+by YAML config for the one grill/board it's compiled for (decision #8 in
+`docs/PLAN.md`), so honoring a different label without changing those would
+just make `/info` lie about what the hardware actually reports. The reply
+always echoes back the compiled-in `model_` instead.
+
+**One real bug found and fixed getting this onto real hardware, worth
+reading before touching `nvs_save_string_()`/`save_alarms_locked_()` again**:
+calling `nvs_save_string_()` (or `save_alarms_locked_()`, which JSON-builds
+first) directly from a REST handler — exactly how the first version of
+`handle_alarms_post_()`/`handle_alarms_delete_()`/`handle_config_()`/
+`handle_setup_()` all did it — stack-overflowed the ESP-IDF httpd task and
+crash-looped the device, confirmed live via `esphome logs`: a captured
+backtrace decoded to `panic_abort -> esp_system_abort ->
+vApplicationStackOverflowHook`. `web_server_idf`'s httpd task gets a small
+(~4KB) default stack (see `AsyncWebServer::begin()`'s `config.stack_size =
+config.stack_size + 256` — not configurable from YAML), and NVS's own flash
+access — worse on a key's first-ever write, which may need to
+allocate/erase a page — on top of a JSON build already using some of that
+stack was enough to blow it. The device *did* recover on its own each time
+(a clean reboot, not a hang needing a physical power cycle — different from
+Phase 4's failure mode), but every REST handler that persists something
+would have hit this on first real use. Fixed the same way in spirit as
+`on_rpc_read_()`'s existing `defer()` of JSON parsing off the BLE callback's
+own small stack: `nvs_save_string_deferred_()` now moves every REST-handler
+NVS write onto the main loop task instead (which already reliably does
+JSON work via the BLE reply path), and the alarms handlers defer a fresh
+`LockGuard` + `save_alarms_locked_()` call the same way. The in-memory
+state (`grill_password_`/`telegram_*_`/`alarms_`) still updates
+synchronously so the HTTP reply is accurate immediately; only the flash
+write itself is deferred, fire-and-forget (a failure there just logs a
+warning — nothing waits on it).
+
+OTA-flashed and verified against the real ESP32 (twice — once to reproduce
+the crash with logs attached, once with the fix):
+
+- The crash reproduced exactly as predicted: a `POST /alarms` request
+  timed out on the caller, `esphome logs` showed
+  `*** CRASH DETECTED ON PREVIOUS BOOT ***` /
+  `vApplicationStackOverflowHook` at boot, and `/health`'s
+  `proxy_uptime_seconds` had reset to single digits — a clean, automatic
+  reboot each time, not a hang.
+- After the fix: `POST /alarms` (a 1-hour timer alarm), `GET /alarms`,
+  `DELETE /alarms/{id}` (both a real one and a repeat delete of the same id,
+  confirming genuine `200`/`404` still works on this path) all completed
+  normally with `proxy_uptime_seconds` climbing continuously through every
+  call — no crash, no reset.
+- NVS survives a real reboot: one test alarm created under the *old, buggy*
+  code (right before it crashed) was still present after that crash's
+  automatic reboot — the write itself had apparently completed just before
+  the overflow was detected. More conclusively, after fully deleting both
+  test alarms and OTA-reflashing the identical fixed binary again purely to
+  force a clean restart, `GET /alarms` still came back `{"alarms":[]}` —
+  the delete's NVS write, not just the add's, survived a real power-cycle-
+  equivalent reboot.
+- `configured`/`telegram_configured` in `/health`/`/info` came back `true`
+  on every boot this session via the YAML-configured fallback (NVS has
+  never had a real `POST /setup` write yet — see below) — confirming
+  `load_persisted_state_()`'s fallback path works, not just its NVS path.
+
+**Not yet exercised**: a real `POST /setup` round trip against an actual Pit
+Boss account (needs real account credentials nobody pasted into this
+session — intentionally not attempted), and `POST /config`'s
+`telegram_bot_token`/`telegram_chat_id` fields specifically (skipped to
+avoid overwriting the real, working bot credentials already proven live in
+Phase 6 — see that section above). Both go through the exact same
+`nvs_save_string_deferred_()` path the alarms fix above already proved
+works, so this is a real but low-risk gap, not an untested code path in the
+way the alarms crash was.
+
 ## Decisions made (2026-09-09)
 
 Asked as clarifying questions before writing this plan; answers below shape
@@ -723,8 +868,17 @@ firmware has proven itself, given what's at stake if it's wrong.
    nginx's `/api/alarms` isn't repointed yet (still the sidecar); only the
    ESP32 side was proven this phase. Telegram delivery itself is now
    confirmed live too (real bot, real phone) — see "Verified" above.
-7. Add the `/setup` endpoint (cloud password fetch, run from the ESP32) and
-   NVS persistence for password + alarms + Telegram config.
+7. ✅ **Done (2026-09-10)** — **`/setup` endpoint (cloud password fetch,
+   run from the ESP32) + NVS persistence** for the grill password, the
+   alarms list, and the Telegram bot token/chat id. See "Verified" above —
+   including a real stack-overflow crash found and fixed along the way,
+   worth reading before touching `nvs_save_string_()`/
+   `save_alarms_locked_()` again. The real cloud login (`POST /setup`
+   against an actual Pit Boss account) and the Telegram fields of
+   `POST /config` weren't exercised this session (no credentials pasted in,
+   deliberately) — see "Not yet exercised" above. nginx's `/api/setup`
+   isn't repointed yet (still the sidecar); only the ESP32 side was proven
+   this phase.
 8. Port the login-only process (decision 5) from today's
    `grill_sidecar.py`; remove the Python BLE stack and the frontend's
    push/notification code.
@@ -733,6 +887,7 @@ firmware has proven itself, given what's at stake if it's wrong.
    Phase 1 begins.
 
 All decisions this plan depended on are now made (see "Decisions made"
-above) — nothing left open. Phases 1 through 6 are done; ready for Phase 7
-(`/setup` cloud-password fetch + NVS persistence) whenever you want to
-start.
+above) — nothing left open. Phases 1 through 7 are bench-verified (Phase 7's
+real cloud login still needs a live `POST /setup` run against the account
+whenever that's convenient — see its "Not yet exercised" note). Phase 8
+(retire the Python BLE stack + push/notification frontend code) is next.

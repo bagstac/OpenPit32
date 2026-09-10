@@ -3,7 +3,10 @@
 Phase 1 of docs/ESP32_FIRMWARE_PLAN.md: connect and round-trip one
 unauthenticated RPC.Ping to prove the transport. Phase 2 adds the auth
 codec (pytboss/codec.py's timed_key()/encode(), ported to C++) and calls
-authenticated PB.GetState.
+authenticated PB.GetState. Phase 7 adds POST /setup (fetches the grill
+password from the Pit Boss cloud, run from the ESP32 itself) and NVS
+persistence, so CONF_GRILL_PASSWORD below is now just the initial/fallback
+value — see set_grill_password()'s header comment.
 
 Modelled on esphome/components/ble_client/__init__.py's registration
 pattern, but as our own top-level BLEClientBase subclass rather than the
@@ -67,12 +70,17 @@ CONFIG_SCHEMA = (
             # docs/PROTOCOL.md), so — like the sidecar's find_grill() today —
             # this matches by advertised-name prefix instead of a fixed MAC.
             cv.Optional(CONF_NAME_PREFIX, default="PBV2-"): cv.string,
-            # The per-grill RPC password (today: scripts/.grill_env's
-            # GRILL_PASSWORD, fetched once from the Pit Boss cloud). Phase 7
-            # of the plan moves that fetch onto the ESP32 itself and
-            # persists this to NVS instead of a compile-time secret; for
-            # now, bench-testing the auth codec needs it available at all.
-            cv.Required(CONF_GRILL_PASSWORD): cv.string_strict,
+            # The per-grill RPC password. Phase 7 moved the real
+            # fetch-and-persist flow onto the ESP32 itself (POST /setup ->
+            # NVS — see pitboss_grill.cpp's handle_setup_()/
+            # load_persisted_state_()), so this is now only the *initial*
+            # fallback used until the first successful /setup: NVS wins
+            # once it has a value, same as it already does for a device
+            # reflashed with different (or no) secrets.yaml content. May be
+            # left "" — a bench unit with nothing in NVS yet and no YAML
+            # value here just starts unconfigured (see handle_health_()'s
+            # `configured` field) until POST /setup runs.
+            cv.Optional(CONF_GRILL_PASSWORD, default=""): cv.string_strict,
             # Reported as-is by /info (scripts/grill_sidecar.py's
             # DEFAULT_MODEL) — no autodetection, same as the sidecar today.
             cv.Optional(CONF_MODEL, default="PBV5 P2"): cv.string,

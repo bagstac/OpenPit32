@@ -15,18 +15,25 @@
 # auto-loads, no separate `web_server_base:`/`web_server:` block needed here.
 # Phase 5 adds POST /command: turn-on/turn-off/set-temperature, behind the
 # same confirm semantics grill_sidecar.py's bridge.command() enforces today.
-# Phase 6 (this revision) adds the alarm monitor loop (GET/POST /alarms,
-# DELETE /alarms/{id}) and Telegram notify() — same temp-target/timer
-# semantics as today's scripts/alarms.py. Needs real wall-clock time (a
-# timer alarm's fires_at has to be a real Unix timestamp GrillDetail.razor
-# can count down from), hence the `time:` block below — pitboss_grill picks
-# it up automatically via cv.use_id (same pattern as `web_server_base`,
-# which needs no explicit block since it's auto_load'd with an empty/default
+# Phase 6 adds the alarm monitor loop (GET/POST /alarms, DELETE
+# /alarms/{id}) and Telegram notify() — same temp-target/timer semantics as
+# today's scripts/alarms.py. Needs real wall-clock time (a timer alarm's
+# fires_at has to be a real Unix timestamp GrillDetail.razor can count down
+# from), hence the `time:` block below — pitboss_grill picks it up
+# automatically via cv.use_id (same pattern as `web_server_base`, which
+# needs no explicit block since it's auto_load'd with an empty/default
 # config; `http_request:` for the Telegram POST works the same way).
-# grill_password below is the same secret as scripts/.grill_env's
-# GRILL_PASSWORD on the Pi (Phase 7 moves fetching/storing it onto the ESP32
-# itself instead of a compile-time secret) — telegram_bot_token/
-# telegram_chat_id below follow the same compile-time-secret pattern for now.
+# Phase 7 (this revision) adds POST /setup — the same one-time Pit Boss
+# cloud login scripts/pitboss_cloud.py does, now run from the ESP32 itself —
+# and NVS persistence for the password it fetches, the alarms list, and the
+# Telegram bot token/chat id (POST /config), so none of that resets on a
+# reboot/reflash anymore. grill_password below is now only the *initial*
+# fallback (NVS wins once POST /setup has run once) — it may be dropped from
+# secrets.yaml entirely for a fresh device that will be set up through the
+# web app's "Fetch grill password" dialog instead. telegram_bot_token/
+# telegram_chat_id are the same story: still settable here for bench
+# convenience, but POST /config (not yet wired to any web-app UI — curl it
+# directly for now) can set/change them without a reflash too.
 
 esphome:
   name: grill-firmware
@@ -85,6 +92,10 @@ external_components:
 pitboss_grill:
   id: grill
   name_prefix: "PBV2-"
+  # Phase 7: only the initial fallback now — NVS (POST /setup) wins once
+  # it has a value. Safe to drop this line (and grill_password from
+  # secrets.yaml) entirely for a device meant to be set up purely through
+  # the web app's "Fetch grill password" dialog.
   grill_password: !secret grill_password
   # Telegram (docs/ESP32_FIRMWARE_PLAN.md's "Telegram integration" section):
   # message @BotFather for a bot token, message the new bot once, then GET
@@ -92,6 +103,8 @@ pitboss_grill:
   # Both default to "" (no secrets.yaml entry needed to compile) — an alarm
   # still fires and is dropped on schedule either way, it just logs
   # "no Telegram bot configured" instead of actually notifying. Configured
-  # 2026-09-10 to verify real delivery — both keys are in secrets.yaml.
+  # 2026-09-10 to verify real delivery — both keys are in secrets.yaml. Like
+  # grill_password above, these are Phase 7's initial fallback only — POST
+  # /config persists a change to NVS, which then wins on every later boot.
   telegram_bot_token: !secret telegram_bot_token
   telegram_chat_id: !secret telegram_chat_id

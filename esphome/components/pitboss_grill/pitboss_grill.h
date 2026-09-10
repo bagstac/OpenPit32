@@ -28,11 +28,14 @@
 // hardcoded constant; see its own comment below. Phase 6 adds
 // GET/POST /alarms + DELETE /alarms/{id} (temp-target/timer alarms, same
 // semantics as scripts/alarms.py) and a Telegram notify() on fire — see
-// check_alarms_()/notify_()'s comments.
-//
-// NOT yet implemented here (later phases): the /setup cloud-password-fetch
-// + NVS persistence flow (alarms and Telegram config are in-memory only
-// for now, like everything else pre-Phase-7).
+// check_alarms_()/notify_()'s comments. Phase 7 adds POST /setup — a direct
+// port of scripts/pitboss_cloud.py's one-time Pit Boss cloud login onto the
+// ESP32 itself (see handle_setup_()/cloud_login_()/cloud_list_grills_()) —
+// and NVS persistence for the grill password it fetches, the alarms list,
+// and the Telegram bot token/chat id (POST /config), so none of that is
+// lost on a reboot/reflash anymore. See load_persisted_state_()/
+// nvs_save_string_()'s comments for the storage layout (docs/
+// ESP32_FIRMWARE_PLAN.md's "Decisions made" #7).
 
 #ifdef USE_ESP32
 
@@ -42,6 +45,7 @@
 #include "esphome/components/esp32_ble_client/ble_client_base.h"
 #include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
 #include "esphome/components/http_request/http_request.h"
+#include "esphome/components/json/json_util.h"
 #include "esphome/components/time/real_time_clock.h"
 #include "esphome/components/web_server_base/web_server_base.h"
 
@@ -88,10 +92,12 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   /// name instead of a fixed MAC. Defaults to this project's tested board.
   void set_name_prefix(const std::string &prefix) { this->name_prefix_ = prefix; }
 
-  /// The per-grill RPC password (today: scripts/.grill_env's
-  /// GRILL_PASSWORD). See Phase 2 notes in docs/ESP32_FIRMWARE_PLAN.md —
-  /// Phase 7 replaces this compile-time secret with a fetch-and-persist
-  /// flow run from the ESP32 itself.
+  /// The per-grill RPC password. Phase 2 needed this as a compile-time
+  /// secret to bench-test the auth codec at all; Phase 7 replaces that with
+  /// a real fetch-and-persist flow (POST /setup -> NVS, see
+  /// load_persisted_state_()) run from the ESP32 itself, so this YAML value
+  /// is now only the *initial* fallback used until the first successful
+  /// /setup — NVS wins once it has one. May be left "" in YAML entirely.
   void set_grill_password(const std::string &password) { this->grill_password_ = password; }
 
   /// The shared ESPHome httpd instance (see esphome/grill-firmware.yaml's
@@ -247,10 +253,26 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   // the BLE round trip actually completes, mirroring grill_sidecar.py's
   // bridge.command(), which the caller awaits to completion the same way).
   void handle_command_(AsyncWebServerRequest *request);
-  // POST /config — currently just error_display_threshold (see
-  // error_display_threshold_'s comment). Doesn't touch BLE at all, so unlike
+  // POST /config — error_display_threshold, and (Phase 7) the Telegram bot
+  // token/chat id, each persisted to NVS as they're set (see
+  // nvs_save_string_()) the same runtime-settable-without-a-reflash pattern
+  // error_display_threshold established. Doesn't touch BLE at all, so unlike
   // handle_command_() this answers synchronously with no defer()/semaphore.
   void handle_config_(AsyncWebServerRequest *request);
+
+  // Phase 7: POST /setup — a direct port of scripts/pitboss_cloud.py's
+  // fetch_and_save() onto the ESP32 itself (docs/PROTOCOL.md section 1: one
+  // POST /login/app, one GET /customer-grills). See the .cpp for the full
+  // flow and GrillRpcService.cs's SetupAsync/SidecarSetupResponse for the
+  // exact request/reply shape SetupDialog.razor expects — this mirrors it
+  // so that dialog needed zero changes. cloud_login_()/cloud_list_grills_()
+  // are its two HTTPS calls, split out so handle_setup_() itself reads as
+  // the same choose-a-grill logic pitboss_cloud.py's fetch_and_save() has.
+  void handle_setup_(AsyncWebServerRequest *request);
+  bool cloud_login_(const std::string &email, const std::string &password, const std::string &country,
+                    std::string &token, std::string &error);
+  bool cloud_list_grills_(const std::string &token, const std::string &country, JsonDocument &out,
+                          std::string &error);
 
   // Phase 6: GET/POST /alarms — see alarms_'s comment on locking.
   void handle_alarms_get_(AsyncWebServerRequest *request);
@@ -301,9 +323,54 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   void set_last_error_(const std::string &message);
   void clear_last_error_();
 
+  // Phase 7: raw ESP-IDF NVS (not ESPHome's own typed ESPPreferences API,
+  // which is built for small fixed-size structs, not the variable-length
+  // strings/JSON this needs) under one namespace — see the .cpp for the key
+  // names. NVS itself is already initialized by the time any Component::
+  // setup() runs (esphome::esp32::ESP32Preferences calls nvs_flash_init()
+  // from app_main(), before the logger or any component — see that
+  // component's preferences.cpp), so nvs_open() is always safe to call here
+  // with no init step of our own.
+  bool nvs_load_string_(const char *key, std::string &out) const;
+  bool nvs_save_string_(const char *key, const std::string &value);
+  // Bench-confirmed 2026-09-10: calling nvs_save_string_() (or anything that
+  // JSON-builds first, like save_alarms_locked_()) directly from a REST
+  // handler stack-overflowed and crash-looped the real device
+  // (vApplicationStackOverflowHook) — the ESP-IDF httpd task's small
+  // (~4KB) default stack, already used by JSON building, has no headroom
+  // left for NVS's own flash access (worse on a key's first-ever write,
+  // which may need to allocate/erase a page). Every REST handler that
+  // persists a plain string now goes through this instead of calling
+  // nvs_save_string_() directly — same fix in spirit as on_rpc_read_()'s
+  // defer() of JSON parsing off the BLE callback's own small stack, applied
+  // to the httpd task instead of the BT stack's task.
+  void nvs_save_string_deferred_(const char *key, const std::string &value);
+  // Called once from setup(), before anything else can touch the fields it
+  // sets: grill_password_/telegram_bot_token_/telegram_chat_id_ are
+  // overridden by whatever's in NVS (a prior POST /setup or POST /config),
+  // falling back to the YAML-configured value if NVS has nothing yet;
+  // alarms_ is restored from its own NVS blob the same way scripts/
+  // alarms.py's AlarmStore reloads alarms.json on restart.
+  void load_persisted_state_();
+  // Rewrites the whole "alarms" NVS key from the current alarms_ — call with
+  // alarms_mutex_ already held, same as every other alarms_ mutation in this
+  // file. Mirrors decision #7 in docs/ESP32_FIRMWARE_PLAN.md: "a direct port
+  // of what scripts/alarms.py already does" — rewritten on every add/
+  // remove/fire, not diffed. Builds JSON + writes NVS, so — per
+  // nvs_save_string_deferred_()'s comment — only ever call this from the
+  // main loop task (check_alarms_() already is one; the httpd-task handlers
+  // must this->defer() a fresh LockGuard + call, not call it inline).
+  void save_alarms_locked_();
+
   Mutex state_mutex_;
 
   std::string name_prefix_{"PBV2-"};
+  // Set once at boot (YAML default, then possibly overridden by NVS — see
+  // load_persisted_state_()), but Phase 7's POST /setup can rewrite it at
+  // any later time from the httpd task, while send_get_state_()/
+  // send_mcu_command_() read it every cycle from the main loop — every
+  // access outside setup()/load_persisted_state_() itself must go through
+  // state_mutex_, unlike model_ below (still truly write-once).
   std::string grill_password_;
   std::string model_;
   bool has_lights_{false};
@@ -431,6 +498,13 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
 
   time::RealTimeClock *time_{nullptr};
   http_request::HttpRequestComponent *http_request_{nullptr};
+  // Phase 7: both now runtime-settable via POST /config and persisted to
+  // NVS (see handle_config_()/load_persisted_state_()) — the YAML value is
+  // only the initial default, same relationship grill_password_ now has
+  // with POST /setup. Read from the main loop (notify_()) and written from
+  // the httpd task (handle_config_()), so — like grill_password_ — every
+  // access outside setup()/load_persisted_state_() goes through
+  // state_mutex_.
   std::string telegram_bot_token_;
   std::string telegram_chat_id_;
 };

@@ -6,10 +6,12 @@
 
 #include <esp_http_server.h>
 #include <esp_random.h>
+#include <nvs.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 #ifdef USE_ESP32
 
@@ -77,6 +79,22 @@ static const size_t CODEC_PADDING_LEN = 16;
 // nowhere near the 10s bucket width (so it can only ever land on-or-ahead
 // of the true bucket, never overshoot into a second one).
 static const double AUTH_KEY_LATENCY_BIAS_S = 1.0;
+
+// Phase 7 NVS layout (docs/ESP32_FIRMWARE_PLAN.md's "Decisions made" #7):
+// one namespace, config values each under their own string key, the alarms
+// list under one JSON-blob key rewritten wholesale on every change. Key/
+// namespace names are well under NVS's 15-char limit.
+static const char *const NVS_NAMESPACE = "pitboss_grill";
+static const char *const NVS_KEY_GRILL_PW = "grill_pw";
+static const char *const NVS_KEY_TG_TOKEN = "tg_token";
+static const char *const NVS_KEY_TG_CHAT = "tg_chat_id";
+static const char *const NVS_KEY_ALARMS = "alarms";
+
+// Pit Boss cloud API (docs/PROTOCOL.md section 1) — a direct port of
+// scripts/pitboss_cloud.py's BASE/_headers()/BOARD_PREFIX. Only ever hit
+// once per POST /setup call, on demand — nothing here runs periodically.
+static const char *const CLOUD_BASE = "https://api-prod.dansonscorp.com/api/v1";
+static const char *const CLOUD_BOARD_PREFIX = "PBV2";
 
 // Phase 5's fixed MCU commands — pytboss's grills.json "PBV2" control board
 // entry, hardcoded per docs/PROTOCOL.md's "command surface" note (this
@@ -206,13 +224,25 @@ static std::string build_mcu_command_request(int id, const std::string &command_
   });
 }
 
-static std::string to_lower_trim(const std::string &s) {
+static std::string to_trim(const std::string &s) {
   size_t start = s.find_first_not_of(" \t\r\n");
   if (start == std::string::npos)
     return "";
   size_t end = s.find_last_not_of(" \t\r\n");
-  std::string out = s.substr(start, end - start + 1);
+  return s.substr(start, end - start + 1);
+}
+
+static std::string to_lower_trim(const std::string &s) {
+  std::string out = to_trim(s);
   std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return std::tolower(c); });
+  return out;
+}
+
+// Phase 7: country codes only ("US" etc.) — pytboss_cloud.py's own
+// `.strip().upper()` on the /setup request's "country" field.
+static std::string to_upper_trim(const std::string &s) {
+  std::string out = to_trim(s);
+  std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return std::toupper(c); });
   return out;
 }
 
@@ -282,6 +312,47 @@ static bool read_json_body(AsyncWebServerRequest *request, std::string &out) {
     if (r <= 0)
       return false;
     received += static_cast<size_t>(r);
+  }
+  return true;
+}
+
+// -- Phase 7 (cloud password fetch) helpers --
+//
+// A direct port of scripts/pitboss_cloud.py's _headers()/_call() onto
+// http_request::HttpRequestComponent — see docs/PROTOCOL.md section 1 for
+// why each header is there.
+
+static std::vector<http_request::Header> cloud_headers(const std::string &country, const std::string &token) {
+  std::vector<http_request::Header> headers{
+      {"Accept", "application/json"},
+      {"Content-Type", "application/json"},
+      {"X-Localization", "en"},
+      {"x-country", country},
+      {"x-store", "PB"},
+      {"User-Agent", "OpenPit32-ESP32/1.0 (grill-password-fetch)"},
+  };
+  if (!token.empty())
+    headers.push_back({"Authorization", "Bearer " + token});
+  return headers;
+}
+
+// Reads an HTTP response body fully into a string, capped at max_len bytes
+// — the same read()/is_read_complete() loop http_request.h's own
+// "capture_response" action support uses internally (see that header's
+// HttpRequestSendAction::play_complex()), via the http_read_fully() helper
+// it ships for exactly this. Needed here (unlike notify_()'s Telegram POST,
+// which never reads a reply body) because both cloud calls below need the
+// JSON body, not just the status code. total_size is passed as the cap
+// rather than content_length: http_read_fully() stops as soon as
+// is_read_complete() says so regardless, and the cloud API's replies are
+// small enough that 4KB is never actually reached in practice.
+static bool read_http_body(http_request::HttpContainer *container, std::string &out, size_t max_len = 4096) {
+  std::vector<uint8_t> buf(max_len);
+  auto result = http_request::http_read_fully(container, buf.data(), max_len, 512, 8000);
+  out.assign(reinterpret_cast<char *>(buf.data()), container->get_bytes_read());
+  if (result.status != http_request::HttpReadStatus::OK) {
+    ESP_LOGW(TAG, "Cloud response body read incomplete (%d bytes so far)", static_cast<int>(out.size()));
+    return false;
   }
   return true;
 }
@@ -362,6 +433,11 @@ void PitbossGrill::setup() {
   BLEClientBase::setup();
   this->set_auto_connect(true);
 
+  // Phase 7: before anything else can touch grill_password_/telegram_*_/
+  // alarms_ — see this method's own comment for why no locking is needed
+  // here specifically.
+  this->load_persisted_state_();
+
   // Phase 5: the httpd task waiting inside handle_command_() is woken by
   // this once the main loop has a real result — see that method's comment.
   this->command_done_sem_ = xSemaphoreCreateBinary();
@@ -423,8 +499,128 @@ void PitbossGrill::clear_last_error_() {
   this->last_error_.clear();
 }
 
+// -- Phase 7: NVS persistence --
+//
+// Raw ESP-IDF NVS rather than ESPHome's own ESPPreferences (built for small
+// fixed-size trivial structs — see esphome/components/esp32/preferences.h —
+// not the variable-length strings/JSON this needs), one namespace, values
+// as plain NVS strings (nvs_get_str()/nvs_set_str()) — see the key/
+// namespace constants above. NVS itself is guaranteed initialized by now:
+// esphome::esp32::ESP32Preferences calls nvs_flash_init() from app_main(),
+// before the logger or any Component::setup() runs (see that component's
+// preferences.cpp) — so nvs_open() below never needs an init step of its
+// own, and a missing namespace (nothing ever saved yet) is just
+// ESP_ERR_NVS_NOT_FOUND, not a real failure.
+bool PitbossGrill::nvs_load_string_(const char *key, std::string &out) const {
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+  if (err != ESP_OK) {
+    if (err != ESP_ERR_NVS_NOT_FOUND)
+      ESP_LOGW(TAG, "nvs_open(readonly) failed: %s", esp_err_to_name(err));
+    return false;
+  }
+  size_t required = 0;
+  err = nvs_get_str(handle, key, nullptr, &required);
+  if (err != ESP_OK || required == 0) {
+    nvs_close(handle);
+    return false;
+  }
+  std::vector<char> buf(required);
+  err = nvs_get_str(handle, key, buf.data(), &required);
+  nvs_close(handle);
+  if (err != ESP_OK)
+    return false;
+  out.assign(buf.data());
+  return true;
+}
+
+bool PitbossGrill::nvs_save_string_(const char *key, const std::string &value) {
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "nvs_open(readwrite) failed: %s", esp_err_to_name(err));
+    return false;
+  }
+  err = nvs_set_str(handle, key, value.c_str());
+  if (err == ESP_OK)
+    err = nvs_commit(handle);
+  nvs_close(handle);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to persist NVS key '%s': %s", key, esp_err_to_name(err));
+    return false;
+  }
+  return true;
+}
+
+// See the header comment — every REST handler (httpd task) that persists a
+// plain string calls this instead of nvs_save_string_() directly, moving
+// the actual flash write onto the main loop task's stack. `key` is always a
+// static string literal (the NVS_KEY_* constants), so capturing the raw
+// pointer is safe; `value` is captured by copy since the caller's local
+// goes out of scope long before this runs. Fire-and-forget: nvs_save_string_
+// () already logs its own warning on failure, so there's nothing further
+// for a caller to check.
+void PitbossGrill::nvs_save_string_deferred_(const char *key, const std::string &value) {
+  this->defer([this, key, value]() { this->nvs_save_string_(key, value); });
+}
+
+// Runs once from setup(), before the BLE stack, httpd, or the alarm_check
+// interval exist — nothing else can be touching grill_password_/
+// telegram_*_/alarms_ concurrently yet, so this needs no locking of its own
+// despite writing fields other code later guards with state_mutex_/
+// alarms_mutex_.
+void PitbossGrill::load_persisted_state_() {
+  std::string saved;
+  if (this->nvs_load_string_(NVS_KEY_GRILL_PW, saved)) {
+    this->grill_password_ = saved;
+    ESP_LOGI(TAG, "Loaded grill password from NVS (a prior POST /setup persisted it)");
+  } else if (!this->grill_password_.empty()) {
+    ESP_LOGI(TAG, "No NVS password yet — using the YAML-configured grill_password until POST /setup runs");
+  }
+
+  if (this->nvs_load_string_(NVS_KEY_TG_TOKEN, saved))
+    this->telegram_bot_token_ = saved;
+  if (this->nvs_load_string_(NVS_KEY_TG_CHAT, saved))
+    this->telegram_chat_id_ = saved;
+
+  std::string alarms_json;
+  if (!this->nvs_load_string_(NVS_KEY_ALARMS, alarms_json))
+    return;
+  JsonDocument doc = esphome::json::parse_json(alarms_json);
+  if (doc.isNull()) {
+    ESP_LOGW(TAG, "Stored alarms JSON in NVS was corrupt — starting with no alarms");
+    return;
+  }
+  for (JsonObject o : doc["alarms"].as<JsonArray>()) {
+    Alarm a;
+    a.id = std::string(o["id"] | "");
+    a.kind = std::string(o["kind"] | "");
+    a.label = std::string(o["label"] | "");
+    a.sensor = std::string(o["sensor"] | "");
+    a.comparison = std::string(o["comparison"] | "");
+    a.target = o["target"] | 0.0;
+    a.duration_seconds = o["duration_seconds"] | 0;
+    a.fires_at = o["fires_at"] | 0.0;
+    a.created_at = o["created_at"] | 0.0;
+    if (!a.id.empty() && (a.kind == "temp" || a.kind == "timer"))
+      this->alarms_.push_back(a);
+  }
+  ESP_LOGI(TAG, "Restored %d alarm(s) from NVS", static_cast<int>(this->alarms_.size()));
+}
+
+// Call with alarms_mutex_ already held — see its declaration in the header.
+void PitbossGrill::save_alarms_locked_() {
+  std::string body = esphome::json::build_json([&](JsonObject root) {
+    JsonArray arr = root["alarms"].to<JsonArray>();
+    for (const auto &a : this->alarms_)
+      fill_alarm_json(arr.add<JsonObject>(), a);
+  });
+  if (!this->nvs_save_string_(NVS_KEY_ALARMS, body))
+    ESP_LOGW(TAG, "Failed to persist alarms to NVS — they won't survive a reboot until the next successful save");
+}
+
 void PitbossGrill::dump_config() {
-  ESP_LOGCONFIG(TAG, "Pitboss Grill (Phase 6 — alarms + Telegram notify):");
+  ESP_LOGCONFIG(TAG, "Pitboss Grill (Phase 7 — POST /setup + NVS persistence):");
   ESP_LOGCONFIG(TAG, "  Advertised-name prefix: %s", this->name_prefix_.c_str());
 }
 
@@ -616,8 +812,17 @@ void PitbossGrill::send_get_time_() {
 }
 
 void PitbossGrill::send_get_state_(double uptime) {
+  // Phase 7: grill_password_ can now be rewritten at any time by POST
+  // /setup, from the httpd task — see its own header comment — so this
+  // main-loop read needs state_mutex_ too, unlike everything else here
+  // (timed_key()/pb_encode() are pure functions, safe to run outside it).
+  std::string password;
+  {
+    LockGuard lock(this->state_mutex_);
+    password = this->grill_password_;
+  }
   auto key = timed_key(uptime);
-  auto encoded = pb_encode(this->grill_password_, key);
+  auto encoded = pb_encode(password, key);
   this->pending_reply_ = PendingReply::GET_STATE;
   this->write_rpc_command_(build_rpc_request(3, "PB.GetState", to_hex(encoded)));
 }
@@ -629,8 +834,14 @@ void PitbossGrill::send_get_state_(double uptime) {
 // runs — see on_get_time_reply_() for how a GetTime cycle routes here
 // instead of into the periodic send_get_state_().
 void PitbossGrill::send_mcu_command_(double uptime) {
+  // See send_get_state_()'s comment — same Phase 7 concern.
+  std::string password;
+  {
+    LockGuard lock(this->state_mutex_);
+    password = this->grill_password_;
+  }
   auto key = timed_key(uptime);
-  auto encoded = pb_encode(this->grill_password_, key);
+  auto encoded = pb_encode(password, key);
   this->pending_reply_ = PendingReply::MCU_COMMAND;
   this->write_rpc_command_(build_mcu_command_request(4, this->command_pending_hex_, to_hex(encoded)));
 }
@@ -969,7 +1180,7 @@ bool PitbossGrill::canHandle(AsyncWebServerRequest *request) const {
   if (request->method() == HTTP_GET)
     return url == "/health" || url == "/state" || url == "/info" || url == "/alarms";
   if (request->method() == HTTP_POST)
-    return url == "/command" || url == "/config" || url == "/alarms";
+    return url == "/command" || url == "/config" || url == "/alarms" || url == "/setup";
   return false;
 }
 
@@ -987,6 +1198,8 @@ void PitbossGrill::handleRequest(AsyncWebServerRequest *request) {
     this->handle_command_(request);
   } else if (url == "/config") {
     this->handle_config_(request);
+  } else if (url == "/setup") {
+    this->handle_setup_(request);
   } else if (url == "/alarms") {
     if (is_post) {
       this->handle_alarms_post_(request);
@@ -1015,6 +1228,7 @@ void PitbossGrill::handle_health_(AsyncWebServerRequest *request) {
   bool has_age;
   uint32_t frame_millis = 0;
   std::string last_error;
+  bool configured;
   {
     LockGuard lock(this->state_mutex_);
     has_rssi = this->has_rssi_;
@@ -1022,12 +1236,13 @@ void PitbossGrill::handle_health_(AsyncWebServerRequest *request) {
     has_age = this->has_frame_millis_;
     frame_millis = this->last_frame_millis_;
     last_error = this->last_error_;
+    // Phase 7: real now — false until a grill password exists, from either
+    // YAML or a successful POST /setup (see grill_password_'s header
+    // comment). Matches GrillRpcService.cs's own doc comment on this field.
+    configured = !this->grill_password_.empty();
   }
   std::string body = esphome::json::build_json([&](JsonObject root) {
-    // Always true today: the grill password is compiled in (set_grill_
-    // password()). Phase 7 makes this conditional once that becomes a
-    // runtime /setup flow instead of a compile-time secret.
-    root["configured"] = true;
+    root["configured"] = configured;
     root["connected"] = connected;
     root["proxy_connected"] = true;
     if (has_rssi)
@@ -1113,11 +1328,12 @@ void PitbossGrill::handle_state_(AsyncWebServerRequest *request) {
 
 // Mirrors grill_sidecar.py's info(): {configured, board_id, model, firmware,
 // accepted_setpoints_f, has_lights, meat_probes} — see GrillRpcService.cs's
-// SidecarInfoResponse. Unlike the sidecar, this never 404s (configured is
-// always true here — see handle_health_()). "firmware" (the sidecar's own
-// one-time Pit Boss cloud fetch) isn't ported yet, so it's left out
-// entirely; GrillDetail.razor's `info.firmware is { } fw` check already
-// treats a missing/null value as "nothing to show". accepted_setpoints_f is
+// SidecarInfoResponse. Unlike the sidecar, this never 404s — configured is a
+// real field here (Phase 7: false until a grill password exists), not a
+// missing route. "firmware" (the sidecar's own one-time Pit Boss cloud
+// fetch) isn't ported yet, so it's left out entirely; GrillDetail.razor's
+// `info.firmware is { } fw` check already treats a missing/null value as
+// "nothing to show". accepted_setpoints_f is
 // ACCEPTED_SETPOINTS_F as-is (Phase 5) — always Fahrenheit regardless of the
 // grill's current display unit, matching the sidecar's own
 // `boss.accepted_setpoints(fahrenheit=True)`. has_lights_/meat_probes_ are
@@ -1133,13 +1349,19 @@ void PitbossGrill::handle_info_(AsyncWebServerRequest *request) {
   // — see state_mutex_'s header comment. model_ is set once in setup() from
   // compile-time config and never mutated again, so it's safe to read
   // unguarded, but there's no cost to being consistent here either.
+  // grill_password_/telegram_*_ are Phase 7 additions that ARE mutated at
+  // runtime (POST /setup, POST /config) so do need the lock.
   std::string board_id;
+  bool configured;
+  bool telegram_configured;
   {
     LockGuard lock(this->state_mutex_);
     board_id = this->board_id_;
+    configured = !this->grill_password_.empty();
+    telegram_configured = !this->telegram_bot_token_.empty() && !this->telegram_chat_id_.empty();
   }
   std::string body = esphome::json::build_json([&](JsonObject root) {
-    root["configured"] = true;
+    root["configured"] = configured;
     if (!board_id.empty())
       root["board_id"] = board_id;
     if (!this->model_.empty())
@@ -1149,24 +1371,34 @@ void PitbossGrill::handle_info_(AsyncWebServerRequest *request) {
       setpoints.add(f);
     root["has_lights"] = this->has_lights_;
     root["meat_probes"] = this->meat_probes_;
-    // Not part of the sidecar's /info shape — an ESP32-only setting (see
+    // Not part of the sidecar's /info shape — ESP32-only settings (see
     // handle_config_()) the web app reads here and writes via POST /config.
     root["error_display_threshold"] = this->error_display_threshold_.load();
+    root["telegram_configured"] = telegram_configured;
   });
   request->send(200, "application/json", body.c_str());
 }
 
-// POST /config — currently just {error_display_threshold: N}, the number of
-// consecutive PB.GetState rejections (see on_get_state_reply_()) required
-// before one is surfaced as last_error_/health's/state's last_error field,
-// added 2026-09-10 so a single expected, self-healing 401 (key-bucket skew
-// — see docs/PROTOCOL.md) doesn't flash a false-alarm warning in
-// GrillDetail.razor. Unlike handle_command_(), this never touches BLE, so
-// it's a plain synchronous read-validate-write-respond with no defer()/
-// semaphore — error_display_threshold_ being std::atomic is the only
-// cross-task concern (this write, from the httpd task, races
-// on_get_state_reply_()'s read on the main loop). In-memory only, like
-// grill_password_/model_ today — Phase 7's NVS work would persist it too.
+// POST /config — {error_display_threshold: N} (the number of consecutive
+// PB.GetState rejections, see on_get_state_reply_(), required before one is
+// surfaced as last_error_/health's/state's last_error field, added
+// 2026-09-10 so a single expected, self-healing 401 — key-bucket skew, see
+// docs/PROTOCOL.md — doesn't flash a false-alarm warning in
+// GrillDetail.razor) and (Phase 7) {telegram_bot_token, telegram_chat_id} —
+// the same runtime-settable-without-a-reflash pattern, now persisted to NVS
+// rather than in-memory only, so a future web-app "notifications" flow
+// (today: secrets.yaml only, see grill-firmware.yaml's comment) can enter
+// these without a reflash, the same way POST /setup enters the grill
+// password. Unlike handle_command_(), none of this touches BLE, so the
+// in-memory update and the HTTP reply are a plain synchronous read-
+// validate-write-respond with no semaphore — error_display_threshold_ being
+// std::atomic and telegram_*_ needing state_mutex_ are the cross-task
+// concerns there (this write, from the httpd task, races
+// on_get_state_reply_()'s/notify_()'s reads on the main loop). The actual
+// NVS flash write is NOT synchronous, though — see
+// nvs_save_string_deferred_()'s comment: doing it inline here
+// stack-overflowed the httpd task on the bench, so it's deferred to the
+// main loop instead and the reply doesn't wait on it.
 void PitbossGrill::handle_config_(AsyncWebServerRequest *request) {
   std::string body;
   if (!read_json_body(request, body)) {
@@ -1190,6 +1422,21 @@ void PitbossGrill::handle_config_(AsyncWebServerRequest *request) {
       return;
     }
     this->error_display_threshold_.store(static_cast<uint8_t>(requested));
+  }
+  // Empty string is a valid, intentional value for either of these — it's
+  // exactly notify_()'s "no bot configured" no-op case, so this also doubles
+  // as how to turn Telegram delivery back off without a reflash.
+  if (!doc["telegram_bot_token"].isNull()) {
+    std::string token = doc["telegram_bot_token"] | "";
+    this->nvs_save_string_deferred_(NVS_KEY_TG_TOKEN, token);
+    LockGuard lock(this->state_mutex_);
+    this->telegram_bot_token_ = token;
+  }
+  if (!doc["telegram_chat_id"].isNull()) {
+    std::string chat_id = doc["telegram_chat_id"] | "";
+    this->nvs_save_string_deferred_(NVS_KEY_TG_CHAT, chat_id);
+    LockGuard lock(this->state_mutex_);
+    this->telegram_chat_id_ = chat_id;
   }
   std::string resp = esphome::json::build_json([&](JsonObject root) {
     root["ok"] = true;
@@ -1433,6 +1680,15 @@ void PitbossGrill::handle_alarms_post_(AsyncWebServerRequest *request) {
     LockGuard lock(this->alarms_mutex_);
     this->alarms_.push_back(alarm);
   }
+  // Phase 7: rewrite the NVS blob to match — deferred to the main loop task
+  // (see nvs_save_string_deferred_()'s/save_alarms_locked_()'s comments;
+  // calling it inline here, on the httpd task, stack-overflowed the device
+  // on the bench). The deferred lambda takes its own fresh lock rather than
+  // reusing the one above, which is already released by the time this runs.
+  this->defer([this]() {
+    LockGuard lock(this->alarms_mutex_);
+    this->save_alarms_locked_();
+  });
 
   std::string resp = esphome::json::build_json([&](JsonObject root) {
     root["ok"] = true;
@@ -1494,6 +1750,16 @@ esp_err_t PitbossGrill::handle_alarms_delete_(httpd_req_t *req) {
       }
     }
   }
+  if (removed) {
+    // Phase 7 — see handle_alarms_post_()'s comment: deferred to the main
+    // loop task, same stack-overflow reason (this handler runs on the same
+    // httpd worker task pool as the AsyncWebServerRequest-based ones above,
+    // just via a raw esp_http_server handler instead).
+    this->defer([this]() {
+      LockGuard lock(this->alarms_mutex_);
+      this->save_alarms_locked_();
+    });
+  }
 
   std::string body = esphome::json::build_json([&](JsonObject root) { root["ok"] = removed; });
   httpd_resp_set_type(req, "application/json");
@@ -1528,6 +1794,7 @@ void PitbossGrill::check_alarms_() {
   // needs alarms_mutex_ held that long. Same snapshot-then-act pattern
   // state_mutex_'s consumers already use.
   std::vector<std::string> fired_messages;
+  bool any_fired = false;
   {
     LockGuard lock(this->alarms_mutex_);
     for (auto it = this->alarms_.begin(); it != this->alarms_.end();) {
@@ -1552,10 +1819,16 @@ void PitbossGrill::check_alarms_() {
       if (hit) {
         fired_messages.push_back(message);
         it = this->alarms_.erase(it);
+        any_fired = true;
       } else {
         ++it;
       }
     }
+    // Phase 7 — see handle_alarms_post_()'s comment. Only on an actual
+    // change: this interval runs every 5s regardless of whether anything
+    // fired, and rewriting the same NVS value repeatedly buys nothing.
+    if (any_fired)
+      this->save_alarms_locked_();
   }
   for (const auto &message : fired_messages) {
     ESP_LOGI(TAG, "Alarm fired: %s", message.c_str());
@@ -1572,7 +1845,16 @@ void PitbossGrill::check_alarms_() {
 // check_alarms_()) for the round trip — acceptable here since alarm checks
 // are a background 5s tick, not something latency-sensitive is waiting on.
 void PitbossGrill::notify_(const std::string &message) {
-  if (this->telegram_bot_token_.empty() || this->telegram_chat_id_.empty()) {
+  // Phase 7: both are now runtime-settable via POST /config (handle_config_
+  // ()), from the httpd task — so this main-loop read needs state_mutex_
+  // too, same reasoning as send_get_state_()'s grill_password_ read.
+  std::string bot_token, chat_id;
+  {
+    LockGuard lock(this->state_mutex_);
+    bot_token = this->telegram_bot_token_;
+    chat_id = this->telegram_chat_id_;
+  }
+  if (bot_token.empty() || chat_id.empty()) {
     ESP_LOGI(TAG, "Alarm fired but no Telegram bot configured: %s", message.c_str());
     return;
   }
@@ -1580,9 +1862,9 @@ void PitbossGrill::notify_(const std::string &message) {
     ESP_LOGW(TAG, "Cannot notify — http_request component missing");
     return;
   }
-  std::string url = "https://api.telegram.org/bot" + this->telegram_bot_token_ + "/sendMessage";
+  std::string url = "https://api.telegram.org/bot" + bot_token + "/sendMessage";
   std::string body = esphome::json::build_json([&](JsonObject root) {
-    root["chat_id"] = this->telegram_chat_id_;
+    root["chat_id"] = chat_id;
     root["text"] = message;
   });
   // An explicit vector, not a brace literal passed inline: HttpRequestComponent::post()
@@ -1600,6 +1882,227 @@ void PitbossGrill::notify_(const std::string &message) {
     ESP_LOGI(TAG, "Telegram notify sent");
   }
   container->end();
+}
+
+// -- Phase 7: POST /setup (cloud password fetch) --
+//
+// A direct port of scripts/pitboss_cloud.py's fetch_and_save() onto the
+// ESP32 itself (docs/PROTOCOL.md section 1) — one POST /login/app to trade
+// account credentials for a short-lived JWT, one GET /customer-grills to
+// read back the paired grill(s)' board id + RPC password, both discarded
+// the instant they've done their job: the account password never leaves
+// this function's local variables, and the JWT is used for exactly one
+// follow-up call and never persisted (matching the sidecar's own "used once
+// and dropped" contract — see GrillRpcService.cs's class comment on
+// GrillRpcService: "This app never sees the password").
+
+bool PitbossGrill::cloud_login_(const std::string &email, const std::string &password, const std::string &country,
+                                std::string &token, std::string &error) {
+  std::string body = esphome::json::build_json([&](JsonObject root) {
+    root["email"] = email;
+    root["password"] = password;
+  });
+  auto container = this->http_request_->post(std::string(CLOUD_BASE) + "/login/app", body, cloud_headers(country, ""));
+  if (container == nullptr) {
+    error = "could not reach the Pit Boss API";
+    return false;
+  }
+  std::string resp_body;
+  read_http_body(container.get(), resp_body);
+  int status = container->status_code;
+  container->end();
+
+  // The API answers 404 UNIDENTIFIED_CUSTOMER for wrong credentials — really
+  // is 404, not a typo for 401 (docs/PROTOCOL.md's own note on this).
+  if (status == 404) {
+    error = "login rejected — check the email and password (and the account country, if not US)";
+    return false;
+  }
+  JsonDocument doc = esphome::json::parse_json(resp_body);
+  if (status != 200 || doc.isNull()) {
+    error = "login failed (HTTP " + std::to_string(status) + ")";
+    return false;
+  }
+  std::string t = doc["data"]["token"] | "";
+  if (t.empty()) {
+    error = "login succeeded but returned no token";
+    return false;
+  }
+  token = t;
+  return true;
+}
+
+bool PitbossGrill::cloud_list_grills_(const std::string &token, const std::string &country, JsonDocument &out,
+                                      std::string &error) {
+  auto container = this->http_request_->get(std::string(CLOUD_BASE) + "/customer-grills", cloud_headers(country, token));
+  if (container == nullptr) {
+    error = "could not reach the Pit Boss API";
+    return false;
+  }
+  std::string resp_body;
+  read_http_body(container.get(), resp_body);
+  int status = container->status_code;
+  container->end();
+
+  out = esphome::json::parse_json(resp_body);
+  if (status != 200 || out.isNull()) {
+    error = "reading the account's grills failed (HTTP " + std::to_string(status) + ")";
+    return false;
+  }
+  return true;
+}
+
+// Mirrors scripts/grill_sidecar.py's setup(): body {email, password,
+// country?, grill_id?, model?}, reply {ok, error?, grills?, board_id?,
+// nickname?, model?, connected} — see GrillRpcService.cs's SetupAsync/
+// SidecarSetupResponse and SetupDialog.razor for the exact contract this has
+// to match, so that dialog needed zero changes to work against the ESP32.
+// "grill_id" disambiguates when the account has more than one grill and
+// more than one PBV2-board grill among them (pytboss_cloud.py's
+// GrillChoiceNeeded) — the reply then carries `grills` (no passwords) for
+// SetupDialog.razor's picker, and the caller resends with grill_id set.
+// "model" is accepted (matching the sidecar's request shape) but not
+// applied: this firmware's setpoints/lights/probe count are fixed by YAML
+// config for the one grill it's compiled for (ACCEPTED_SETPOINTS_F,
+// has_lights_, meat_probes_), so changing only the label without changing
+// those would just make /info lie about what the hardware actually has —
+// the reply always echoes back the compiled-in model_ instead.
+//
+// Every reply here is HTTP 200 regardless of ok/error, for the same reason
+// handle_command_()'s comment gives (this ESP-IDF web server backend can't
+// answer anything but 200/404/409 correctly via AsyncWebServerRequest, and
+// GrillRpcService.cs's SetupAsync never checks the status code either way —
+// it deserializes the body and reads `ok`/`grills`/`error` unconditionally).
+//
+// Both cloud calls are synchronous, blocking this httpd task for their
+// combined round trip (typically a couple of seconds, two TLS handshakes)
+// — the same trade-off handle_command_()'s comment documents for BLE
+// commands: acceptable for a rare, user-initiated, one-time action, not
+// something any polling loop triggers.
+void PitbossGrill::handle_setup_(AsyncWebServerRequest *request) {
+  std::string body;
+  if (!read_json_body(request, body)) {
+    request->send(200, "application/json", "{\"ok\":false,\"error\":\"missing or oversized JSON body\"}");
+    return;
+  }
+  JsonDocument doc = esphome::json::parse_json(body);
+  if (doc.isNull()) {
+    request->send(200, "application/json", "{\"ok\":false,\"error\":\"invalid JSON\"}");
+    return;
+  }
+
+  auto send_error = [&](const std::string &msg) {
+    std::string resp = esphome::json::build_json([&](JsonObject root) {
+      root["ok"] = false;
+      root["error"] = msg;
+    });
+    request->send(200, "application/json", resp.c_str());
+  };
+
+  std::string email = to_trim(std::string(doc["email"] | ""));
+  std::string password = std::string(doc["password"] | "");
+  if (email.empty() || password.empty()) {
+    send_error("email and password are required");
+    return;
+  }
+  std::string country = to_upper_trim(std::string(doc["country"] | "US"));
+  bool has_grill_id = !doc["grill_id"].isNull();
+  int grill_id = doc["grill_id"] | -1;
+
+  std::string token, error;
+  bool login_ok = this->cloud_login_(email, password, country, token, error);
+  password.clear();  // the account password is used once and dropped, same as pytboss_cloud.py
+  if (!login_ok) {
+    send_error(error);
+    return;
+  }
+
+  JsonDocument grills_doc;
+  bool list_ok = this->cloud_list_grills_(token, country, grills_doc, error);
+  token.clear();  // the account's JWT is never persisted either — only the grill's own RPC password is
+  if (!list_ok) {
+    send_error(error);
+    return;
+  }
+
+  JsonArray rows = grills_doc["data"]["customer_grills"].as<JsonArray>();
+  if (rows.isNull() || rows.size() == 0) {
+    send_error("no grills on this account — pair the grill in the Pit Boss app first");
+    return;
+  }
+
+  JsonObject chosen;
+  if (has_grill_id) {
+    for (JsonObject g : rows) {
+      if ((g["id"] | -1) == grill_id) {
+        chosen = g;
+        break;
+      }
+    }
+    if (chosen.isNull()) {
+      send_error("grill id " + std::to_string(grill_id) + " is not on this account");
+      return;
+    }
+  } else if (rows.size() == 1) {
+    chosen = rows[0];
+  } else {
+    std::vector<JsonObject> pbv2_rows;
+    for (JsonObject g : rows) {
+      std::string board_id = g["board_id"] | "";
+      if (board_id.compare(0, strlen(CLOUD_BOARD_PREFIX), CLOUD_BOARD_PREFIX) == 0)
+        pbv2_rows.push_back(g);
+    }
+    if (pbv2_rows.size() != 1) {
+      std::string resp = esphome::json::build_json([&](JsonObject root) {
+        root["ok"] = false;
+        root["error"] = "several grills on the account — choose one";
+        JsonArray arr = root["grills"].to<JsonArray>();
+        for (JsonObject g : rows) {
+          JsonObject o = arr.add<JsonObject>();
+          o["grill_id"] = g["id"];
+          o["board_id"] = g["board_id"];
+          o["nickname"] = g["grill_nickname"];
+          std::string pw = g["password"] | "";
+          o["has_password"] = !pw.empty();
+        }
+      });
+      request->send(200, "application/json", resp.c_str());
+      return;
+    }
+    chosen = pbv2_rows[0];
+  }
+
+  std::string board_id = chosen["board_id"] | "";
+  std::string grill_pw = chosen["password"] | "";
+  std::string nickname = chosen["grill_nickname"] | "";
+  if (board_id.empty() || grill_pw.empty()) {
+    send_error("the grill record has no board_id/password yet — finish pairing it in the Pit Boss app");
+    return;
+  }
+
+  // Deferred to the main loop task — see nvs_save_string_deferred_()'s
+  // comment (doing the flash write inline here stack-overflowed the httpd
+  // task on the bench). Not fatal to this response either way: the fetched
+  // password works for BLE auth immediately (set in-memory right below,
+  // synchronously), it just won't survive a reboot if the deferred write
+  // happens to fail — nvs_save_string_() logs its own warning if so.
+  this->nvs_save_string_deferred_(NVS_KEY_GRILL_PW, grill_pw);
+  {
+    LockGuard lock(this->state_mutex_);
+    this->grill_password_ = grill_pw;
+  }
+  grill_pw.clear();
+
+  bool connected = this->state() == espbt::ClientState::ESTABLISHED;
+  std::string resp = esphome::json::build_json([&](JsonObject root) {
+    root["ok"] = true;
+    root["board_id"] = board_id;
+    if (!nickname.empty())
+      root["nickname"] = nickname;
+    root["model"] = this->model_;
+    root["connected"] = connected;
+  });
+  request->send(200, "application/json", resp.c_str());
 }
 
 bool PitbossGrill::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
