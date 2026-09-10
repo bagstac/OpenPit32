@@ -331,6 +331,58 @@ rollout item 4's follow-up note above) — this phase only proved the ESP32
 side directly. Repointing it is a small addition to the same
 `nginx.conf.template` pattern whenever that's wanted.
 
+## Verified 2026-09-10: Phase 6, alarms + Telegram notify
+
+`pitboss_grill.h`/`.cpp` add `GET/POST /alarms` and `DELETE /alarms/{id}`,
+mirroring `scripts/alarms.py`'s temp-target/timer semantics and
+`scripts/grill_sidecar.py`'s exact route shapes (see `fill_alarm_json()`'s
+comment for the field mapping to `GrillRpcService.cs`'s `AlarmDto`) — no
+frontend changes needed. A 5s `alarm_check` interval (matching the
+sidecar's `CHECK_SECONDS`) evaluates every alarm against `grill_state()`/
+real time and drops any that fire; a fired alarm calls a Telegram
+`notify()` (decision #3's placeholder), one HTTPS POST kept in its own
+function so swapping providers later touches nothing else. Both bot fields
+default to `""`: unset, an alarm still fires and drops on schedule, it just
+logs instead of sending anywhere.
+
+Needs real wall-clock time — a timer alarm's `fires_at` has to be a genuine
+Unix timestamp `GrillDetail.razor`'s countdown can subtract
+`DateTimeOffset.UtcNow` from, not millis-since-boot — so
+`grill-firmware.yaml` gained a `time: - platform: sntp` block, and
+`http_request:` (auto-loaded with defaults, same as `web_server_base`)
+supplies the Telegram POST. `POST /alarms` rejects with "grill clock not
+synced yet" if NTP hasn't completed (only matters in the first few seconds
+after boot).
+
+**One real, framework-level bug found and worked around**: `DELETE
+/alarms/{id}` cannot go through this component's normal `canHandle()`/
+`handleRequest()` path at all — `web_server_idf`'s `AsyncWebServer` only
+ever registers `HTTP_GET`/`HTTP_POST`/`HTTP_OPTIONS` handlers with the
+underlying `esp_http_server` (`AsyncWebServer::begin()`), so there is no
+code path for any other method, regardless of what an `AsyncWebHandler`
+implements. Matching the sidecar's real `DELETE` (rather than inventing a
+`POST`-based delete that would be a permanent frontend divergence) meant
+registering a second handler directly on the same `httpd_handle_t` for
+`HTTP_DELETE` (`setup_delete_handler_()`), which has to operate on the raw
+`httpd_req_t` — `AsyncWebServerRequest`'s constructor is only callable by
+`AsyncWebServer` itself. Worth it: this is the one route where the sidecar
+comparison, `GrillRpcService.cs`'s `DeleteAlarmAsync`, actually checks
+`IsSuccessStatusCode` rather than only reading the JSON body, so the real
+`200`/`404` this path can produce (unlike every other route here, capped at
+`200` by `init_response_()`'s limitation — see Phase 5's note) isn't
+cosmetic.
+
+OTA-flashed and verified against the real ESP32 (alarms/Telegram don't
+touch BLE grill control at all, so no live-grill sign-off needed this
+phase): validation errors for every bad input (unknown kind/sensor/
+comparison, missing target, non-positive duration), a real temp alarm
+created with a correct 2026 Unix `created_at`, `DELETE` returning genuine
+`200`/`404` confirmed via a follow-up `GET`, and an 8s timer alarm firing
+and auto-dropping on schedule with the expected log lines (`Alarm fired:
+...` / `... but no Telegram bot configured`). Telegram delivery itself
+isn't proven yet — no bot token configured; see the setup steps in
+`grill-firmware.yaml`'s comment.
+
 ## 2026-09-10 follow-up: debounce the occasional PB.GetState rejection
 
 Live testing surfaced the spurious-401 case Phase 2 already documented as
@@ -362,6 +414,38 @@ valid JSON" branch right above it, and `/command`'s own synchronous
 rejection replies (missing confirm, unsupported action, etc.), are
 immediate, user-initiated, one-shot responses — debouncing across cycles
 makes sense only for a periodic background poll like this one.
+
+## 2026-09-10 follow-up: the real bug behind the rejections — no latency bias
+
+Phase 6 verification then surfaced why the "occasional" rate wasn't always
+occasional: a fixed 15s `GetState` interval beats against the firmware's
+10s auth-key bucket with a 30s period (their LCM), so depending on a given
+boot's exact phase, `PB.GetTime`'s read can land right at a bucket boundary
+every *other* cycle — not ~1/40 but a full ~50% rejection rate for that
+boot's whole life, confirmed live (alternating fail/success/fail/success,
+exactly matching the 30s beat).
+
+Root cause: `checkPassword` only accepts a key built from the firmware's
+own current bucket or the *next* one — never the previous one (pytboss's
+`get_uptime()`: "absorbs a client running ahead but rejects one running
+behind"). This port had no bias at all — it used `PB.GetTime`'s raw reply
+value straight through, which by the time the derived key actually reaches
+the grill (a further RPC round trip, ~150-400ms measured) has almost always
+slipped slightly *behind* the firmware's true clock, the one direction it
+never forgives. pytboss avoids this by timestamping before sending
+`PB.GetTime` rather than after its reply arrives, so its own uptime
+extrapolation always runs slightly ahead instead.
+
+Fixed the same way in spirit, more simply in practice:
+`AUTH_KEY_LATENCY_BIAS_S` (1.0s) is added to every `PB.GetTime` reading
+once, in `on_get_time_reply_()`, before it's used to derive any key —
+comfortably above the round trip actually measured on this hardware and
+nowhere near the 10s bucket width, so it can only ever land on-or-ahead of
+the firmware's true bucket, never overshoot into a second one. The
+debounce work above already happened to hide this from the user-facing
+`last_error` field (alternating failures never reach a streak of 5), but it
+was real BLE traffic being wasted on every other cycle, not just a cosmetic
+concern.
 
 ## Decisions made (2026-09-09)
 
@@ -627,7 +711,15 @@ firmware has proven itself, given what's at stake if it's wrong.
    along the way, worth reading before adding another write route on this
    web server backend. nginx's `/api/command` isn't repointed yet (still the
    sidecar); only the ESP32 side was proven this phase.
-6. Add the alarm monitor loop + Telegram `notify()`.
+6. ✅ **Done (2026-09-10)** — **alarm monitor loop + Telegram `notify()`**.
+   See "Verified" above — including a real framework limitation (no
+   `DELETE` support at all in this ESP-IDF web server backend) worked
+   around, and a real auth-key latency bug found and fixed along the way
+   (see the follow-up note right below — read it before touching
+   `on_get_time_reply_()`/`send_get_state_()`/`send_mcu_command_()` again).
+   nginx's `/api/alarms` isn't repointed yet (still the sidecar); only the
+   ESP32 side was proven this phase. Telegram delivery itself isn't proven
+   live yet — no bot token configured.
 7. Add the `/setup` endpoint (cloud password fetch, run from the ESP32) and
    NVS persistence for password + alarms + Telegram config.
 8. Port the login-only process (decision 5) from today's
@@ -638,5 +730,6 @@ firmware has proven itself, given what's at stake if it's wrong.
    Phase 1 begins.
 
 All decisions this plan depended on are now made (see "Decisions made"
-above) — nothing left open. Phases 1 through 5 are done; ready for Phase 6
-(alarm monitor + Telegram `notify()`) whenever you want to start.
+above) — nothing left open. Phases 1 through 6 are done; ready for Phase 7
+(`/setup` cloud-password fetch + NVS persistence) whenever you want to
+start.

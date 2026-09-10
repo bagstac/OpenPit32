@@ -25,10 +25,14 @@
 // POST /config (added 2026-09-10, not a numbered phase) makes
 // error_display_threshold_ — how many consecutive PB.GetState rejections
 // before one is shown as an error — a runtime setting instead of a
-// hardcoded constant; see its own comment below.
+// hardcoded constant; see its own comment below. Phase 6 adds
+// GET/POST /alarms + DELETE /alarms/{id} (temp-target/timer alarms, same
+// semantics as scripts/alarms.py) and a Telegram notify() on fire — see
+// check_alarms_()/notify_()'s comments.
 //
-// NOT yet implemented here (later phases): the alarm monitor + Telegram
-// notify(), and the /setup cloud-password-fetch + NVS persistence flow.
+// NOT yet implemented here (later phases): the /setup cloud-password-fetch
+// + NVS persistence flow (alarms and Telegram config are in-memory only
+// for now, like everything else pre-Phase-7).
 
 #ifdef USE_ESP32
 
@@ -37,9 +41,12 @@
 #include "esphome/components/esp32_ble/ble_uuid.h"
 #include "esphome/components/esp32_ble_client/ble_client_base.h"
 #include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
+#include "esphome/components/http_request/http_request.h"
+#include "esphome/components/time/real_time_clock.h"
 #include "esphome/components/web_server_base/web_server_base.h"
 
 #include <esp_gattc_api.h>
+#include <esp_http_server.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <atomic>
@@ -109,6 +116,25 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   void set_has_lights(bool has_lights) { this->has_lights_ = has_lights; }
   void set_meat_probes(uint8_t meat_probes) { this->meat_probes_ = meat_probes; }
 
+  /// Real wall-clock time (grill-firmware.yaml's `time:` block, any
+  /// platform) — a timer alarm's fires_at has to be a real Unix timestamp
+  /// GrillDetail.razor's DescribeAlarm() can subtract DateTimeOffset.UtcNow
+  /// from, not just millis()-since-boot. See check_alarms_()/handle_alarms_
+  /// post_()'s comments.
+  void set_time(time::RealTimeClock *clock) { this->time_ = clock; }
+
+  /// Shared ESPHome HTTP client (grill-firmware.yaml auto-loads this with
+  /// defaults, same as web_server_base) — notify_()'s one POST to Telegram's
+  /// Bot API, per docs/ESP32_FIRMWARE_PLAN.md's "Telegram integration"
+  /// section.
+  void set_http_request(http_request::HttpRequestComponent *client) { this->http_request_ = client; }
+
+  /// Telegram Bot API credentials (see grill-firmware.yaml's comment on
+  /// obtaining them) — both default to "" (notify_() then just logs instead
+  /// of sending), so this compiles and runs with no bot configured at all.
+  void set_telegram_bot_token(const std::string &token) { this->telegram_bot_token_ = token; }
+  void set_telegram_chat_id(const std::string &chat_id) { this->telegram_chat_id_ = chat_id; }
+
   // -- AsyncWebHandler (web_server_base's shared httpd) --
   bool canHandle(AsyncWebServerRequest *request) const override;
   void handleRequest(AsyncWebServerRequest *request) override;
@@ -167,6 +193,26 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   /// has_temperatures are false until the first frame of each kind lands.
   const GrillState &grill_state() const { return this->grill_state_; }
 
+  // Phase 6: one alarm, as created via POST /alarms — field names/shapes
+  // deliberately mirror scripts/alarms.py's AlarmStore entries exactly (see
+  // OpenPit32/Services/GrillRpcService.cs's AlarmDto) so nginx can point
+  // /api/alarms at this ESP32 with zero frontend changes, same as every
+  // other route here. "temp" alarms use sensor/comparison/target and leave
+  // duration_seconds/fires_at unset; "timer" alarms are the reverse. Both
+  // kinds are real Unix-epoch seconds in created_at/fires_at (via time_),
+  // not millis()-since-boot — see set_time()'s comment.
+  struct Alarm {
+    std::string id;
+    std::string kind;  // "temp" | "timer"
+    std::string label;
+    std::string sensor;       // temp only: "grillTemp"/"smokerActTemp"/"p1Temp".."p4Temp"
+    std::string comparison;   // temp only: "at_or_above" | "at_or_below"
+    double target{0};         // temp only
+    int duration_seconds{0};  // timer only
+    double fires_at{0};       // timer only
+    double created_at{0};
+  };
+
  protected:
   void resolve_characteristics_();
   void register_for_notifications_();
@@ -205,6 +251,39 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   // error_display_threshold_'s comment). Doesn't touch BLE at all, so unlike
   // handle_command_() this answers synchronously with no defer()/semaphore.
   void handle_config_(AsyncWebServerRequest *request);
+
+  // Phase 6: GET/POST /alarms — see alarms_'s comment on locking.
+  void handle_alarms_get_(AsyncWebServerRequest *request);
+  void handle_alarms_post_(AsyncWebServerRequest *request);
+  // DELETE /alarms/{id} is NOT one of these: web_server_idf's AsyncWebServer
+  // only ever registers HTTP_GET/HTTP_POST/HTTP_OPTIONS handlers with the
+  // underlying esp_http_server (see AsyncWebServer::begin() in
+  // web_server_idf.cpp) — there is no code path for any other method,
+  // regardless of what canHandle()/handleRequest() do. Matching the
+  // sidecar's real `DELETE /alarms/{id}` (rather than inventing a
+  // POST-based delete just for this platform, which is a permanent frontend
+  // divergence) means registering our own HTTP_DELETE handler directly on
+  // the raw httpd_handle_t in setup() — see setup_delete_handler_()/
+  // handle_alarms_delete_() in the .cpp. That bypasses AsyncWebServerRequest
+  // entirely (its constructor is private to AsyncWebServer), so this one
+  // route talks to esp_http_server's C API directly rather than through the
+  // AsyncWebHandler abstraction the rest of this file uses.
+  void setup_delete_handler_();
+  static esp_err_t delete_alarm_trampoline_(httpd_req_t *req);
+  esp_err_t handle_alarms_delete_(httpd_req_t *req);
+
+  // Runs every 5s (setup()'s "alarm_check" interval, matching
+  // scripts/alarms.py's CHECK_SECONDS) — evaluates every alarm against
+  // grill_state()/time_->timestamp_now(), fires (notify_()) and drops any
+  // that are due. A fired alarm is removed, never re-armed or repeated,
+  // same as the sidecar today.
+  void check_alarms_();
+  // One HTTPS POST to Telegram's Bot API — see set_telegram_bot_token()'s
+  // comment on the no-bot-configured case. Deliberately this project's only
+  // caller of http_request_, kept in its own function per
+  // docs/ESP32_FIRMWARE_PLAN.md's "Telegram integration" section, so
+  // swapping to ntfy.sh/Pushover later touches only this one body.
+  void notify_(const std::string &message);
 
   // Phase 4 is the first thing that reads grill_state_/last_error_/board_id_/
   // last_rssi_ from outside the task that writes them — the REST handlers
@@ -339,6 +418,21 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   bool command_retried_{false};
 
   GrillState grill_state_;
+
+  // Phase 6 (alarms) — alarms_mutex_ guards the vector itself: written from
+  // the httpd task (handle_alarms_post_()/handle_alarms_delete_()) and read
+  // from both the httpd task (handle_alarms_get_()) and the main loop
+  // (check_alarms_(), on the "alarm_check" interval). Snapshot-under-lock,
+  // release, THEN act (build JSON / call notify_()) is the same pattern
+  // state_mutex_'s consumers already use, for the same reason: never hold a
+  // lock across a JSON build or a blocking network call.
+  Mutex alarms_mutex_;
+  std::vector<Alarm> alarms_;
+
+  time::RealTimeClock *time_{nullptr};
+  http_request::HttpRequestComponent *http_request_{nullptr};
+  std::string telegram_bot_token_;
+  std::string telegram_chat_id_;
 };
 
 }  // namespace pitboss_grill

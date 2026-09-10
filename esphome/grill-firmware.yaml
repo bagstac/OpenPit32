@@ -13,12 +13,20 @@
 # Phase 4 serves that state over /health, /state, /info — the pitboss_grill
 # component registers those routes on the web_server_base httpd instance it
 # auto-loads, no separate `web_server_base:`/`web_server:` block needed here.
-# Phase 5 (this revision) adds POST /command: turn-on/turn-off/
-# set-temperature, behind the same confirm semantics grill_sidecar.py's
-# bridge.command() enforces today. grill_password below is the same secret
-# as scripts/.grill_env's GRILL_PASSWORD on the Pi (Phase 7 moves
-# fetching/storing it onto the ESP32 itself instead of a compile-time
-# secret).
+# Phase 5 adds POST /command: turn-on/turn-off/set-temperature, behind the
+# same confirm semantics grill_sidecar.py's bridge.command() enforces today.
+# Phase 6 (this revision) adds the alarm monitor loop (GET/POST /alarms,
+# DELETE /alarms/{id}) and Telegram notify() — same temp-target/timer
+# semantics as today's scripts/alarms.py. Needs real wall-clock time (a
+# timer alarm's fires_at has to be a real Unix timestamp GrillDetail.razor
+# can count down from), hence the `time:` block below — pitboss_grill picks
+# it up automatically via cv.use_id (same pattern as `web_server_base`,
+# which needs no explicit block since it's auto_load'd with an empty/default
+# config; `http_request:` for the Telegram POST works the same way).
+# grill_password below is the same secret as scripts/.grill_env's
+# GRILL_PASSWORD on the Pi (Phase 7 moves fetching/storing it onto the ESP32
+# itself instead of a compile-time secret) — telegram_bot_token/
+# telegram_chat_id below follow the same compile-time-secret pattern for now.
 
 esphome:
   name: grill-firmware
@@ -47,6 +55,14 @@ logger:
   logs:
     pitboss_grill: DEBUG
 
+# Phase 6: alarms need a real Unix timestamp (fires_at) for
+# GrillDetail.razor's countdown to make sense, not just uptime-since-boot.
+# NTP over the WiFi this ESP32 already has; UTC throughout since every
+# comparison here is epoch-vs-epoch, no calendar/local-time display anywhere.
+time:
+  - platform: sntp
+    id: sntp_time
+
 esp32_ble_tracker:
   scan_parameters:
     active: true
@@ -70,3 +86,12 @@ pitboss_grill:
   id: grill
   name_prefix: "PBV2-"
   grill_password: !secret grill_password
+  # Telegram (docs/ESP32_FIRMWARE_PLAN.md's "Telegram integration" section):
+  # message @BotFather for a bot token, message the new bot once, then GET
+  # https://api.telegram.org/bot<TOKEN>/getUpdates to read back the chat id.
+  # Both default to "" (no secrets.yaml entry needed to compile) — an alarm
+  # still fires and is dropped on schedule either way, it just logs
+  # "no Telegram bot configured" instead of actually notifying. Uncomment
+  # and add both keys to secrets.yaml to turn notifications on:
+  # telegram_bot_token: !secret telegram_bot_token
+  # telegram_chat_id: !secret telegram_chat_id

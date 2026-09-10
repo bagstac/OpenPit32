@@ -13,18 +13,33 @@ attach.
 """
 
 import esphome.codegen as cg
-from esphome.components import esp32_ble, esp32_ble_client, esp32_ble_tracker, web_server_base
+from esphome.components import (
+    esp32_ble,
+    esp32_ble_client,
+    esp32_ble_tracker,
+    http_request,
+    web_server_base,
+)
+from esphome.components import time as time_
 from esphome.components.esp32_ble import BTLoggers
+from esphome.components.http_request import CONF_HTTP_REQUEST_ID
 from esphome.components.web_server_base import CONF_WEB_SERVER_BASE_ID
 import esphome.config_validation as cv
-from esphome.const import CONF_ID
+from esphome.const import CONF_ID, CONF_TIME_ID
 
 # web_server_base (not the full web_server: dashboard) gets us ESPHome's
 # shared httpd instance with none of web_server's own entity-dashboard
 # routes — see pitboss_grill.h/.cpp's AsyncWebHandler for what actually
-# gets registered on it (Phase 4: /health, /state, /info).
-AUTO_LOAD = ["esp32_ble_client", "json", "web_server_base"]
-DEPENDENCIES = ["esp32_ble_tracker"]
+# gets registered on it (Phase 4: /health, /state, /info; Phase 6:
+# GET/POST /alarms). http_request is Phase 6's Telegram POST — both are
+# self-contained, all-default components AUTO_LOAD can create silently (no
+# explicit YAML block needed), same as web_server_base today. `time` can't
+# work that way — there's no single default platform (sntp/homeassistant/
+# gps/...) for AUTO_LOAD to pick — so it's a DEPENDENCIES entry instead,
+# forcing grill-firmware.yaml to declare one explicitly (see its `time:`
+# block); cv.use_id(time_.RealTimeClock) below then binds to whichever one.
+AUTO_LOAD = ["esp32_ble_client", "json", "web_server_base", "http_request"]
+DEPENDENCIES = ["esp32_ble_tracker", "time"]
 
 pitboss_grill_ns = cg.esphome_ns.namespace("pitboss_grill")
 # Matches pitboss_grill.h's actual inheritance: our own BLEClientBase
@@ -41,6 +56,8 @@ CONF_GRILL_PASSWORD = "grill_password"
 CONF_MODEL = "model"
 CONF_HAS_LIGHTS = "has_lights"
 CONF_MEAT_PROBES = "meat_probes"
+CONF_TELEGRAM_BOT_TOKEN = "telegram_bot_token"
+CONF_TELEGRAM_CHAT_ID = "telegram_chat_id"
 
 CONFIG_SCHEMA = (
     cv.Schema(
@@ -69,9 +86,20 @@ CONFIG_SCHEMA = (
             # have (found live, 2026-09-10 — was hardcoded to 4 in the .cpp).
             cv.Optional(CONF_HAS_LIGHTS, default=False): cv.boolean,
             cv.Optional(CONF_MEAT_PROBES, default=3): cv.int_range(min=0, max=8),
-            # Phase 4: the shared httpd /health, /state, /info register on.
+            # Phase 4: the shared httpd /health, /state, /info (and Phase 6's
+            # /alarms) register on.
             cv.GenerateID(CONF_WEB_SERVER_BASE_ID): cv.use_id(
                 web_server_base.WebServerBase
+            ),
+            # Phase 6: alarm timer/temp-target monitor + Telegram notify().
+            # Both bot fields default to "" — see grill-firmware.yaml's
+            # comment on what an empty value does (alarms still fire and
+            # drop on schedule; nothing is sent anywhere).
+            cv.Optional(CONF_TELEGRAM_BOT_TOKEN, default=""): cv.string_strict,
+            cv.Optional(CONF_TELEGRAM_CHAT_ID, default=""): cv.string_strict,
+            cv.GenerateID(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
+            cv.GenerateID(CONF_HTTP_REQUEST_ID): cv.use_id(
+                http_request.HttpRequestComponent
             ),
         }
     )
@@ -92,6 +120,13 @@ async def to_code(config):
     cg.add(var.set_model(config[CONF_MODEL]))
     cg.add(var.set_has_lights(config[CONF_HAS_LIGHTS]))
     cg.add(var.set_meat_probes(config[CONF_MEAT_PROBES]))
+    cg.add(var.set_telegram_bot_token(config[CONF_TELEGRAM_BOT_TOKEN]))
+    cg.add(var.set_telegram_chat_id(config[CONF_TELEGRAM_CHAT_ID]))
 
     web_server = await cg.get_variable(config[CONF_WEB_SERVER_BASE_ID])
     cg.add(var.set_web_server_base(web_server))
+
+    time_var = await cg.get_variable(config[CONF_TIME_ID])
+    cg.add(var.set_time(time_var))
+    http_request_var = await cg.get_variable(config[CONF_HTTP_REQUEST_ID])
+    cg.add(var.set_http_request(http_request_var))

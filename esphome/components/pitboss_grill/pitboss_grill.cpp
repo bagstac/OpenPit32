@@ -56,6 +56,28 @@ static const size_t RPC_CHUNK_SIZE = 20;
 static const uint8_t CODEC_KEY[8] = {0x8F, 0x80, 0x19, 0xCF, 0x77, 0x6C, 0xFE, 0xB7};
 static const size_t CODEC_PADDING_LEN = 16;
 
+// Root-caused live 2026-09-10: a fixed 15s GetState interval beats against
+// the firmware's 10s auth-key bucket with a 30s period (their LCM), so
+// depending on this boot's exact phase, the PB.GetTime read can land right
+// at a bucket boundary every OTHER cycle — not "occasionally" (~1/40, the
+// pre-existing/expected case docs/PROTOCOL.md and on_get_state_reply_()'s
+// comment describe) but a full ~50% rejection rate for the life of that
+// boot. checkPassword only accepts a key built from the firmware's own
+// current bucket or the NEXT one — never the previous one (see
+// pytboss/api.py's get_uptime(): "absorbs a client running ahead but
+// rejects one running behind") — and this port had no bias at all: it used
+// PB.GetTime's raw reply value straight through, which by the time the
+// derived key actually reaches the grill (a further RPC round trip's worth
+// of latency, ~150-400ms measured) has almost always slipped slightly
+// *behind* the firmware's true clock, the one direction it never forgives.
+// pytboss avoids this by timestamping *before* sending GetTime rather than
+// after the reply arrives, so its own extrapolation always runs slightly
+// ahead instead. This does the same job more simply: a fixed forward bias,
+// comfortably above the round trip actually measured on this hardware and
+// nowhere near the 10s bucket width (so it can only ever land on-or-ahead
+// of the true bucket, never overshoot into a second one).
+static const double AUTH_KEY_LATENCY_BIAS_S = 1.0;
+
 // Phase 5's fixed MCU commands — pytboss's grills.json "PBV2" control board
 // entry, hardcoded per docs/PROTOCOL.md's "command surface" note (this
 // project only ever talks to one grill model/board; a different one needs
@@ -264,6 +286,78 @@ static bool read_json_body(AsyncWebServerRequest *request, std::string &out) {
   return true;
 }
 
+// -- Phase 6 (alarms) helpers --
+//
+// Sensor keys/labels match scripts/alarms.py's SENSORS dict exactly — these
+// are the same names GET /state's fields use (see handle_state_()), which
+// is deliberate: a temp alarm's "sensor" is just one of those field names.
+
+static const char *sensor_label(const std::string &sensor) {
+  if (sensor == "grillTemp")
+    return "Grill Temp";
+  if (sensor == "smokerActTemp")
+    return "Smoker Temp";
+  if (sensor == "p1Temp")
+    return "Probe 1";
+  if (sensor == "p2Temp")
+    return "Probe 2";
+  if (sensor == "p3Temp")
+    return "Probe 3";
+  if (sensor == "p4Temp")
+    return "Probe 4";
+  return nullptr;  // unknown sensor
+}
+
+// -1 (see GrillState's comment) covers both "unknown sensor name" and "no
+// reading yet" — check_alarms_() treats both the same way a missing dict key
+// does in scripts/alarms.py's _check_once(): skip this alarm this cycle,
+// don't fire, don't error.
+static int16_t sensor_value(const PitbossGrill::GrillState &s, const std::string &sensor) {
+  if (sensor == "grillTemp")
+    return s.grill_temp;
+  if (sensor == "smokerActTemp")
+    return s.smoker_act_temp;
+  if (sensor == "p1Temp")
+    return s.p1_temp;
+  if (sensor == "p2Temp")
+    return s.p2_temp;
+  if (sensor == "p3Temp")
+    return s.p3_temp;
+  if (sensor == "p4Temp")
+    return s.p4_temp;
+  return -1;
+}
+
+// A hex id the same shape as Python's uuid.uuid4().hex (32 lowercase hex
+// chars) — collision odds from 16 random bytes are astronomically low at
+// the handful-of-alarms scale this runs at, so no uniqueness check is done.
+static std::string generate_alarm_id() {
+  uint8_t bytes[16];
+  esp_fill_random(bytes, sizeof(bytes));
+  return to_hex(std::vector<uint8_t>(bytes, bytes + sizeof(bytes)));
+}
+
+// Fills one alarm's fields into an existing JsonObject — shared by
+// handle_alarms_get_()'s array and handle_alarms_post_()'s single-alarm
+// reply. sensor/comparison/target are omitted for a "timer" alarm and
+// duration_seconds/fires_at for a "temp" one (rather than emitted as JSON
+// null) — GrillRpcService.cs's AlarmDto fields are all nullable, so a
+// missing key deserializes the same as an explicit null.
+static void fill_alarm_json(JsonObject o, const PitbossGrill::Alarm &a) {
+  o["id"] = a.id;
+  o["kind"] = a.kind;
+  o["label"] = a.label;
+  if (a.kind == "temp") {
+    o["sensor"] = a.sensor;
+    o["comparison"] = a.comparison;
+    o["target"] = a.target;
+  } else {
+    o["duration_seconds"] = a.duration_seconds;
+    o["fires_at"] = a.fires_at;
+  }
+  o["created_at"] = a.created_at;
+}
+
 void PitbossGrill::setup() {
   BLEClientBase::setup();
   this->set_auto_connect(true);
@@ -272,11 +366,17 @@ void PitbossGrill::setup() {
   // this once the main loop has a real result — see that method's comment.
   this->command_done_sem_ = xSemaphoreCreateBinary();
 
-  // Phase 4: register /health, /state, /info on ESPHome's shared httpd
-  // (web_server_base) — same pattern web_server/prometheus/captive_portal
-  // use (base->init() is refcounted, safe to call alongside theirs).
+  // Phase 4: register /health, /state, /info (Phase 6: /alarms) on
+  // ESPHome's shared httpd (web_server_base) — same pattern web_server/
+  // prometheus/captive_portal use (base->init() is refcounted, safe to call
+  // alongside theirs).
   this->web_server_base_->init();
   this->web_server_base_->add_handler(this);
+  // DELETE /alarms/{id} can't go through add_handler() above — see
+  // setup_delete_handler_()'s comment (and handle_alarms_delete_()'s
+  // declaration in the header) for why. Safe to call now: init() just
+  // called AsyncWebServer::begin(), which starts the httpd synchronously.
+  this->setup_delete_handler_();
 
   // Periodic rather than one-shot, and via the global scheduler rather than
   // loop() (which BLEClientBase disables once state reaches IDLE, since
@@ -303,6 +403,12 @@ void PitbossGrill::setup() {
       this->send_get_state_cycle_();
     }
   });
+
+  // Phase 6: matches scripts/alarms.py's CHECK_SECONDS — needs no BLE
+  // connection itself (check_alarms_() reads grill_state()'s last-known
+  // values, whatever they are), same as the sidecar's monitor() running
+  // "independent of bridge.configured".
+  this->set_interval("alarm_check", 5000, [this]() { this->check_alarms_(); });
 }
 
 void PitbossGrill::loop() { BLEClientBase::loop(); }
@@ -318,7 +424,7 @@ void PitbossGrill::clear_last_error_() {
 }
 
 void PitbossGrill::dump_config() {
-  ESP_LOGCONFIG(TAG, "Pitboss Grill (Phase 5 — turn-on/turn-off/set-temperature):");
+  ESP_LOGCONFIG(TAG, "Pitboss Grill (Phase 6 — alarms + Telegram notify):");
   ESP_LOGCONFIG(TAG, "  Advertised-name prefix: %s", this->name_prefix_.c_str());
 }
 
@@ -548,14 +654,20 @@ void PitbossGrill::on_get_time_reply_(const std::string &json) {
     return;
   }
   ESP_LOGD(TAG, "GetTime OK, uptime=%.1f s", uptime);
+  // See AUTH_KEY_LATENCY_BIAS_S's comment: bias the reading forward once,
+  // here, so every key derived from it (send_get_state_()/
+  // send_mcu_command_() below) is biased the direction the firmware
+  // actually forgives, instead of computing an unbiased key and hoping
+  // this cycle's latency happens to be small.
+  double biased_uptime = uptime + AUTH_KEY_LATENCY_BIAS_S;
   // pending_after_time_ is NOT reset here — a retried MCU command (see
   // on_mcu_command_reply_()) calls send_get_time_() again and needs to land
   // back here a second time. Only on_mcu_command_reply_() itself resets it,
   // once it's actually done (success or final failure).
   if (this->pending_after_time_ == PendingReply::MCU_COMMAND) {
-    this->send_mcu_command_(uptime);
+    this->send_mcu_command_(biased_uptime);
   } else {
-    this->send_get_state_(uptime);
+    this->send_get_state_(biased_uptime);
   }
 }
 
@@ -844,23 +956,27 @@ void PitbossGrill::on_debug_log_(const uint8_t *data, uint16_t len) {
 // Registered on ESPHome's shared httpd via web_server_base — see setup()
 // and set_web_server_base(). Route matching follows the same canHandle()/
 // handleRequest() idiom esphome/components/web_server and .../prometheus
-// use (see web_server_base/web_server_idf.h). GET /health, /state, /info
-// are read-only (Phase 4); POST /command (Phase 5) and POST /config (the
-// error_display_threshold setting) are the write routes.
+// use (see web_server_base/web_server_idf.h). GET /health, /state, /info,
+// /alarms are read-only; POST /command (Phase 5), POST /config (the
+// error_display_threshold setting), and POST /alarms (Phase 6) are the
+// write routes. DELETE /alarms/{id} is NOT here — see
+// setup_delete_handler_()'s comment for why that one bypasses this whole
+// AsyncWebHandler mechanism.
 
 bool PitbossGrill::canHandle(AsyncWebServerRequest *request) const {
   char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
   StringRef url = request->url_to(url_buf);
   if (request->method() == HTTP_GET)
-    return url == "/health" || url == "/state" || url == "/info";
+    return url == "/health" || url == "/state" || url == "/info" || url == "/alarms";
   if (request->method() == HTTP_POST)
-    return url == "/command" || url == "/config";
+    return url == "/command" || url == "/config" || url == "/alarms";
   return false;
 }
 
 void PitbossGrill::handleRequest(AsyncWebServerRequest *request) {
   char url_buf[AsyncWebServerRequest::URL_BUF_SIZE];
   StringRef url = request->url_to(url_buf);
+  bool is_post = request->method() == HTTP_POST;
   if (url == "/health") {
     this->handle_health_(request);
   } else if (url == "/state") {
@@ -871,6 +987,12 @@ void PitbossGrill::handleRequest(AsyncWebServerRequest *request) {
     this->handle_command_(request);
   } else if (url == "/config") {
     this->handle_config_(request);
+  } else if (url == "/alarms") {
+    if (is_post) {
+      this->handle_alarms_post_(request);
+    } else {
+      this->handle_alarms_get_(request);
+    }
   }
 }
 
@@ -1208,6 +1330,276 @@ void PitbossGrill::handle_command_(AsyncWebServerRequest *request) {
     root["action"] = action;
   });
   request->send(200, "application/json", resp.c_str());
+}
+
+// -- Phase 6: alarms --
+//
+// Mirrors scripts/grill_sidecar.py's GET/POST /alarms and DELETE
+// /alarms/{id} — see fill_alarm_json()'s comment for the field shape, and
+// setup_delete_handler_()'s comment for why DELETE is wired up completely
+// differently from the other four routes in this file.
+
+void PitbossGrill::handle_alarms_get_(AsyncWebServerRequest *request) {
+  std::vector<Alarm> snapshot;
+  {
+    LockGuard lock(this->alarms_mutex_);
+    snapshot = this->alarms_;
+  }
+  std::string body = esphome::json::build_json([&](JsonObject root) {
+    JsonArray arr = root["alarms"].to<JsonArray>();
+    for (const auto &a : snapshot)
+      fill_alarm_json(arr.add<JsonObject>(), a);
+  });
+  request->send(200, "application/json", body.c_str());
+}
+
+// Every reply here is HTTP 200 regardless of ok/error, for the same reason
+// handle_command_()'s comment gives: this ESP-IDF web server backend can't
+// answer 400 correctly (it silently becomes 500 — see that comment for the
+// live-confirmed detail), and GrillRpcService.cs never checks the status
+// code for command/config-shaped replies anyway. AddTempAlarmAsync/
+// AddTimerAlarmAsync (GrillRpcService.cs) only look at the body's `ok`.
+void PitbossGrill::handle_alarms_post_(AsyncWebServerRequest *request) {
+  std::string body;
+  if (!read_json_body(request, body)) {
+    request->send(200, "application/json", "{\"ok\":false,\"error\":\"missing or oversized JSON body\"}");
+    return;
+  }
+  JsonDocument doc = esphome::json::parse_json(body);
+  if (doc.isNull()) {
+    request->send(200, "application/json", "{\"ok\":false,\"error\":\"invalid JSON\"}");
+    return;
+  }
+  std::string kind = to_lower_trim(doc["kind"] | "");
+  std::string label = doc["label"] | "";
+
+  Alarm alarm;
+  std::string error;
+  if (kind == "temp") {
+    std::string sensor = doc["sensor"] | "";
+    std::string comparison = doc["comparison"] | "";
+    const char *default_label = sensor_label(sensor);
+    if (default_label == nullptr) {
+      error = "unknown sensor '" + sensor + "'";
+    } else if (comparison != "at_or_above" && comparison != "at_or_below") {
+      error = "unknown comparison '" + comparison + "'";
+    } else if (doc["target"].isNull()) {
+      error = "temp alarm needs a target";
+    } else {
+      alarm.kind = "temp";
+      alarm.sensor = sensor;
+      alarm.comparison = comparison;
+      alarm.target = doc["target"] | 0.0;
+      alarm.label = label.empty() ? default_label : label;
+    }
+  } else if (kind == "timer") {
+    int duration = doc["duration_seconds"] | 0;
+    if (duration <= 0) {
+      error = "duration must be positive";
+    } else {
+      alarm.kind = "timer";
+      alarm.duration_seconds = duration;
+      alarm.label = label.empty() ? "Timer" : label;
+    }
+  } else {
+    error = "unknown alarm kind '" + kind + "'";
+  }
+
+  // created_at/fires_at have to be real Unix seconds (see set_time()'s
+  // comment) — reject rather than silently create an alarm whose timestamp
+  // GrillDetail.razor's DescribeAlarm() would render as nonsense (e.g. a
+  // multi-decade "remaining" countdown) if NTP hasn't synced yet. In
+  // practice this only matters in the first few seconds after boot.
+  if (error.empty() && (this->time_ == nullptr || !this->time_->now().is_valid())) {
+    error = "grill clock not synced yet — try again in a moment";
+  }
+
+  if (!error.empty()) {
+    std::string resp = esphome::json::build_json([&](JsonObject root) {
+      root["ok"] = false;
+      root["error"] = error;
+    });
+    request->send(200, "application/json", resp.c_str());
+    return;
+  }
+
+  double now = static_cast<double>(this->time_->timestamp_now());
+  alarm.id = generate_alarm_id();
+  alarm.created_at = now;
+  if (alarm.kind == "timer")
+    alarm.fires_at = now + alarm.duration_seconds;
+
+  {
+    LockGuard lock(this->alarms_mutex_);
+    this->alarms_.push_back(alarm);
+  }
+
+  std::string resp = esphome::json::build_json([&](JsonObject root) {
+    root["ok"] = true;
+    fill_alarm_json(root["alarm"].to<JsonObject>(), alarm);
+  });
+  request->send(200, "application/json", resp.c_str());
+}
+
+// DELETE /alarms/{id} — see this method's declaration in the header for why
+// it exists at all instead of going through canHandle()/handleRequest():
+// web_server_idf's AsyncWebServer only ever registers HTTP_GET/HTTP_POST/
+// HTTP_OPTIONS with esp_http_server (AsyncWebServer::begin(), web_server_
+// idf.cpp) — there is no HTTP_DELETE code path in that framework at all.
+// Registering our own handler directly on the same httpd_handle_t is legal
+// ESP-IDF (multiple handlers, different methods, coexist fine) but means
+// operating on the raw httpd_req_t rather than AsyncWebServerRequest, whose
+// constructor only AsyncWebServer itself may call.
+void PitbossGrill::setup_delete_handler_() {
+  httpd_handle_t server = this->web_server_base_->get_server()->get_server();
+  if (server == nullptr) {
+    ESP_LOGE(TAG, "Cannot register DELETE /alarms/{id} — httpd not started");
+    return;
+  }
+  httpd_uri_t handler_delete = {};
+  handler_delete.uri = "";  // matches every path, same as the GET/POST/OPTIONS
+                            // handlers AsyncWebServer::begin() already registered
+                            // (the server's uri_match_fn, set once at httpd_start(),
+                            // treats "" as "match anything" for every method)
+  handler_delete.method = HTTP_DELETE;
+  handler_delete.handler = &PitbossGrill::delete_alarm_trampoline_;
+  handler_delete.user_ctx = this;
+  esp_err_t err = httpd_register_uri_handler(server, &handler_delete);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to register DELETE handler, err=%d", err);
+  }
+}
+
+esp_err_t PitbossGrill::delete_alarm_trampoline_(httpd_req_t *req) {
+  auto *self = static_cast<PitbossGrill *>(req->user_ctx);
+  return self->handle_alarms_delete_(req);
+}
+
+esp_err_t PitbossGrill::handle_alarms_delete_(httpd_req_t *req) {
+  std::string uri(req->uri);
+  size_t query_pos = uri.find('?');
+  if (query_pos != std::string::npos)
+    uri.resize(query_pos);
+
+  static const std::string PREFIX = "/alarms/";
+  bool removed = false;
+  if (uri.compare(0, PREFIX.size(), PREFIX) == 0 && uri.size() > PREFIX.size()) {
+    std::string id = uri.substr(PREFIX.size());
+    LockGuard lock(this->alarms_mutex_);
+    for (auto it = this->alarms_.begin(); it != this->alarms_.end(); ++it) {
+      if (it->id == id) {
+        this->alarms_.erase(it);
+        removed = true;
+        break;
+      }
+    }
+  }
+
+  std::string body = esphome::json::build_json([&](JsonObject root) { root["ok"] = removed; });
+  httpd_resp_set_type(req, "application/json");
+  // Unlike the AsyncWebServerRequest-based handlers above, this talks to
+  // esp_http_server directly, so a real 200/404 (matching the sidecar's
+  // `status=200 if removed else 404`) works here with none of
+  // init_response_()'s 400->500 limitation.
+  httpd_resp_set_status(req, removed ? "200 OK" : "404 Not Found");
+  httpd_resp_send(req, body.c_str(), HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+// Evaluates every alarm against the latest grill_state()/real time, fires
+// (notify_()) and drops any that are due — see scripts/alarms.py's
+// _check_once() for the semantics this ports. Runs on the "alarm_check"
+// interval (setup()), independent of the BLE link's state, same as the
+// sidecar's monitor() running "independent of bridge.configured": a timer
+// alarm needs only the clock.
+void PitbossGrill::check_alarms_() {
+  if (this->time_ == nullptr || !this->time_->now().is_valid())
+    return;  // nothing meaningful to compare fires_at/target against yet
+  double now = static_cast<double>(this->time_->timestamp_now());
+
+  GrillState state;
+  {
+    LockGuard lock(this->state_mutex_);
+    state = this->grill_state_;
+  }
+
+  // Collected while alarms_mutex_ is held, sent after it's released — a
+  // Telegram POST can take seconds (see notify_()), and nothing else here
+  // needs alarms_mutex_ held that long. Same snapshot-then-act pattern
+  // state_mutex_'s consumers already use.
+  std::vector<std::string> fired_messages;
+  {
+    LockGuard lock(this->alarms_mutex_);
+    for (auto it = this->alarms_.begin(); it != this->alarms_.end();) {
+      bool hit = false;
+      std::string message;
+      if (it->kind == "timer") {
+        if (now >= it->fires_at) {
+          hit = true;
+          message = "Timer done: " + it->label + " finished.";
+        }
+      } else {
+        int16_t value = sensor_value(state, it->sensor);
+        if (value >= 0) {
+          bool cmp_hit = it->comparison == "at_or_above" ? (value >= it->target) : (value <= it->target);
+          if (cmp_hit) {
+            hit = true;
+            message = "Temperature alarm: " + it->label + " reached " + std::to_string(value) + "\xC2\xB0 (target " +
+                      std::to_string(static_cast<int>(std::lround(it->target))) + "\xC2\xB0).";
+          }
+        }
+      }
+      if (hit) {
+        fired_messages.push_back(message);
+        it = this->alarms_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (const auto &message : fired_messages) {
+    ESP_LOGI(TAG, "Alarm fired: %s", message.c_str());
+    this->notify_(message);
+  }
+}
+
+// One HTTPS POST to Telegram's Bot API — see set_telegram_bot_token()'s
+// comment for the no-bot-configured no-op, and
+// docs/ESP32_FIRMWARE_PLAN.md's "Telegram integration" section for why
+// Telegram specifically (a placeholder, deliberately isolated to this one
+// function so swapping providers later doesn't touch check_alarms_() at
+// all). http_request_->post() blocks the calling task (the main loop, via
+// check_alarms_()) for the round trip — acceptable here since alarm checks
+// are a background 5s tick, not something latency-sensitive is waiting on.
+void PitbossGrill::notify_(const std::string &message) {
+  if (this->telegram_bot_token_.empty() || this->telegram_chat_id_.empty()) {
+    ESP_LOGI(TAG, "Alarm fired but no Telegram bot configured: %s", message.c_str());
+    return;
+  }
+  if (this->http_request_ == nullptr) {
+    ESP_LOGW(TAG, "Cannot notify — http_request component missing");
+    return;
+  }
+  std::string url = "https://api.telegram.org/bot" + this->telegram_bot_token_ + "/sendMessage";
+  std::string body = esphome::json::build_json([&](JsonObject root) {
+    root["chat_id"] = this->telegram_chat_id_;
+    root["text"] = message;
+  });
+  // An explicit vector, not a brace literal passed inline: HttpRequestComponent::post()
+  // has both a std::vector<Header> overload and a deprecated std::list<Header> one, and
+  // a bare {{"Content-Type", "application/json"}} argument is ambiguous between them.
+  std::vector<http_request::Header> headers{{"Content-Type", "application/json"}};
+  auto container = this->http_request_->post(url, body, headers);
+  if (container == nullptr) {
+    ESP_LOGW(TAG, "Telegram notify failed: request could not start");
+    return;
+  }
+  if (!http_request::is_success(container->status_code)) {
+    ESP_LOGW(TAG, "Telegram notify failed: HTTP %d", container->status_code);
+  } else {
+    ESP_LOGI(TAG, "Telegram notify sent");
+  }
+  container->end();
 }
 
 bool PitbossGrill::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
