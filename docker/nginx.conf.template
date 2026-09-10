@@ -1,13 +1,29 @@
-# Serves the published Blazor WebAssembly SPA and reverse-proxies the
-# sidecar's HTTP API under /api/, so the whole app is one origin — needed
-# for a single Cloudflare Tunnel hostname and so one login covers both.
+# Serves the published Blazor WebAssembly SPA and reverse-proxies API
+# traffic under /api/, so the whole app is one origin — needed for a single
+# Cloudflare Tunnel hostname and so one login covers both. As of Phase 4
+# (docs/ESP32_FIRMWARE_PLAN.md) that traffic is split across two backends:
+# the sidecar (scripts/grill_sidecar.py) for everything not yet ported, and
+# the grill's own ESP32 (esphome/grill-firmware.yaml) for the read-only
+# /health, /state, /info it now serves directly — same JSON shapes, so
+# OpenPit32/Services/GrillRpcService.cs needs no changes either way.
+# /login, /logout, /auth-check still go to the sidecar; that's rollout item
+# 8, not done yet.
 # Client-side routes (/grill, /health) don't exist as files, so unmatched
 # paths fall back to index.html and the Blazor router takes it from there.
+#
+# This file is an envsubst *.template (docker/web.Dockerfile copies it into
+# nginx:alpine's /etc/nginx/templates/, which substitutes ${VAR} before
+# nginx starts) so $GRILL_PROXY_HOST only has to be set in one place — the
+# same variable docker-compose.yml already passes to the sidecar for this
+# exact board. Everything else below stays plain nginx syntax: bare
+# $variable (no braces) is an nginx runtime variable, untouched by envsubst.
 #
 # 127.0.0.11 is Docker Compose's embedded DNS; re-resolving per-request
 # (via the $sidecar variable in proxy_pass) rather than once at nginx
 # startup means this keeps working if the sidecar container is recreated
-# on its own.
+# on its own. The grill ESP32 isn't on the compose network — $grill_esp32
+# below is a literal LAN IP substituted in at container start, not
+# something this resolver looks up.
 resolver 127.0.0.11 valid=10s;
 
 # nginx's own $scheme is always "http" here — it never terminates TLS
@@ -28,6 +44,7 @@ server {
     index index.html;
 
     set $sidecar http://sidecar:8091;
+    set $grill_esp32 http://${GRILL_PROXY_HOST};
 
     # Fixed username/password so the app isn't wide open once it's reachable
     # from the internet (e.g. via a Cloudflare Tunnel) — but as a signed
@@ -65,6 +82,34 @@ server {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
         try_files $uri $uri/ /index.html;
+    }
+
+    # /health, /state, /info now come straight from the grill's ESP32
+    # (Phase 4) instead of the sidecar — same paths, same JSON shapes, still
+    # behind the same login. These three `location =` exact matches take
+    # precedence over the /api/ prefix block below regardless of file order,
+    # so everything else under /api/ (command, setup, alarms, push, models,
+    # probe-targets — not yet ported, rollout items 5-8) keeps going to the
+    # sidecar unchanged.
+    location = /api/health {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/health;
+        proxy_set_header Host $host;
+    }
+
+    location = /api/state {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/state;
+        proxy_set_header Host $host;
+    }
+
+    location = /api/info {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/info;
+        proxy_set_header Host $host;
     }
 
     location /api/ {

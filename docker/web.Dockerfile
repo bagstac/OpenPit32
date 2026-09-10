@@ -11,5 +11,9 @@ RUN dotnet publish -c Release -o /app/publish -p:DefineConstants=DOCKER_DEPLOY
 
 FROM nginx:alpine
 COPY --from=build /app/publish/wwwroot /usr/share/nginx/html
-COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+# A *.template here, not a plain .conf: nginx:alpine's entrypoint runs
+# envsubst over everything in /etc/nginx/templates/ before startup,
+# substituting ${GRILL_PROXY_HOST} (docker-compose.yml passes it through)
+# and writing the result to /etc/nginx/conf.d/default.conf.
+COPY docker/nginx.conf.template /etc/nginx/templates/default.conf.template
 EXPOSE 80

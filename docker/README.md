@@ -63,6 +63,9 @@ the tunnel doesn't need its own auth layer on top unless you want one.
   `.env`) only matters for LAN-direct access to port 8091 for diagnostics;
   the browser's normal path through nginx is same-origin and doesn't use it.
 - Nothing here needs Bluetooth hardware on the Docker host — that's the
-  ESP32's job. The sidecar only needs LAN access to it (TCP 6053).
+  ESP32's job. The sidecar needs LAN access to it on TCP 6053 (ESPHome
+  API); as of Phase 4, `web` also needs LAN access to it on TCP 80 (HTTP)
+  for `/api/health`, `/api/state`, `/api/info` — same `GRILL_PROXY_HOST`,
+  both containers just reach it over different ports.
 - `.env` holds the ESP32's API key and the app's login; git-ignored, same
   as `scripts/.grill_env` and `esphome/secrets.yaml` for a bare-metal run.

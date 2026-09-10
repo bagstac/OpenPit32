@@ -57,6 +57,11 @@ services:
       dockerfile: docker/web.Dockerfile
     ports:
       - "${WEB_PORT:-5219}:80"
+    environment:
+      # nginx.conf.template substitutes this for /api/health, /api/state,
+      # /api/info (Phase 4 — served by the ESP32 directly now). Same board,
+      # same variable the sidecar below still uses for everything else.
+      GRILL_PROXY_HOST: ${GRILL_PROXY_HOST}
     depends_on:
       - sidecar
     restart: unless-stopped
