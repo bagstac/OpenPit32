@@ -1,8 +1,9 @@
 """Pitboss Grill — native BLE client for the grill's Mongoose OS RPC service.
 
 Phase 1 of docs/ESP32_FIRMWARE_PLAN.md: connect and round-trip one
-unauthenticated RPC.Ping to prove the transport, before anything
-grill-specific (auth, commands, state decoding) gets built on it.
+unauthenticated RPC.Ping to prove the transport. Phase 2 adds the auth
+codec (pytboss/codec.py's timed_key()/encode(), ported to C++) and calls
+authenticated PB.GetState.
 
 Modelled on esphome/components/ble_client/__init__.py's registration
 pattern, but as our own top-level BLEClientBase subclass rather than the
@@ -17,7 +18,7 @@ from esphome.components.esp32_ble import BTLoggers
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
 
-AUTO_LOAD = ["esp32_ble_client"]
+AUTO_LOAD = ["esp32_ble_client", "json"]
 DEPENDENCIES = ["esp32_ble_tracker"]
 
 pitboss_grill_ns = cg.esphome_ns.namespace("pitboss_grill")
@@ -31,6 +32,7 @@ PitbossGrill = pitboss_grill_ns.class_(
 )
 
 CONF_NAME_PREFIX = "name_prefix"
+CONF_GRILL_PASSWORD = "grill_password"
 
 CONFIG_SCHEMA = (
     cv.Schema(
@@ -40,6 +42,12 @@ CONFIG_SCHEMA = (
             # docs/PROTOCOL.md), so — like the sidecar's find_grill() today —
             # this matches by advertised-name prefix instead of a fixed MAC.
             cv.Optional(CONF_NAME_PREFIX, default="PBV2-"): cv.string,
+            # The per-grill RPC password (today: scripts/.grill_env's
+            # GRILL_PASSWORD, fetched once from the Pit Boss cloud). Phase 7
+            # of the plan moves that fetch onto the ESP32 itself and
+            # persists this to NVS instead of a compile-time secret; for
+            # now, bench-testing the auth codec needs it available at all.
+            cv.Required(CONF_GRILL_PASSWORD): cv.string_strict,
         }
     )
     .extend(cv.COMPONENT_SCHEMA)
@@ -55,3 +63,4 @@ async def to_code(config):
     await cg.register_component(var, config)
     await esp32_ble_tracker.register_client(var, config)
     cg.add(var.set_name_prefix(config[CONF_NAME_PREFIX]))
+    cg.add(var.set_grill_password(config[CONF_GRILL_PASSWORD]))

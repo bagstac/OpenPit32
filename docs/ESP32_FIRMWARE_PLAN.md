@@ -7,8 +7,8 @@ of the Bluetooth protocol, command dispatch, alarm evaluation, and alerting.
 Current state / why the sidecar exists at all today: `docs/STATE.md`.
 Protocol facts this plan leans on: `docs/PROTOCOL.md`.
 
-Phase 1 (below) is implemented and bench-verified against the real grill;
-everything past it is still ahead.
+Phases 1 and 2 (below) are implemented and bench-verified against the real
+grill; everything past that is still ahead.
 
 ## Verified 2026-09-09: Phase 1, native BLE connect + RPC.Ping
 
@@ -54,6 +54,49 @@ test cycles (plus the Pi sidecar's own reconnect attempts once this ESP32
 stops running `bluetooth_proxy`) exhausted that limit twice during this
 session, producing a rapid-reconnect symptom that looked like a firmware
 crash but wasn't one.
+
+## Verified 2026-09-09: Phase 2, auth codec + authenticated PB.GetState
+
+`pitboss_grill.cpp` ports `pytboss/codec.py`'s `timed_key()`/`encode()` to
+C++ (`timed_key()`/`pb_encode()`/`to_hex()`), derives the auth key from the
+grill's own uptime (via an unauthenticated `PB.GetTime` each cycle, per
+`docs/PROTOCOL.md`), and calls authenticated `PB.GetState` on a 15s
+interval. OTA-flashed and run against the real grill:
+
+- Repeated, real `PB.GetState` round trips decode successfully:
+  `{"id":3,"result":{"sc_11":"FE0B...","sc_12":"FE0C..."},
+  "src":"PBV2-9451DC46B934"}` — the same two raw status/temperature frames
+  already streaming over the debug-log channel, confirming the codec and
+  the authenticated call both work end-to-end.
+- The occasional spurious `401 Unauthorized` `docs/PROTOCOL.md` warns about
+  (a slow write landing in the wrong 10s key bucket) does happen on the
+  bench; the next 15s cycle re-derives the key from fresh uptime and
+  succeeds, exactly as expected — not treated as fatal.
+- `PB.GetState`'s reply fields are `sc_11`/`sc_12` (raw hex frames), not
+  named fields like `moduleIsOn`/`grillTemp` — those names only exist after
+  `pytboss`'s per-control-board `parse_status()`/`parse_temperatures()`
+  decode them (see `api.py`'s `get_state()`). Porting that bit-level decode
+  is Phase 3, per the rollout plan below.
+
+**One real bug found and fixed along the way, worth remembering**: firing a
+multi-chunk GATT write's chunks back-to-back with no pacing crash-looped
+the device — reliably, on every attempt, regardless of which task called
+it or what the payload contained. `BLECharacteristic::write_value()`
+defaults to `ESP_GATT_WRITE_TYPE_NO_RSP` (write-without-response), which
+returns as soon as the BT controller's internal buffer pool *accepts* a
+write, not once it's actually been sent — queuing several unpaced writes
+before that pool drains exhausted it and took down the whole BT stack.
+`RPC.Ping`/`PB.GetTime` only ever need ~3-4 total writes (one length write
++ 2-3 data chunks) and never hit this; `PB.GetState`'s longer JSON body
+needs ~7 (one length write + ~6 data chunks) and hit it every single time.
+Bisection ruled out the codec math, the JSON payload content, and the
+BLE-callback-vs-main-loop call stack (wrapping the reply dispatch in
+`defer()` did *not* fix it) before landing on write pacing as the actual
+cause. Fixed by pacing each chunk off its own `ESP_GATTC_WRITE_CHAR_EVT`
+completion event (see `write_next_rpc_chunk_()`/`on_rpc_write_complete_()`)
+instead of firing them in a loop. Anyone adding a request with a longer
+body later should keep using that same event-paced path rather than
+looping over `write_value()` directly.
 
 ## Decisions made (2026-09-09)
 
@@ -298,10 +341,13 @@ firmware has proven itself, given what's at stake if it's wrong.
    time chasing timing artifacts in one-shot logs before switching to
    periodic/counter-based diagnostics — worth doing that from the start
    next time.
-2. Port the auth codec; call authenticated `PB.GetState`; log the decoded
-   JSON and diff it against what the current sidecar logs for the same
-   moment.
-3. Wire status/temperature decoding into the component's internal state.
+2. ✅ **Done (2026-09-09)** — **Auth codec + authenticated `PB.GetState`**:
+   port the auth codec, call `PB.GetState` on a timer, log the decoded
+   JSON. See "Verified" above — including a real BLE write-pacing bug
+   found and fixed along the way, worth reading before touching
+   `write_rpc_command_()`.
+3. Wire status/temperature decoding (the `sc_11`/`sc_12` frames' bit-level
+   fields — see "Verified" above) into the component's internal state.
 4. Add the REST endpoints (`/health`, `/state`, `/info`) — read-only —
    and repoint nginx's `proxy_pass` at the ESP32 to confirm the Blazor app
    renders live data with zero frontend changes.
@@ -318,4 +364,5 @@ firmware has proven itself, given what's at stake if it's wrong.
    Phase 1 begins.
 
 All decisions this plan depended on are now made (see "Decisions made"
-above) — nothing left open. Ready for Phase 1 whenever you want to start.
+above) — nothing left open. Phases 1 and 2 are done; ready for Phase 3
+(status/temperature decoding) whenever you want to start.

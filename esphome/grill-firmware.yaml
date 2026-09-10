@@ -7,10 +7,12 @@
 # reading that plan first — same hardware notes apply (BOOT/EN dance for
 # the first USB flash, OTA after).
 #
-# This phase only proves the BLE transport: connect by advertised name,
-# discover the RPC/debug-log service, register for notifications, and log
-# one RPC.Ping round trip. No auth, no MCU commands, no state decoding yet
-# — those are later phases once this is confirmed working on real hardware.
+# Phase 1 proved the BLE transport (connect, discover, notify, unauth'd
+# RPC.Ping). Phase 2 adds the auth codec and authenticated PB.GetState.
+# grill_password below is the same secret as scripts/.grill_env's
+# GRILL_PASSWORD on the Pi (Phase 7 moves fetching/storing it onto the
+# ESP32 itself instead of a compile-time secret). No MCU commands or
+# FE0B/FE0C field-level decoding yet — later phases.
 
 esphome:
   name: grill-firmware
@@ -61,3 +63,4 @@ external_components:
 pitboss_grill:
   id: grill
   name_prefix: "PBV2-"
+  grill_password: !secret grill_password
