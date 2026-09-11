@@ -322,8 +322,17 @@ else
 
     protected override async Task OnInitializedAsync()
     {
+        // 10s, not 5s (as of 2026-09-11) — each poll is up to 4 HTTP requests
+        // (health, alarms, info once, state) and, since Phase 4, all of them
+        // now hit the grill's own ESP32 directly instead of a PC-side
+        // sidecar. That ESP32 has one 2.4GHz radio shared between this WiFi
+        // traffic and the BLE link doing actual grill RPCs — halving the
+        // poll rate measurably reduces radio contention that was
+        // contributing to commands (power_on, set_temp) silently failing to
+        // reach the grill. See docs/ESP32_FIRMWARE_PLAN.md's 2026-09-11
+        // follow-up.
         pollTimer = new System.Threading.Timer(_ => _ = InvokeAsync(PollSidecar),
-            null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
+            null, TimeSpan.Zero, TimeSpan.FromSeconds(10));
     }
 
     private async Task PollSidecar()

@@ -134,14 +134,25 @@ signed-session-cookie login form, holding no grill state of any kind.
 7. **A stuck RPC reply used to wedge `POST /command` with "grill busy"
    forever** — fixed 2026-09-11 with a `loop()` watchdog
    (`RPC_REPLY_TIMEOUT_MS`) that force-clears an in-flight request past 5s
-   and retries a command's own request once. Real root cause #1 (why
-   replies were dropping at all): `post_connect_roaming` — ESPHome's
-   default periodic WiFi rescan for a "better" AP, which this board's WiFi
-   signal always triggers — was colliding with BLE on this ESP32's one
-   shared 2.4GHz radio; disabled in `grill-firmware.yaml`. A real, *still
-   open* baseline reply-drop rate remains even with that fixed (see the
-   2026-09-11 follow-up in `docs/ESP32_FIRMWARE_PLAN.md`) — the system now
-   recovers instead of staying stuck, but hasn't been made fully reliable.
+   and retries a command's own request once. Root cause: this firmware
+   collapsed the old sidecar's two-chip split (a PC with no radio
+   constraints, plus a *dedicated* quiet BLE-only proxy ESP32) onto one
+   ESP32 with one shared 2.4GHz radio serving both the grill's BLE link
+   *and* every bit of WiFi traffic (the browser's poll, mDNS, SNTP,
+   Telegram) — an RPC write using `ESP_GATT_WRITE_TYPE_NO_RSP` (confirmed
+   the *only* write type this GATT server actually tolerates — switching to
+   WRITE_TYPE_RSP caused real disconnects, reverted) that loses that
+   radio-time race is just silently gone. `post_connect_roaming` (ESPHome's
+   periodic "check for a better AP" WiFi scan, which this board's signal
+   always triggered) was one concrete collision, disabled outright; cutting
+   general WiFi chatter — `mdns: disabled: true`, and `GrillDetail.razor`/
+   `Home.razor`'s poll interval 5s→10s — closed the rest of it: 10/10
+   `POST /command` calls succeeded live afterward with zero timeouts. See
+   the 2026-09-11 follow-up in `docs/ESP32_FIRMWARE_PLAN.md` for the full
+   writeup, including a real mistake made verifying this (ran `power_off`
+   tests without checking `/state` first — no cook was actually
+   interrupted, but check current state before assuming a command is
+   "safe to test," never assume from earlier in the same conversation).
 8. `pkill -f "esphome logs"` does not reliably kill background log
    processes in this environment (Windows + Git Bash) — several piling up
    exhausts the ESPHome API's 5-connection cap and produces a

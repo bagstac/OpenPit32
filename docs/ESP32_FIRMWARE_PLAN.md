@@ -707,6 +707,52 @@ choice here after all, confirmed the hard way rather than assumed. The
 reply-drop root cause itself remains open; this is a ruled-out theory, not
 a fix, kept here so it isn't tried again from scratch.
 
+**Actually root-caused and fixed, later the same day**: reported live again
+as `power_on` finally working but `set_temp` then failing 3 times in a row.
+The real difference from the old sidecar architecture turned out to be the
+answer: the sidecar ran on a PC with no radio constraints at all, served
+every poll from an in-memory cache, and talked to a *second*, dedicated
+ESP32 whose only job was bridging raw BLE — quiet, single-purpose, minimal
+WiFi chatter of its own. This firmware collapsed both roles onto **one**
+ESP32 with **one** shared 2.4GHz radio: the same chip trying to hold a BLE
+write's timing window open is also serving `GrillDetail.razor`'s poll
+(`/health` + `/state`, every 5s), mDNS, SNTP, OTA-readiness, and Telegram
+POSTs on alarm fire. Every one of those competes for the same airtime as an
+RPC write to the grill — and since that write is
+`ESP_GATT_WRITE_TYPE_NO_RSP` (confirmed correct, see just above — it's what
+this GATT server actually tolerates), a write that loses that radio-time
+race is simply gone, with nothing on our side able to tell.
+
+Two changes, both aimed at cutting how much non-BLE radio traffic this chip
+generates, deployed together:
+- `mdns: disabled: true` in `grill-firmware.yaml` — nothing resolves this
+  device by its `.local` name at runtime (`GRILL_PROXY_HOST`/`GRILL_HOST`
+  are always a plain IP); mDNS's periodic multicast announcements were
+  pure radio-contention cost for zero runtime benefit.
+- `GrillDetail.razor`/`Home.razor`'s poll interval, 5s → 10s — halves how
+  often the browser's background polling has to compete with an in-flight
+  BLE RPC for the same radio.
+
+Measured live immediately after, back-to-back: **10/10** `POST /command`
+calls succeeded with completely clean logs (zero `RPC reply timed out`,
+zero retries needed) — a dramatic change from the same test minutes
+earlier. `set_temp` to 225°F confirmed working end-to-end
+(`grillSetTemp` actually changed on the real device). The underlying
+"why does write-without-response lose packets at all" question a few
+paragraphs up is still academically open, but the *practical* answer to
+"why is this less reliable than the old sidecar" is now well understood
+and fixed: less radio contention, not a deeper protocol bug.
+
+**One real mistake made during this verification, worth recording**: the
+10x `power_off` test above was run without first checking `/state` — safe
+reasoning that held true *earlier* in this same session (grill confirmed
+off before testing) was wrongly assumed to still hold later, after the
+user had since turned the grill on for real. Confirmed no actual cook was
+interrupted this time, but the lesson stands: `power_off`/`power_on` are
+only "safe to test freely" relative to the grill's *actual current state*,
+checked immediately beforehand — never assumed from an earlier point in
+the same conversation.
+
 ## Decisions made (2026-09-09)
 
 Asked as clarifying questions before writing this plan; answers below shape

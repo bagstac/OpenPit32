@@ -89,8 +89,11 @@ else if (info is not null)
     protected override async Task OnInitializedAsync()
     {
         await PollSidecar();
+        // 10s, not 5s — see GrillDetail.razor's OnInitializedAsync() comment:
+        // less polling means less WiFi traffic competing with the grill's
+        // ESP32 for its one shared radio's airtime during an actual BLE RPC.
         localPoll = new System.Threading.Timer(_ => _ = InvokeAsync(PollSidecar),
-            null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+            null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
     }
 
     private void OpenGrill() => Nav.NavigateTo("/grill");

@@ -83,6 +83,18 @@ ota:
   - platform: esphome
     password: !secret ota_password
 
+# api/web_server_base auto-load mdns with its default (enabled) config; disabled
+# here 2026-09-11 as one more piece of the RPC-reply-drop-rate investigation
+# (docs/ESP32_FIRMWARE_PLAN.md's 2026-09-11 follow-up) — nothing actually
+# resolves this device by its .local name at runtime (GRILL_PROXY_HOST/
+# GRILL_HOST are always a plain IP; only ad-hoc `esphome logs`/`esphome run`
+# during development ever used it, and even those work fine given an explicit
+# --device IP instead), so mDNS's periodic multicast announcements were pure
+# radio-contention cost on this ESP32's one 2.4GHz radio (shared with BLE)
+# for zero runtime benefit.
+mdns:
+  disabled: true
+
 logger:
   level: DEBUG
   logs:
