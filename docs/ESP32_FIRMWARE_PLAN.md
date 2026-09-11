@@ -1,14 +1,20 @@
-# Plan: move all grill control onto the ESP32
+# Plan: move all grill control onto the ESP32 (done)
 
-Goal, from a 2026-09-09 discussion: collapse the current three-hop
+Goal, from a 2026-09-09 discussion: collapse the original three-hop
 architecture (web app → Python sidecar → ESP32 BLE proxy → grill) down to
 two real components — a thin web-facing edge, and an ESP32 that owns 100%
 of the Bluetooth protocol, command dispatch, alarm evaluation, and alerting.
-Current state / why the sidecar exists at all today: `docs/STATE.md`.
-Protocol facts this plan leans on: `docs/PROTOCOL.md`.
+**As of Phase 8 (2026-09-10), this is done**: the Python sidecar is deleted
+entirely, replaced by a small login-only process
+(`scripts/login_service.py`) that holds no grill state at all — see
+`docs/STATE.md` for the current architecture and `docs/PROTOCOL.md` for the
+protocol facts this plan leaned on.
 
-Phases 1 through 7 (below) are implemented and bench-verified against the
-real grill; everything past that is still ahead.
+Phases 1 through 9 (below) are all complete and bench-verified/deployed
+live against the real grill — see the "Rollout plan" section near the
+bottom for the phase-by-phase checklist, and each phase's own "Verified"
+section for what was actually proven on real hardware. Nothing from this
+plan's original scope remains open.
 
 ## Verified 2026-09-09: Phase 1, native BLE connect + RPC.Ping
 
