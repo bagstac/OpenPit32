@@ -131,6 +131,24 @@ signed-session-cookie login form, holding no grill state of any kind.
    container used for the identical file — changing either would silently
    invalidate every existing login session on the next deploy. Keep them in
    sync if either ever moves.
+7. **A stuck RPC reply used to wedge `POST /command` with "grill busy"
+   forever** — fixed 2026-09-11 with a `loop()` watchdog
+   (`RPC_REPLY_TIMEOUT_MS`) that force-clears an in-flight request past 5s
+   and retries a command's own request once. Real root cause #1 (why
+   replies were dropping at all): `post_connect_roaming` — ESPHome's
+   default periodic WiFi rescan for a "better" AP, which this board's WiFi
+   signal always triggers — was colliding with BLE on this ESP32's one
+   shared 2.4GHz radio; disabled in `grill-firmware.yaml`. A real, *still
+   open* baseline reply-drop rate remains even with that fixed (see the
+   2026-09-11 follow-up in `docs/ESP32_FIRMWARE_PLAN.md`) — the system now
+   recovers instead of staying stuck, but hasn't been made fully reliable.
+8. `pkill -f "esphome logs"` does not reliably kill background log
+   processes in this environment (Windows + Git Bash) — several piling up
+   exhausts the ESPHome API's 5-connection cap and produces a
+   rapid-reconnect symptom that looks exactly like a firmware crash but
+   isn't (confirmed: `/health` answered normally the instant the stale
+   client processes were force-killed). `taskkill /F /IM python.exe`
+   (or killing by tracked PID) actually works; `pkill -f` does not.
 
 ## Files map
 - `scripts/login_service.py` — the entire Python surface now: login form +

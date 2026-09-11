@@ -601,6 +601,93 @@ Phase 6 — see that section above). Both go through the exact same
 works, so this is a real but low-risk gap, not an untested code path in the
 way the alarms crash was.
 
+## 2026-09-11 follow-up: "grill busy" forever — a stuck-RPC watchdog + a real WiFi/BLE collision
+
+Reported live: `POST /command` (including `power_on`) started answering
+`"grill busy — try again"` on every attempt, permanently, for a real user
+trying to use the app normally — not a bench artifact.
+
+**Root cause #1, the actual bug**: `pending_reply_` (which of Ping/GetTime/
+GetState/MCU_COMMAND is currently in flight — see the header's own comment)
+had no timeout at all outside the httpd-triggered command path. If a sent
+RPC request's reply simply never arrived — no truncation notification
+either, `on_rpc_read_()`'s `len==0` path never fired, just *nothing* — there
+was no mechanism anywhere to notice and recover. Confirmed live via
+`esphome logs`: `write_rpc_command_()`'s own "Sent RPC request" log (which
+only fires once the full write is confirmed by its own
+`ESP_GATTC_WRITE_CHAR_EVT`, i.e. the request genuinely reached the grill)
+fired normally, but no "RPC reply announced"/"GetTime OK" ever followed.
+Once that happened once, `pending_reply_` stayed non-NONE forever: every
+later 15s `GetState` cycle saw "a reply is still in flight" and no-opped,
+and every `POST /command` saw the identical thing and answered "busy"
+instantly — with no way back short of a full BLE disconnect/reconnect
+(the only other place that resets `pending_reply_`).
+
+Fixed with a watchdog: `rpc_request_millis_` timestamps every request in
+`write_rpc_command_()`; `loop()` now force-clears anything still pending
+past `RPC_REPLY_TIMEOUT_MS` (5s — generous over the ~150-600ms real round
+trips measured on this hardware, comfortably inside both the 15s periodic
+cycle and the command semaphore budget). The recovery logic is shared
+(`abandon_pending_rpc_()`) with `on_rpc_read_()`'s existing truncation
+handling, and now also **retries once** for a command's own request before
+giving up — reusing `on_mcu_command_reply_()`'s existing "every MCU command
+here is idempotent, so retrying cannot double-apply anything" guarantee,
+since consecutive individual attempts routinely succeeded right after a
+failed one. `POST /command`'s own semaphore wait grew from 8s to 12s to
+give that retry room to actually land before the httpd side gives up first.
+
+**Root cause #2, why replies were dropping at all**: found live, a
+`[D][wifi] Roam scan (-58 dBm, attempt 1/3)` log line landing immediately
+before one of these timeouts. ESPHome's `post_connect_roaming` (on by
+default) rescans for a "better" AP every 5 minutes whenever WiFi RSSI is
+below -49dBm (`wifi_component.h`'s `ROAMING_GOOD_RSSI`) — this board's own
+WiFi signal (-56 to -58dBm, comfortably fine on its own terms) is always
+below that bar, so it was roam-scanning on every check. A WiFi scan needs
+the radio to hop across every channel, and this ESP32 has one 2.4GHz radio
+shared with BLE (already flagged as a risk in `grill-firmware.yaml`'s own
+comments, re: excessive logging starving WiFi during Phase 1 bring-up) —
+each scan collided with whatever BLE RPC exchange was in flight. Fixed by
+setting `post_connect_roaming: false`: this board sits fixed next to the
+grill, so there's no second AP to usefully roam to in the first place —
+disabling it is pure upside.
+
+**Honest gap, not fully solved**: even with roaming disabled, a real
+baseline RPC-reply-drop rate remains — measured live, individual attempts
+still timing out something like 40-60% of the time, often enough that both
+the original attempt and its one retry drop back to back
+(`"grill did not reply in time"`). The passive debug-log push channel
+(no request/reply round trip, just notifications) stayed 100% fresh
+throughout every one of these failures, and WiFi/BLE RSSI were both
+excellent (-43 to -44dBm) — so this isn't a range/signal-quality problem,
+and it isn't the roaming collision either (no `Roam scan` line anywhere
+near these). What specifically makes the *reply* side of a write+wait-for-
+notify RPC exchange this unreliable on this hardware, while a one-way push
+notification never drops, is not root-caused. What's true instead is that
+the system now **recovers**: a `POST /command` that hits this either
+succeeds on its built-in retry or fails within ~10-12s instead of wedging
+the whole link forever — the actual reported symptom (permanently stuck,
+needing a manual power cycle) is fixed, even though the underlying
+reply-drop rate itself is a real, still-open question.
+
+**Also worth remembering for next bench session**: `pkill -f "esphome
+logs"` did not reliably kill background `esphome logs` processes in this
+environment (Windows + Git Bash) — several accumulated across a long
+session and exhausted the ESPHome API server's 5-connection cap, producing
+a rapid-reconnect symptom (`EOF received (SocketClosedAPIError)` in a tight
+loop, `esphome upload` failing with "Device closed connection without
+responding") that looked exactly like a firmware crash but wasn't one — the
+device's own `/health` answered normally the instant the stale client
+processes were force-killed (`taskkill /F /IM python.exe` on Windows) and
+its connection slots freed up. This is the same class of gotcha Phase 1's
+bench notes already flagged once; evidently worth restating since it
+recurred.
+
+Deployed live and reverified: `POST /command` retries automatically and
+recovers instead of wedging; no `Roam scan` line appears anymore in any
+capture since disabling it; grill state (`moduleIsOn`, etc.) confirmed
+unaffected by the extensive `power_off` testing this required (idempotent
+by design, as intended).
+
 ## Decisions made (2026-09-09)
 
 Asked as clarifying questions before writing this plan; answers below shape

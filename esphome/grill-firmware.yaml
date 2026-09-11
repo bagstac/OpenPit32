@@ -59,6 +59,21 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   reboot_timeout: 15min
+  # Root-caused live 2026-09-11: ESPHome's post_connect_roaming (default on)
+  # rescans for a "better" AP every 5 min whenever WiFi RSSI is below -49dBm
+  # (wifi_component.h's ROAMING_GOOD_RSSI) — this board's WiFi signal here
+  # (-56 to -58dBm, comfortably fine on its own) is always below that, so it
+  # was roam-scanning on every check. A WiFi scan needs the radio to hop
+  # across every channel, and this ESP32 has one 2.4GHz radio shared with
+  # BLE — each scan collided with whatever BLE RPC exchange was in flight,
+  # dropping the grill's reply notification with nothing on our side able
+  # to tell the difference from any other dropped packet (confirmed via a
+  # `[D][wifi] Roam scan` log line landing right before a `pitboss_grill`
+  # "RPC reply timed out" warning). This board sits fixed next to the grill
+  # — there is no second AP to usefully roam to — so disable it outright
+  # rather than accept periodic BLE collisions for a roam that could never
+  # help here anyway.
+  post_connect_roaming: false
 
 api:
   encryption:

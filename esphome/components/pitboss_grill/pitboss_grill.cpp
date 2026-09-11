@@ -50,6 +50,20 @@ static ESPBTUUID mongoose_uuid(const std::string &raw16) {
 // write_rpc_command_() for the full frame format and why chunks are paced.
 static const size_t RPC_CHUNK_SIZE = 20;
 
+// Found live 2026-09-11: nothing previously bounded how long a sent RPC
+// request (Ping/GetTime/GetState/MCU command) could sit waiting for a reply
+// that never comes — a single dropped BLE notification (root cause never
+// pinned down; the write itself always completed fine per the "Sent RPC
+// request" log, so this is specifically the *reply* going missing, not the
+// request) wedged pending_reply_ non-NONE forever, silently breaking every
+// later GetState cycle and every POST /command with no way to recover short
+// of a full disconnect/reconnect. loop() now force-clears a request stuck
+// past this deadline — see rpc_request_millis_'s comment. Real round trips
+// measured on this hardware are ~150-600ms even for GetState's longer body;
+// 5s is generous headroom while still recovering well inside both the 15s
+// periodic cycle and POST /command's own 8s semaphore budget.
+static const uint32_t RPC_REPLY_TIMEOUT_MS = 5000;
+
 // Auth codec — a direct port of pytboss/codec.py, itself a port of the PB
 // firmware's own codec() / getCodecKey() (see docs/PROTOCOL.md's
 // Authentication section). KEY is the firmware's fixed key for the grill
@@ -487,7 +501,69 @@ void PitbossGrill::setup() {
   this->set_interval("alarm_check", 5000, [this]() { this->check_alarms_(); });
 }
 
-void PitbossGrill::loop() { BLEClientBase::loop(); }
+void PitbossGrill::loop() {
+  BLEClientBase::loop();
+  // Stuck-RPC watchdog — see RPC_REPLY_TIMEOUT_MS's and rpc_request_millis_'s
+  // comments for why this exists at all: found live 2026-09-11, a sent
+  // request whose reply just never arrives (no truncation notification
+  // either — on_rpc_read_()'s len==0 path never fires) wedged
+  // pending_reply_ permanently with nothing to recover it. millis() wraps
+  // every ~49.7 days; a wrapped subtraction here briefly reads as a huge
+  // elapsed time (always >= the timeout, never the reverse), so at worst
+  // this fires one tick early right at the wrap instead of silently
+  // failing to fire — the safe direction for a watchdog to be wrong in.
+  if (this->pending_reply_ != PendingReply::NONE &&
+      millis() - this->rpc_request_millis_ > RPC_REPLY_TIMEOUT_MS) {
+    ESP_LOGW(TAG, "RPC reply timed out after %ums with no reply or truncation at all — recovering",
+             static_cast<unsigned>(millis() - this->rpc_request_millis_));
+    this->abandon_pending_rpc_("grill did not reply in time");
+  }
+}
+
+// See the header comment. `kind` is captured before pending_reply_ is
+// cleared so the pending_after_time_/command_mutex_ check below still knows
+// what was actually in flight.
+//
+// A command's own request (kind GET_TIME or MCU_COMMAND, with
+// pending_after_time_ still MCU_COMMAND) gets exactly one retry here before
+// giving up — the same "retry once" idempotency guarantee
+// on_mcu_command_reply_()'s comment already documents for an explicit
+// rejection (every MCU command this project sends is idempotent, so
+// retrying cannot double-apply anything) applies just as well to a request
+// that got no reply at all. Confirmed live 2026-09-11: consecutive
+// individual attempts routinely succeeded right after a failed one, so a
+// same-request retry recovers real cases handle_command_()'s caller would
+// otherwise have to notice and retry by hand.
+void PitbossGrill::abandon_pending_rpc_(const char *reason) {
+  PendingReply kind = this->pending_reply_;
+  this->pending_reply_ = PendingReply::NONE;
+  this->rpc_reply_in_progress_ = false;
+  this->rpc_write_in_progress_ = false;
+  // A truncation/timeout NOT tied to an in-flight command has nothing more
+  // to do — the next *periodic* GetTime cycle just tries again in its own
+  // time.
+  if (this->pending_after_time_ != PendingReply::MCU_COMMAND)
+    return;
+  if ((kind == PendingReply::GET_TIME || kind == PendingReply::MCU_COMMAND) && !this->command_retried_) {
+    ESP_LOGW(TAG, "%s — retrying once", reason);
+    this->command_retried_ = true;
+    this->send_get_time_();
+    return;
+  }
+  // Either already retried once, or this wasn't actually the command's own
+  // request (shouldn't happen — pending_reply_ during a command flow is
+  // always GET_TIME or MCU_COMMAND — kept as a defensive fallback). Must
+  // not leave pending_after_time_ pointing at MCU_COMMAND with a now-
+  // abandoned command_pending_hex_, or the next *periodic* GetTime cycle
+  // would reissue that stale command with no caller waiting on it. Waking
+  // handle_command_() here (instead of leaving it to its own semaphore
+  // timeout) also fails it fast.
+  this->pending_after_time_ = PendingReply::GET_STATE;
+  if (kind == PendingReply::GET_TIME || kind == PendingReply::MCU_COMMAND) {
+    this->command_result_error_ = reason;
+    xSemaphoreGive(this->command_done_sem_);
+  }
+}
 
 void PitbossGrill::set_last_error_(const std::string &message) {
   LockGuard lock(this->state_mutex_);
@@ -732,6 +808,12 @@ void PitbossGrill::write_rpc_command_(const std::string &json) {
   this->rpc_write_json_ = json;
   this->rpc_write_offset_ = 0;
   this->rpc_write_in_progress_ = true;
+  // Every caller (send_ping_/send_get_time_/send_get_state_/
+  // send_mcu_command_) already set pending_reply_ to a non-NONE value right
+  // before calling this — timestamp it here, once, for loop()'s stuck-reply
+  // watchdog (see rpc_request_millis_'s header comment) rather than at each
+  // call site individually.
+  this->rpc_request_millis_ = millis();
 
   uint8_t len_bytes[4] = {
       static_cast<uint8_t>((json.size() >> 24) & 0xFF),
@@ -1082,23 +1164,7 @@ void PitbossGrill::on_rpc_read_(const uint8_t *data, uint16_t len) {
   if (len == 0) {
     ESP_LOGW(TAG, "Abandoning truncated RPC reply: got %d of %u bytes",
              static_cast<int>(this->rpc_reply_buffer_.size()), this->rpc_reply_expected_);
-    this->rpc_reply_in_progress_ = false;
-    // Also clear this, or send_get_state_cycle_()'s in-flight guard would
-    // wrongly believe a reply is still pending forever after a truncation.
-    PendingReply kind = this->pending_reply_;
-    this->pending_reply_ = PendingReply::NONE;
-    // A truncation mid-command must not leave pending_after_time_ pointing
-    // at MCU_COMMAND with a now-abandoned command_pending_hex_ — the next
-    // *periodic* GetTime cycle would otherwise reissue that stale command
-    // with no caller waiting on it. Waking handle_command_() here (instead
-    // of leaving it to the 8s timeout) also fails it fast.
-    if (this->pending_after_time_ == PendingReply::MCU_COMMAND) {
-      this->pending_after_time_ = PendingReply::GET_STATE;
-      if (kind == PendingReply::GET_TIME || kind == PendingReply::MCU_COMMAND) {
-        this->command_result_error_ = "BLE link dropped mid-command";
-        xSemaphoreGive(this->command_done_sem_);
-      }
-    }
+    this->abandon_pending_rpc_("BLE link dropped mid-command");
     return;
   }
   this->rpc_reply_buffer_.insert(this->rpc_reply_buffer_.end(), data, data + len);
@@ -1555,9 +1621,12 @@ void PitbossGrill::handle_command_(AsyncWebServerRequest *request) {
   this->defer([this, command_hex]() {
     if (this->pending_reply_ != PendingReply::NONE) {
       // The periodic 15s GetState cycle (or, in principle, another command)
-      // was already mid-flight when this one was deferred in — vanishingly
-      // unlikely given command_mutex_ above, but fail loudly rather than
-      // stomp on it.
+      // was already mid-flight when this one was deferred in — real enough
+      // in practice (not the "vanishingly unlikely" case this comment used
+      // to claim) that loop()'s RPC_REPLY_TIMEOUT_MS watchdog exists
+      // specifically so this self-clears within a few seconds rather than
+      // wedging forever; fail loudly here rather than stomp on whatever's
+      // actually in flight.
       this->command_result_error_ = "grill busy — try again";
       xSemaphoreGive(this->command_done_sem_);
       return;
@@ -1567,7 +1636,14 @@ void PitbossGrill::handle_command_(AsyncWebServerRequest *request) {
     this->send_get_time_();
   });
 
-  bool completed = xSemaphoreTake(this->command_done_sem_, pdMS_TO_TICKS(8000)) == pdTRUE;
+  // 12s, not 8s: abandon_pending_rpc_()'s retry-once-on-no-reply can now
+  // burn up to ~2x RPC_REPLY_TIMEOUT_MS (5s each) before this semaphore
+  // would ever see it, on top of whatever the retry's own successful round
+  // trip then takes — 8s wasn't enough headroom for that whole sequence to
+  // land within it, which just traded a real command failure for a
+  // misleading "timed out waiting for grill" even on a run that was about
+  // to succeed via its retry.
+  bool completed = xSemaphoreTake(this->command_done_sem_, pdMS_TO_TICKS(12000)) == pdTRUE;
   std::string result_error = completed ? this->command_result_error_ : std::string("timed out waiting for grill");
 
   std::string resp = esphome::json::build_json([&](JsonObject root) {

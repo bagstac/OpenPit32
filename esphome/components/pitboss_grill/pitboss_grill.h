@@ -71,6 +71,8 @@ using namespace esp32_ble_client;
 class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
  public:
   void setup() override;
+  // Also watches for a stuck in-flight RPC reply — see rpc_request_millis_'s
+  // comment — and force-recovers past the RPC_REPLY_TIMEOUT_MS deadline.
   void loop() override;
   void dump_config() override;
   // BLEClientBase defaults to setup_priority::BLUETOOTH (350) — fine for
@@ -233,6 +235,14 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   void on_rpc_notify_(const uint8_t *data, uint16_t len);
   void on_rpc_read_(const uint8_t *data, uint16_t len);
   void on_debug_log_(const uint8_t *data, uint16_t len);
+  // Shared recovery path for an RPC that's never going to complete — a
+  // truncated reply (on_rpc_read_()'s len==0 case, a real disconnect
+  // mid-read) or one that simply never arrived at all within
+  // RPC_REPLY_TIMEOUT_MS (loop()'s watchdog). Resets pending_reply_ (so the
+  // next periodic cycle isn't stuck believing one's still in flight) and,
+  // if a POST /command was waiting on this specific request, wakes it with
+  // `reason` as the error instead of leaving it to time out on its own.
+  void abandon_pending_rpc_(const char *reason);
   void request_next_reply_chunk_();
   void write_rpc_command_(const std::string &json);
   void write_next_rpc_chunk_();
@@ -427,6 +437,19 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   // without needing to track/match request ids of our own.
   enum class PendingReply { NONE, PING, GET_TIME, GET_STATE, MCU_COMMAND };
   PendingReply pending_reply_{PendingReply::NONE};
+
+  // millis() timestamp of the write that put pending_reply_ into its current
+  // non-NONE state (set in write_rpc_command_()) — loop() watches this and
+  // force-recovers if no reply/truncation ever arrives (see loop()'s own
+  // comment). Found live 2026-09-11: with nothing bounding "sent but never
+  // replied" at all, a single dropped BLE notification — for any reason,
+  // never actually root-caused, the write itself always completed fine per
+  // the "Sent RPC request" log — wedged pending_reply_ non-NONE permanently.
+  // Every later GetState cycle then saw "a reply still in flight" and
+  // no-opped forever, and every POST /command saw the same thing and
+  // answered "grill busy" instantly, forever, until a manual power cycle —
+  // no self-healing possible without this.
+  uint32_t rpc_request_millis_{0};
 
   // GET_TIME is a shared first step (every authenticated call needs a fresh
   // uptime to derive its key) — this says what on_get_time_reply_() should
