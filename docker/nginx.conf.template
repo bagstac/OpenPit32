@@ -2,12 +2,14 @@
 # traffic under /api/, so the whole app is one origin — needed for a single
 # Cloudflare Tunnel hostname and so one login covers both. As of Phase 4
 # (docs/ESP32_FIRMWARE_PLAN.md) that traffic is split across two backends:
-# the sidecar (scripts/grill_sidecar.py) for everything not yet ported, and
-# the grill's own ESP32 (esphome/grill-firmware.yaml) for the read-only
-# /health, /state, /info it now serves directly — same JSON shapes, so
-# OpenPit32/Services/GrillRpcService.cs needs no changes either way.
-# /login, /logout, /auth-check still go to the sidecar; that's rollout item
-# 8, not done yet.
+# the sidecar (scripts/grill_sidecar.py) for what's not yet ported off it,
+# and the grill's own ESP32 (esphome/grill-firmware.yaml) for everything
+# Phases 4-7 have proven there — /health, /state, /info, /config, /command,
+# /alarms (including DELETE /alarms/{id}), /setup — same JSON shapes in
+# every case, so OpenPit32/Services/GrillRpcService.cs needs no changes
+# either way. /login, /logout, /auth-check still go to the sidecar (rollout
+# item 8, not done yet), along with /push/*, /models, and /probe-targets
+# (not being ported at all — see the plan's decisions #3 and #6).
 # Client-side routes (/grill, /health) don't exist as files, so unmatched
 # paths fall back to index.html and the Blazor router takes it from there.
 #
@@ -87,13 +89,14 @@ server {
         try_files $uri $uri/ /index.html;
     }
 
-    # /health, /state, /info now come straight from the grill's ESP32
-    # (Phase 4) instead of the sidecar — same paths, same JSON shapes, still
-    # behind the same login. /config (below) is ESP32-only, no sidecar
-    # equivalent. These `location =` exact matches take precedence over the
-    # /api/ prefix block below regardless of file order, so everything else
-    # under /api/ (command, setup, alarms, push, models, probe-targets — not
-    # yet ported, rollout items 5-8) keeps going to the sidecar unchanged.
+    # /health, /state, /info come straight from the grill's ESP32 (Phase 4);
+    # /config is ESP32-only, no sidecar equivalent (added alongside these
+    # 2026-09-10). These `location =` exact matches take precedence over the
+    # /api/ prefix block below regardless of file order, so only what's
+    # listed here (plus /api/command, /api/alarms* and /api/setup right
+    # below) goes to the ESP32 — everything else under /api/ (login/logout/
+    # auth-check above are separate blocks entirely; push, models,
+    # probe-targets) still falls through to the sidecar unchanged.
     location = /api/health {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
@@ -115,14 +118,56 @@ server {
         proxy_set_header Host $host;
     }
 
-    # POST /config — the ESP32-only error_display_threshold setting (2026-09-10,
-    # not part of the sidecar's API). Same exact-match precedence as the three
-    # above; not covered by /api/ below since that block still targets the
-    # sidecar, which has no /config route.
+    # POST /config — the ESP32-only error_display_threshold/telegram_bot_token/
+    # telegram_chat_id settings (2026-09-10, Phase 7) — not part of the
+    # sidecar's API at all.
     location = /api/config {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
         proxy_pass $grill_esp32/config;
+        proxy_set_header Host $host;
+    }
+
+    # Phase 5: POST /command (turn-on/turn-off/set-temperature). Body is
+    # forwarded as-is — nginx proxies the request body by default, same as
+    # /api/config above already relies on; no special directive needed.
+    location = /api/command {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/command;
+        proxy_set_header Host $host;
+    }
+
+    # Phase 6/7: GET/POST /alarms (list/create) and POST /setup (Phase 7's
+    # cloud password fetch) — exact matches, same pattern as the ones above.
+    location = /api/alarms {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/alarms;
+        proxy_set_header Host $host;
+    }
+
+    location = /api/setup {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/setup;
+        proxy_set_header Host $host;
+    }
+
+    # DELETE /alarms/{id} — a *prefix* match (not `location =`), since the
+    # id is part of the path. More specific than the bare /api/ prefix block
+    # below, so nginx picks this one for anything under /api/alarms/ without
+    # needing a regex. rewrite strips the /api prefix the same way the
+    # generic /api/ block below does (proxy_pass with a variable disables
+    # nginx's automatic prefix-stripping), landing on the ESP32's own
+    # DELETE /alarms/{id} route (pitboss_grill.cpp's setup_delete_handler_()
+    # — a real 200/404, unlike most routes on that ESP-IDF web server
+    # backend, which this proxies through unchanged).
+    location /api/alarms/ {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        rewrite ^/api/alarms/(.*)$ /alarms/$1 break;
+        proxy_pass $grill_esp32;
         proxy_set_header Host $host;
     }
 
