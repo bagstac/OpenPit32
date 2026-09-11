@@ -1,5 +1,5 @@
-# Tooling only: compiling/flashing esphome/grill-proxy.yaml. Keep it in its
-# own venv — esphome pins a large dependency set that conflicts with the
-# runtime requirements.
+# Tooling only: compiling/flashing esphome/grill-firmware.yaml. Keep it in
+# its own venv — esphome pins a large dependency set that conflicts with the
+# runtime requirements (requirements.txt, scripts/login_service.py).
 #   python -m venv .venv && .venv\Scripts\pip install -r requirements-esphome.txt
 esphome>=2026.6

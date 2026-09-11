@@ -876,18 +876,30 @@ firmware has proven itself, given what's at stake if it's wrong.
    `save_alarms_locked_()` again. The real cloud login (`POST /setup`
    against an actual Pit Boss account) and the Telegram fields of
    `POST /config` weren't exercised this session (no credentials pasted in,
-   deliberately) — see "Not yet exercised" above. nginx's `/api/setup`
-   isn't repointed yet (still the sidecar); only the ESP32 side was proven
-   this phase.
-8. Port the login-only process (decision 5) from today's
-   `grill_sidecar.py`; remove the Python BLE stack and the frontend's
-   push/notification code.
-9. Update `README.md`, `docs/STATE.md`, `docs/PROTOCOL.md` to describe the
-   new architecture; retire this file's "not yet started" framing once
-   Phase 1 begins.
+   deliberately) — see "Not yet exercised" above. nginx's `/api/setup` was
+   repointed as its own follow-up right after (see below) — every route
+   this phase added is live on the real deployment now.
+8. ✅ **Done (2026-09-10)** — **retired the Python sidecar entirely**:
+   ported the login-only process (decision 5) into
+   `scripts/login_service.py`, deleted `grill_sidecar.py`/`esphome_ble.py`/
+   `alarms.py`/`pitboss_cloud.py` plus the now-unused BLE dev tools
+   (`ble_scan.py`/`ble_probe.py`/`proxy_scan.py`), trimmed
+   `requirements.txt` down to just `aiohttp`, and removed the frontend's
+   push/notification code (`js/push.js`, `push-worker.js`, the
+   VAPID-subscription UI in `GrillDetail.razor`, and
+   `GrillRpcService.cs`'s push/models methods — `GET /models` had no
+   replacement either, since it depended on pytboss's catalog). Also
+   retired `esphome/grill-proxy.yaml` (the BLE-radio-only fallback firmware
+   the sidecar drove remotely) now that the new firmware has months of real
+   production use behind it — see git history if either ever needs to come
+   back. See "Verified" below for the real deployment + a local-dev
+   regression this surfaced and fixed.
+9. ✅ **Done (2026-09-10)** — updated `README.md`, `docs/STATE.md`,
+   `docs/PROTOCOL.md` for the new architecture. This file's own
+   introduction no longer says "everything past that is still ahead" —
+   nothing is, as of Phase 8.
 
 All decisions this plan depended on are now made (see "Decisions made"
-above) — nothing left open. Phases 1 through 7 are bench-verified (Phase 7's
-real cloud login still needs a live `POST /setup` run against the account
-whenever that's convenient — see its "Not yet exercised" note). Phase 8
-(retire the Python BLE stack + push/notification frontend code) is next.
+above) — nothing left open, and nothing left in the original migration
+scope either. Phases 1 through 8 are bench-verified end to end, live on the
+real deployment.

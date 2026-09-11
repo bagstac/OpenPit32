@@ -5,7 +5,7 @@
 <PageTitle>Bridge Health — OpenPit32</PageTitle>
 
 <div class="d-flex justify-content-between align-items-center mb-3">
-    <h3 class="mb-0">Bridge Health <span class="text-muted small">grill sidecar · 127.0.0.1:8091</span></h3>
+    <h3 class="mb-0">Bridge Health <span class="text-muted small">grill's ESP32</span></h3>
     <div>
         <a class="btn btn-outline-secondary btn-sm" href="@Rpc.HealthUrl" target="_blank" rel="noopener">raw /health ↗</a>
         <a class="btn btn-outline-secondary btn-sm ms-1" href="/">Back</a>
@@ -17,8 +17,8 @@
         @if (health is null)
         {
             <p class="text-danger mb-0">
-                Sidecar unreachable — start
-                <code>.venv312\Scripts\python.exe scripts\grill_sidecar.py</code>.
+                Can't reach the grill's ESP32 — for local (non-Docker) dev, check
+                <code>GRILL_HOST</code> in <code>Program.cs</code> matches its LAN IP.
             </p>
         }
         else

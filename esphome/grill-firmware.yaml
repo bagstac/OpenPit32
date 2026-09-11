@@ -1,43 +1,54 @@
-# Phase 1 (docs/ESP32_FIRMWARE_PLAN.md): the grill talks Mongoose OS RPC
-# directly to THIS ESP32 — no PC-side sidecar, no generic bluetooth_proxy
-# hop. Deliberately a separate file from esphome/grill-proxy.yaml, not an
-# edit to it: that one keeps working as an instant rollback (reflash it)
-# until this firmware has proven itself on the bench, per the plan's
-# rollout notes. Do not point this at the grill's real ESP32 without
-# reading that plan first — same hardware notes apply (BOOT/EN dance for
-# the first USB flash, OTA after).
+# The grill's production firmware (docs/ESP32_FIRMWARE_PLAN.md): the grill
+# talks Mongoose OS RPC directly to THIS ESP32 — 100% of BLE, command
+# dispatch, alarm evaluation, and Telegram alerting live here, no PC-side
+# process in between at all as of Phase 8. Earlier phases went through
+# esphome/grill-proxy.yaml (a pure BLE-radio bluetooth_proxy a Python
+# sidecar drove remotely) as an instant-rollback fallback while this was
+# being proven out; that file and the sidecar it required are both retired
+# now — see git history if you ever need either back.
 #
-# Phase 1 proved the BLE transport (connect, discover, notify, unauth'd
-# RPC.Ping). Phase 2 added the auth codec and authenticated PB.GetState.
-# Phase 3 decoded the sc_11/sc_12 (FE0B/FE0C) frames into internal state.
-# Phase 4 serves that state over /health, /state, /info — the pitboss_grill
-# component registers those routes on the web_server_base httpd instance it
-# auto-loads, no separate `web_server_base:`/`web_server:` block needed here.
-# Phase 5 adds POST /command: turn-on/turn-off/set-temperature, behind the
-# same confirm semantics grill_sidecar.py's bridge.command() enforces today.
-# Phase 6 adds the alarm monitor loop (GET/POST /alarms, DELETE
-# /alarms/{id}) and Telegram notify() — same temp-target/timer semantics as
-# today's scripts/alarms.py. Needs real wall-clock time (a timer alarm's
-# fires_at has to be a real Unix timestamp GrillDetail.razor can count down
-# from), hence the `time:` block below — pitboss_grill picks it up
-# automatically via cv.use_id (same pattern as `web_server_base`, which
-# needs no explicit block since it's auto_load'd with an empty/default
-# config; `http_request:` for the Telegram POST works the same way).
-# Phase 7 (this revision) adds POST /setup — the same one-time Pit Boss
-# cloud login scripts/pitboss_cloud.py does, now run from the ESP32 itself —
-# and NVS persistence for the password it fetches, the alarms list, and the
-# Telegram bot token/chat id (POST /config), so none of that resets on a
-# reboot/reflash anymore. grill_password below is now only the *initial*
-# fallback (NVS wins once POST /setup has run once) — it may be dropped from
-# secrets.yaml entirely for a fresh device that will be set up through the
-# web app's "Fetch grill password" dialog instead. telegram_bot_token/
-# telegram_chat_id are the same story: still settable here for bench
-# convenience, but POST /config (not yet wired to any web-app UI — curl it
-# directly for now) can set/change them without a reflash too.
+# First flash over USB (later ones go OTA once it's on WiFi — `esphome run`
+# picks that automatically): this exact hardware (classic ESP32-D0WD-V3 dev
+# board, CP2102 USB-UART, 4 MB flash) doesn't enter download mode via its
+# auto-reset circuit by itself — hold BOOT, tap EN, release BOOT, then:
+#   .venv\Scripts\esphome compile esphome\grill-firmware.yaml
+#   .venv\Scripts\python -m esptool --port COM4 --before no-reset --baud 460800 \
+#       write-flash 0x0 esphome\.esphome\build\grill-firmware\.pioenvs\grill-firmware\firmware.factory.bin
+# (An ESP32-C3 was tried first for the original proxy role; it had a WiFi
+# hardware fault. For a C3 use board: esp32-c3-devkitm-1 below — the rest of
+# this file is unchanged.) Secrets live in esphome/secrets.yaml (never
+# committed, never printed).
+#
+# Phase-by-phase history (all bench-verified against the real grill; full
+# detail in docs/ESP32_FIRMWARE_PLAN.md): Phase 1 proved the BLE transport
+# (connect, discover, notify, unauth'd RPC.Ping). Phase 2 added the auth
+# codec and authenticated PB.GetState. Phase 3 decoded the sc_11/sc_12
+# (FE0B/FE0C) frames into internal state. Phase 4 served that state over
+# /health, /state, /info — the pitboss_grill component registers those
+# routes on the web_server_base httpd instance it auto-loads, no separate
+# `web_server_base:`/`web_server:` block needed here. Phase 5 added POST
+# /command: turn-on/turn-off/set-temperature, behind a confirm-required
+# safety gate. Phase 6 added the alarm monitor loop (GET/POST /alarms,
+# DELETE /alarms/{id}) and Telegram notify() for temp-target/timer alarms.
+# Needs real wall-clock time (a timer alarm's fires_at has to be a real Unix
+# timestamp GrillDetail.razor can count down from), hence the `time:` block
+# below — pitboss_grill picks it up automatically via cv.use_id (same
+# pattern as `web_server_base`, which needs no explicit block since it's
+# auto_load'd with an empty/default config; `http_request:` for the
+# Telegram POST works the same way). Phase 7 added POST /setup — a one-time
+# Pit Boss cloud login run from the ESP32 itself — and NVS persistence for
+# the password it fetches, the alarms list, and the Telegram bot token/chat
+# id (POST /config), so none of that resets on a reboot/reflash. Phase 8
+# retired the Python sidecar entirely, replacing it with a small login-only
+# service (scripts/login_service.py) for Docker deployments — see
+# docker/README.md. grill_password/telegram_bot_token/telegram_chat_id
+# below are now only the *initial* fallback (NVS wins once POST /setup /
+# POST /config have run once) — safe to drop from secrets.yaml entirely for
+# a fresh device set up purely through the web app.
 
 esphome:
   name: grill-firmware
-  friendly_name: Grill Firmware (dev)
+  friendly_name: Grill Firmware
 
 esp32:
   board: esp32dev

@@ -3,7 +3,10 @@ using System.Text.Json;
 
 namespace OpenPit32.Services;
 
-/// <summary>Decoded grill state served by scripts/grill_sidecar.py (/state).</summary>
+/// <summary>Decoded grill state, served by GET /state — the ESP32 directly
+/// as of Phase 4 (docs/ESP32_FIRMWARE_PLAN.md); type names here keep the
+/// "Sidecar" prefix from when scripts/grill_sidecar.py served this same
+/// shape, since every Razor page already references them.</summary>
 public class SidecarState
 {
     public bool moduleIsOn { get; set; }
@@ -78,13 +81,6 @@ public class SidecarConfigResponse
     public int? error_display_threshold { get; set; }
 }
 
-public class SidecarModelsResponse
-{
-    public string? control_board { get; set; }
-    public List<string> models { get; set; } = new();
-    public string? @default { get; set; }
-}
-
 public class SidecarCommandResponse
 {
     public bool ok { get; set; }
@@ -112,9 +108,10 @@ public class SidecarSetupResponse
     public bool connected { get; set; }
 }
 
-/// <summary>An alarm as stored by scripts/alarms.py — either a "temp" alarm
-/// (sensor/comparison/target set) or a "timer" alarm (duration_seconds/fires_at
-/// set). Dropped from the list server-side once it fires.</summary>
+/// <summary>An alarm as stored by the grill's ESP32 (pitboss_grill.cpp,
+/// NVS-persisted) — either a "temp" alarm (sensor/comparison/target set) or
+/// a "timer" alarm (duration_seconds/fires_at set). Dropped from the list
+/// server-side once it fires; delivered via Telegram, not browser push.</summary>
 public class AlarmDto
 {
     public string id { get; set; } = "";
@@ -141,17 +138,15 @@ public class AlarmResponse
     public AlarmDto? alarm { get; set; }
 }
 
-public class VapidKeyResponse
-{
-    public string publicKey { get; set; } = "";
-}
-
 /// <summary>
-/// Thin client for the local grill sidecar (http://127.0.0.1:8091), which
-/// holds the Bluetooth session and the grill password. This app never sees
-/// the password; the only cloud interaction is <see cref="SetupAsync"/>, a
-/// one-time fetch of that password from the user's Pit Boss account, and the
-/// account credentials are passed straight through to the sidecar.
+/// Thin client for the grill bridge — as of Phase 8 (docs/ESP32_FIRMWARE_PLAN.md),
+/// the grill's own ESP32 for every grill/alarm route, and a small login-only
+/// process for /login, /logout, /auth-check (both same-origin behind nginx,
+/// hence one shared HttpClient/base address — see docker/nginx.conf.template).
+/// This app never sees the grill password; the only cloud interaction is
+/// <see cref="SetupAsync"/>, a one-time fetch of that password from the
+/// user's Pit Boss account, sent straight through to the ESP32's own
+/// POST /setup, which persists it to its own flash.
 /// </summary>
 public class GrillRpcService
 {
@@ -168,16 +163,13 @@ public class GrillRpcService
     public Task<SidecarHealthResponse?> GetHealthAsync() =>
         _http.GetFromJsonAsync<SidecarHealthResponse>("health");
 
-    /// <summary>Null while the sidecar is not set up (it answers 404).</summary>
+    /// <summary>Null while the grill isn't configured yet (it answers 404).</summary>
     public async Task<SidecarInfoResponse?> GetInfoAsync()
     {
         var resp = await _http.GetAsync("info");
         if (!resp.IsSuccessStatusCode) return null;
         return await resp.Content.ReadFromJsonAsync<SidecarInfoResponse>();
     }
-
-    public Task<SidecarModelsResponse?> GetModelsAsync() =>
-        _http.GetFromJsonAsync<SidecarModelsResponse>("models");
 
     public async Task<SidecarCommandResponse> SendCommandAsync(
         string action, double? value = null, int? probe = null, bool confirm = false)
@@ -189,14 +181,14 @@ public class GrillRpcService
 
         var resp = await _http.PostAsJsonAsync("command", body);
         return await resp.Content.ReadFromJsonAsync<SidecarCommandResponse>()
-               ?? new SidecarCommandResponse { ok = false, error = "Empty reply from sidecar" };
+               ?? new SidecarCommandResponse { ok = false, error = "Empty reply from the grill" };
     }
 
     /// <summary>
     /// ESP32-only setting (POST /config): how many consecutive PB.GetState
     /// rejections are required before GrillDetail.razor shows a link-problem
     /// warning, instead of flashing one on the first, usually self-healing,
-    /// occurrence. No-op against the sidecar (no such route there).
+    /// occurrence.
     /// </summary>
     public async Task<SidecarConfigResponse> SetErrorDisplayThresholdAsync(int threshold)
     {
@@ -206,11 +198,16 @@ public class GrillRpcService
     }
 
     /// <summary>
-    /// Ask the sidecar to fetch the grill password from the Pit Boss account.
-    /// A 409 reply carries <c>grills</c> to choose from; resend with grillId.
+    /// Ask the ESP32 to fetch the grill password from the Pit Boss account
+    /// (POST /setup). A 409-shaped reply (still HTTP 200 on this backend —
+    /// see pitboss_grill.cpp's handle_setup_()) carries <c>grills</c> to
+    /// choose from; resend with grillId. No "model" to send: the ESP32
+    /// always reports the model it was compiled/configured for regardless
+    /// of what's sent (see that handler's comment) — this project only ever
+    /// targets the one grill it's flashed for.
     /// </summary>
     public async Task<SidecarSetupResponse> SetupAsync(
-        string email, string password, string country, string? model, int? grillId)
+        string email, string password, string country, int? grillId)
     {
         var body = new Dictionary<string, object?>
         {
@@ -218,15 +215,15 @@ public class GrillRpcService
             ["password"] = password,
             ["country"] = country,
         };
-        if (!string.IsNullOrWhiteSpace(model)) body["model"] = model;
         if (grillId is not null) body["grill_id"] = grillId;
 
         var resp = await _http.PostAsJsonAsync("setup", body);
         return await resp.Content.ReadFromJsonAsync<SidecarSetupResponse>()
-               ?? new SidecarSetupResponse { ok = false, error = "Empty reply from sidecar" };
+               ?? new SidecarSetupResponse { ok = false, error = "Empty reply from the grill" };
     }
 
-    // ---- Alarms & push (scripts/alarms.py) ----
+    // ---- Alarms (ESP32-native as of Phase 6/7; Telegram-delivered, no
+    // browser push/VAPID subscription involved at all) ----
 
     public Task<AlarmsResponse?> GetAlarmsAsync() =>
         _http.GetFromJsonAsync<AlarmsResponse>("alarms");
@@ -260,23 +257,9 @@ public class GrillRpcService
     {
         var resp = await _http.PostAsJsonAsync("alarms", body);
         return await resp.Content.ReadFromJsonAsync<AlarmResponse>()
-               ?? new AlarmResponse { ok = false, error = "Empty reply from sidecar" };
+               ?? new AlarmResponse { ok = false, error = "Empty reply from the grill" };
     }
 
     public async Task<bool> DeleteAlarmAsync(string id) =>
         (await _http.DeleteAsync($"alarms/{Uri.EscapeDataString(id)}")).IsSuccessStatusCode;
-
-    /// <summary>Null if the sidecar is unreachable (no key yet to subscribe with).</summary>
-    public async Task<string?> GetVapidPublicKeyAsync()
-    {
-        var resp = await _http.GetFromJsonAsync<VapidKeyResponse>("push/vapid-public-key");
-        return resp?.publicKey;
-    }
-
-    /// <summary>Registers a browser's PushSubscription.toJSON() with the sidecar.</summary>
-    public async Task<bool> SubscribePushAsync(JsonElement subscription) =>
-        (await _http.PostAsJsonAsync("push/subscribe", subscription)).IsSuccessStatusCode;
-
-    public async Task<bool> UnsubscribePushAsync(string endpoint) =>
-        (await _http.PostAsJsonAsync("push/unsubscribe", new { endpoint })).IsSuccessStatusCode;
 }

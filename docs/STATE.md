@@ -1,188 +1,177 @@
 # OpenPit32 — Session Handoff / Current State
 
-Read this first, then PLAN.md (history) and PROTOCOL.md (protocol facts).
-The README at the repo root is the user-facing setup guide.
+Read this first. `docs/ESP32_FIRMWARE_PLAN.md` has the full phase-by-phase
+history of how this got here (each phase's real hardware verification, every
+bug found and fixed along the way) and `docs/PROTOCOL.md` has the protocol
+facts. `docs/PLAN.md` is the *original* sidecar-architecture planning doc —
+left as historical record, not current state; everything it planned has
+since been superseded by the ESP32 migration below. The README at the repo
+root is the user-facing setup guide.
 
-Updated 2026-09-07: BLE via the ESP32 proxy is the only grill transport. The
-cloud-relay transport, the account login UI and all reverse-engineering
-artifacts were removed (2026-09-05 publish prep). The Pit Boss cloud is
-touched exactly once, by the "Pit Boss account" dialog / `scripts/pitboss_cloud.py`,
-to fetch the grill's Bluetooth password.
-
-Since publish prep, three more things landed: the app is an installable PWA
-(manifest + service worker, flame-and-ripples icon set); a Docker deployment
-(`docker-compose.yml`, `docker/`) runs it as two containers behind nginx,
-single-origin (`/api/` reverse-proxied to the sidecar); and that Docker
-deployment gates itself with a real login form + signed session cookie
-(`scripts/grill_sidecar.py`'s `/login`, `/logout`, `/auth-check`), not a
-browser Basic Auth popup, so a password manager can fill it. One such
-deployment is exposed at `openpit32.codingattempts.com` via a Cloudflare
-Tunnel running on a second host, config-file style (not the Zero Trust
-dashboard), sharing a tunnel with an unrelated hostname — see
-`docker/README.md` for the auth/tunnel setup and `docker/nginx.conf`'s
-comments for the reverse-proxy details (notably: nginx's own `$scheme` is
-always `http` since it never terminates TLS itself, so the login-redirect
-Location header has to derive the external scheme from
-`X-Forwarded-Proto` via a `map`, not `$scheme`, or it wrongly redirects an
-HTTPS tunnel visitor to `http://`).
+**Updated 2026-09-10 (Phase 8 complete): the Python sidecar is gone.** The
+grill's own ESP32 (`esphome/grill-firmware.yaml`) now owns 100% of BLE,
+command dispatch, alarm evaluation, and Telegram alerting directly — no
+PC-side Bluetooth process, no `bluetooth_proxy`, no `pytboss`/`bleak`/
+`habluetooth`/`aioesphomeapi` dependency at all anymore. What's left on the
+Python side is `scripts/login_service.py`, ~150 lines that do nothing but
+the session-cookie login Docker deployments gate behind (`/login`,
+`/logout`, `/auth-check`) — unused entirely for a bare-metal/local-dev run,
+since there's no login gate without nginx in front.
 
 ## TL;DR status
-- Web client controls the grill over BLE through an ESP32 ESPHome
-  `bluetooth_proxy`: live temps (pushed, <1 s old), set temperature, power
-  (two-step confirm), prime; light hidden on models without one.
+- Web client (Blazor WASM) talks to the grill's ESP32 directly over plain
+  HTTP/JSON — `GET/POST` `/health`, `/state`, `/info`, `/config`,
+  `/command`, `/alarms` (+`DELETE /alarms/{id}`), `/setup`. Live temps
+  pushed by the grill's own debug-log channel (<1 s old), set temperature,
+  power (two-step confirm), no light/prime on this grill (PBV5 P2 has
+  neither).
 - Alarms card on the grill page: a temp-target alarm (any sensor, ≥/≤) or a
-  countdown timer, delivered as a Web Push (VAPID) notification — fires even
-  with the tab closed, as long as the sidecar keeps running. Backend is
-  `scripts/alarms.py` (`AlarmStore`, monitor loop polled from `main()`
-  alongside the grill bridge); key pair + alarms + subscriptions persist next
-  to `.grill_env`. Browser side: `wwwroot/js/push.js` (subscribe/permission)
-  + `wwwroot/push-worker.js` (shared `push`/`notificationclick` handling,
-  imported by both service workers).
+  countdown timer, delivered as a **Telegram message** — fires even with no
+  browser open at all, anywhere, independent of any device/subscription
+  state (no VAPID, no service-worker push, that whole approach was dropped
+  — see the plan's decision #3). Evaluated by the ESP32 itself on a 5 s
+  timer; alarms persist across a reboot/reflash (NVS).
 - Works with the controller switched off (mains only) — remote power-on
   from cold verified. Needs the ESP32 powered within a few metres of the
   controller with a usable BLE RSSI (> -80 dBm comfortable, < -85 flaky).
 - Test unit: model PBV5 P2, control board PBV2, ESP-IDF firmware 16.8.8
-  (idf v5.5.1, app pbz_firmware). The grill's BLE address is random and
-  rotates — match by the advertised name (= board id `PBV2-…`).
+  (idf v5.5.1, app pbz_firmware), 3 meat probes, no light. The grill's BLE
+  address is random and rotates — the ESP32 matches by advertised name
+  prefix (`PBV2-`).
 
-## Services to run (2 processes, bare-metal)
-1. Sidecar: `.\.venv312\Scripts\python.exe scripts\grill_sidecar.py`
-   → http://127.0.0.1:8091 (GET /health /state /info /models /probe-targets,
-   POST /command, POST /setup; plus /login /logout /auth-check, only
-   meaningful when AUTH_USERNAME/AUTH_PASSWORD are set — see below). Reads
-   scripts/.grill_env (SECRET — never print/read it into chat):
-   GRILL_PROXY_HOST/KEY required; GRILL_BOARD_ID / GRILL_PASSWORD /
-   GRILL_MODEL filled in by /setup. Starts fine without them
-   (`configured: false`).
-2. Web app: `dotnet run --project OpenPit32\OpenPit32.csproj --urls http://localhost:5219`
-3. Open http://localhost:5219. First run: "Fetch grill password" → the dialog
-   posts the Pit Boss account email/password to the sidecar's /setup, which
-   logs in once, saves board id + password + model to .grill_env and
-   connects. Afterwards the Home card → /grill (status + controls),
-   /health (link diagnostics).
+## Services to run (bare-metal, 1 process)
+1. Flash `esphome/grill-firmware.yaml` to the ESP32 (see its own top
+   comment for the USB BOOT/EN dance; OTA after that). `esphome/secrets.yaml`
+   needs `wifi_ssid`/`wifi_password`/`api_key`/`ota_password` at minimum;
+   `grill_password`/`telegram_bot_token`/`telegram_chat_id` are optional
+   now (POST /setup / POST /config can set them at runtime instead, and NVS
+   persists whichever wins — see the plan's Phase 7 writeup).
+2. Web app: edit `GRILL_HOST` in `OpenPit32/Program.cs` to the ESP32's LAN
+   IP (no reverse proxy in local dev, so the app talks to it directly —
+   there's no login gate here either, that's Docker/nginx-only), then
+   `dotnet run --project OpenPit32\OpenPit32.csproj --urls http://localhost:5219`.
+3. Open http://localhost:5219. First run: **Fetch grill password** → the
+   dialog posts the Pit Boss account email/password straight to the ESP32's
+   own `POST /setup`, which logs in once, saves the password to its own
+   flash (NVS), and forgets the account login. Nothing is stored in the
+   browser or on the PC. Afterwards the Home card → `/grill` (status +
+   controls), `/health` (link diagnostics).
 
-Alternative: `docker compose up -d --build` runs both as containers behind
-nginx on one host (docker/README.md) — same sidecar, same API, plus the
-login gate. `OpenPit32/Program.cs` picks the sidecar base URL at compile
-time via the `DOCKER_DEPLOY` constant (`docker/web.Dockerfile` sets it),
-not at runtime, after two runtime-detection approaches both proved
-unreliable (see PLAN.md history if resurrecting this).
+Alternative: `docker compose up -d --build` runs the web app + a small
+login-only auth service as two containers behind nginx on one host
+(`docker/README.md`) — nginx fans `/api/*` out to the ESP32 directly for
+every grill/alarm route, and to the auth container only for
+`/login`/`/logout`/`/auth-check`. `OpenPit32/Program.cs` picks the API base
+URL at compile time via the `DOCKER_DEPLOY` constant (`docker/web.Dockerfile`
+sets it), not at runtime, after two runtime-detection approaches both
+proved unreliable (see `docs/PLAN.md` history if resurrecting this).
 
 ## Architecture
-OpenPit32 (Blazor WASM) → GrillRpcService (typed HttpClient) → sidecar
-(aiohttp) → pytboss `PitBoss(BleConnection)` → habluetooth / bleak-esphome →
-ESPHome native API (TCP 6053, noise-encrypted) → ESP32 `bluetooth_proxy` →
-grill GATT (Mongoose OS RPC service).
-- The ESPHome API link reconnects on its own (aioesphomeapi ReconnectLogic).
-- The grill GATT link does not: `GrillBridge._ble_keepalive` rescans and
-  calls `BleConnection.reset_device()` with 2→60 s backoff, woken early by
-  the disconnect callback.
-- `GrillBridge.configure()` (re)creates the PitBoss session; it starts with
-  `BleConnection(None)` so the spec loads before the grill is heard.
-- State arrives as `<==PB:` debug-log notifications (push); the 10 s poll is
-  a backup. Never replace a good cache with an empty decode (the firmware
-  blanks its frames right after a command).
-- `esphome_ble.TelemetryProxyManager` subscribes to the ESP32's own
-  wifi_signal / uptime sensors for /health.
+```
+OpenPit32 (Blazor WASM) → GrillRpcService (typed HttpClient)
+    │ /health /state /info /config /command /alarms /setup
+    ▼
+grill's ESP32 (esphome/grill-firmware.yaml, pitboss_grill component)
+    │ native BLE central, Mongoose OS RPC-over-GATT
+    ▼
+grill controller (Mongoose OS on ESP32, GATT)
+```
+Plus, only when deployed via Docker (nginx in front, gating `/login`,
+`/logout`, `/auth-check` and nothing else): `scripts/login_service.py`, a
+signed-session-cookie login form, holding no grill state of any kind.
 
-## Verified 2026-09-05 at the grill
-- proxy_scan: grill at -63 dBm; ble_probe --proxy: GATT connect, RPC.Ping,
-  Sys.GetInfo; authenticated calls (probe targets, firmware) OK.
-- Controller OFF: BLE still answers. power_on from cold ignited the grill;
-  set_temp 225/230 took; power_off worked.
-- ESP32 USB pull → /health proxy_connected false → recovered, no restart.
-- Spurious `Unauthorized`: the password key is derived from uptime in 10 s
-  buckets and the firmware accepts current-or-next only; slow BLE writes can
-  land a bucket late. Sidecar retries commands / get_state once after 1 s
-  and does not surface it from the post-command refresh.
-- Readings at the test spot: WiFi -58…-63 dBm (fine); BLE varied -62…-87
-  between reconnects — placement facing the controller matters.
-
-## Verified 2026-09-07: alarms + push, deployed to the Pi
-- Deployed the alarms feature (feature/grill-alarms) to the standing Docker
-  host at `bsbagley@192.168.1.172` (`~/openpit32`, `docker compose up -d
-  --build`) for real-device testing before merging, per the Docker
-  deployment flow in docker/README.md.
-- End to end on a real phone (Android Chrome, over the Cloudflare Tunnel
-  domain — plain-HTTP LAN access is not a secure context and push silently
-  cannot work there): Enable Notifications subscribed against a real
-  `fcm.googleapis.com` endpoint; a 60 s test timer alarm fired and cleared
-  itself on schedule; the sidecar logged no push-delivery errors.
-- Found and fixed two bugs during this pass — see Gotchas #8 and #9 below.
+- State arrives as `<==PB:` debug-log notifications (push, sub-second),
+  decoded the same way as the authenticated 15 s `PB.GetState` poll that
+  backs it up — never replaces a good cache with an empty decode (the
+  firmware blanks its own frames right after a command).
+- The BLE link auto-reconnects (`set_auto_connect(true)`); a disconnect
+  clears in-flight RPC state so the next cycle recovers cleanly rather than
+  wedging (`gattc_event_handler()`'s `ESP_GATTC_DISCONNECT_EVT` case).
+- `pitboss_grill.cpp` is a from-scratch C++ port of `pytboss`'s protocol
+  knowledge (auth codec, RPC framing, per-board frame decode) — not a
+  wrapper around the Python library, which is gone from the runtime
+  entirely. Credit belongs to `pytboss` regardless; see README.md.
 
 ## Gotchas (do not relearn)
 1. Blazor timer polls don't re-render on their own: end timer-driven
-   methods with an explicit StateHasChanged().
-2. habluetooth outside Home Assistant: the bare BluetoothManager's
-   `_discover_service_info` is a no-op (the startup WARNING is harmless),
-   so `bleak.BleakScanner` callbacks / find_device_by_filter never fire.
-   Discover via `manager.async_discovered_service_info(True)` →
-   `info.device` (esphome_ble.find_grill). open_proxy must also re-point
-   `pytboss.ble.BleakClient*` at habluetooth's patched classes.
-3. The pytboss `_on_disconnected` callback runs synchronously inside bleak:
-   only flag + wake the keepalive there, never await.
-4. The grill stops advertising while connected, so the proxy-side BLE RSSI
-   only refreshes between connections; proxy_scan.py must run with the
-   sidecar stopped.
-5. bleak-esphome 4.1.0 private hooks (`_on_connect`, `_cli`) are used for
-   telemetry — re-check when bumping it.
-6. ESP32 hardware notes: an ESP32-C3 tried first had a WiFi fault; the
-   classic ESP32-D0WD-V3 dev board is the proxy. Its auto-reset does not
-   enter download mode: hold BOOT, tap EN, release BOOT, flash with
-   `--before no-reset`; OTA thereafter. mDNS (`grill-proxy.local`) does not
-   resolve from Windows — use the IP.
-7. Secrets: scripts/.grill_env and esphome/secrets.yaml are git-ignored;
-   never print them. The sidecar never logs the grill or account password.
-8. PWA service worker updates: without `skipWaiting()` (on install) and
+   methods with an explicit `StateHasChanged()`.
+2. ESP32 hardware notes: an ESP32-C3 tried first had a WiFi fault; the
+   classic ESP32-D0WD-V3 dev board is what's deployed. Its auto-reset does
+   not enter download mode: hold BOOT, tap EN, release BOOT, flash with
+   `--before no-reset` (full command in `grill-firmware.yaml`'s header);
+   OTA thereafter. mDNS (`grill-firmware.local`) does not reliably resolve
+   from Windows — use the IP.
+3. Secrets: `esphome/secrets.yaml` is git-ignored; never print it. The
+   grill/account passwords are never logged (ESP32 side: `handle_setup_()`
+   clears local password copies as soon as they're used; Python side:
+   `login_service.py` never touches a grill password at all anymore).
+4. PWA service worker updates: without `skipWaiting()` (on install) and
    `clients.claim()` (on activate), a browser that already has this app's
    service worker keeps serving the OLD cached shell after a redeploy until
    every open tab/PWA window is fully closed — Blazor fingerprints framework
    files per publish, so the stale shell fetches files that no longer exist
    and the app looks like it's simply broken (seen in Chrome on Android
    right after a rebuild; Vivaldi worked because it had never cached this
-   origin before). Both service workers now call both, so a redeploy takes
-   over immediately instead of requiring a manual "clear site data".
-9. `Notification.permission == "granted"` is not the same as "a working
-   PushSubscription exists" — clearing site storage (gotcha #8's fix) or a
-   sidecar volume reset can drop the subscription while the OS-level
-   permission stays granted. GrillDetail.razor tracks `pushSubscribed`
-   separately (confirmed by the sidecar accepting POST /push/subscribe) so
-   the Alarms card always offers a way back in instead of silently hiding
-   the button with the permission already granted.
+   origin before). Both service workers call both, so a redeploy takes over
+   immediately instead of requiring a manual "clear site data".
+5. **NVS writes must never happen directly on the ESP32's httpd request
+   task** — confirmed live 2026-09-10: `POST /alarms` calling
+   `nvs_set_str()`/`nvs_commit()` inline stack-overflowed the ESP-IDF
+   httpd task (small, ~4KB default stack, not configurable from YAML) and
+   crash-looped the device (it self-recovered each time, no physical
+   power-cycle needed — different from an earlier Phase 4 failure mode).
+   Every REST handler that persists something now defers the actual flash
+   write to the main loop task instead (`nvs_save_string_deferred_()` /
+   `save_alarms_locked_()`'s "call from the main loop only" contract) — see
+   the Phase 7 writeup in `docs/ESP32_FIRMWARE_PLAN.md` for the full
+   root-cause/fix writeup before touching that code again.
+6. The Docker `auth` container's persisted session-signing secret
+   (`AUTH_SECRET_PATH`, default `/data/.auth_secret`) deliberately uses the
+   *same* path inside the *same* `grill-data` volume the old `sidecar`
+   container used for the identical file — changing either would silently
+   invalidate every existing login session on the next deploy. Keep them in
+   sync if either ever moves.
 
 ## Files map
-- scripts/: grill_sidecar.py (bridge + HTTP API, incl. the login/session
-  routes and the alarms/push routes), alarms.py (AlarmStore: temp/timer
-  alarms, VAPID keys, Web Push delivery, the monitor loop), esphome_ble.py
-  (proxy helper), pitboss_cloud.py (one-time password fetch; CLI + used by
-  /setup), proxy_scan.py (what the ESP32 hears), ble_probe.py (RPC smoke
-  test), ble_scan.py (PC adapter scan), .grill_env.example.
-- esphome/: grill-proxy.yaml, secrets.yaml.example.
-- OpenPit32/: Pages (Home, GrillDetail `/grill` incl. the Alarms card,
+- `scripts/login_service.py` — the entire Python surface now: login form +
+  session cookie + nginx's `/auth-check` target. No grill/BLE code of any
+  kind.
+- `esphome/grill-firmware.yaml`, `esphome/components/pitboss_grill/`
+  (`__init__.py`, `pitboss_grill.h`/`.cpp`) — the grill firmware itself;
+  owns everything grill-related. `esphome/secrets.yaml.example`.
+- `OpenPit32/`: Pages (Home, GrillDetail `/grill` incl. the Alarms card,
   BridgeHealth `/health`), Layout (MainLayout, NavMenu, SetupDialog),
-  Services/GrillRpcService.cs, Services/IncludeCredentialsHandler.cs (makes
-  WASM's HttpClient send the session cookie on background /api/ calls —
-  top-level nav does this on its own, background fetches don't),
-  wwwroot/js/push.js (push subscribe JS interop), wwwroot/push-worker.js
-  (shared `push`/`notificationclick` handling, imported by both service
-  workers).
-- docker/: nginx.conf (single-origin reverse proxy + auth gate),
-  web.Dockerfile, sidecar.Dockerfile, README.md (deploy + auth setup),
-  .env.example. docker-compose.yml lives at the repo root.
-- docs/: STATE.md (this), PLAN.md (history), PROTOCOL.md.
-- requirements.txt (runtime, .venv312), requirements-esphome.txt (tooling, .venv).
+  `Services/GrillRpcService.cs`, `Services/IncludeCredentialsHandler.cs`
+  (makes WASM's HttpClient send the session cookie on background `/api/`
+  calls, Docker-only — top-level nav does this on its own, background
+  fetches don't; harmless no-op against the ESP32 directly in local dev,
+  which has no cookies to send).
+- `docker/`: `nginx.conf.template` (single-origin reverse proxy: most
+  routes straight to the ESP32, `/login`/`/logout`/`/auth-check` to
+  `auth`), `web.Dockerfile`, `auth.Dockerfile`, `README.md` (deploy + auth
+  setup), `.env.example`. `docker-compose.yml` lives at the repo root.
+- `docs/`: STATE.md (this), `ESP32_FIRMWARE_PLAN.md` (the real history —
+  every phase, every bug found and fixed, all bench-verified against the
+  real grill), `PLAN.md` (superseded original sidecar plan, historical
+  only), `PROTOCOL.md`.
+- `requirements.txt` (runtime, `.venv312` — just `aiohttp` now),
+  `requirements-esphome.txt` (tooling, `.venv`).
 
 ## Ideas / next up
 - A permanent home for the ESP32 (wall USB adapter, case) facing the
   controller panel.
-- Probe-target UI, °F/°C toggle.
-- Alarms card ships one-shot alarms only (no repeat/snooze); could add
-  re-arming after a manual "done" ack if that turns out to matter in use.
-- The grill was powered OFF at the end of the 2026-09-05 session; check
-  `/state` moduleIsOn before assuming anything.
+- Probe-target UI, °F/°C toggle (see the plan's decision #6 on why
+  probe-targets specifically isn't planned — alarms already cover the same
+  need).
+- Alarms ship one-shot only (no repeat/snooze); could add re-arming after a
+  manual "done" ack if that turns out to matter in use.
+- `POST /config`'s `telegram_bot_token`/`telegram_chat_id` fields have no
+  web-app UI yet (curl them directly) — a "Notifications" card mirroring
+  the existing "Link Settings" card (`error_display_threshold`) would be
+  the natural next step, whenever wanted.
 
 ## Resume checklist
-1. Start sidecar + web app; GET http://127.0.0.1:8091/health should show
-   configured + connected + proxy_connected.
-2. Safe tests only: set_temp / prime. NEVER power_on unless the user is
-   ready (it ignites).
+1. `curl http://<esp32-ip>/health` should show `configured: true`,
+   `connected: true`.
+2. Safe tests only: `set_temp` / status reads. NEVER `power_on` unless the
+   user is ready (it ignites a real appliance).

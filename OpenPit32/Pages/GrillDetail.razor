@@ -1,7 +1,5 @@
 @page "/grill"
-@using System.Text.Json
 @inject GrillRpcService Rpc
-@inject IJSRuntime JS
 @implements IAsyncDisposable
 
 <PageTitle>Grill — OpenPit32</PageTitle>
@@ -13,7 +11,8 @@
 else if (health is null)
 {
     <div class="alert alert-warning">
-        Grill bridge unreachable — start <code>scripts\grill_sidecar.py</code>.
+        Can't reach the grill's ESP32 — for local (non-Docker) dev, check
+        <code>GRILL_HOST</code> in <code>Program.cs</code> matches its LAN IP.
     </div>
     <button class="btn btn-outline-secondary" @onclick="PollSidecar">Retry</button>
     <a class="btn btn-outline-secondary ms-1" href="/">Back</a>
@@ -209,39 +208,6 @@ else
     <div class="card pb-card mt-4">
         <div class="card-header">Alarms</div>
         <div class="card-body">
-            @if (!pushSupported)
-            {
-                <p class="text-muted small mb-3">
-                    This browser can't do push notifications here (no secure context,
-                    or an old browser) — alarms still fire and clear below, but only
-                    while this page is open.
-                </p>
-            }
-            else if (pushSubscribed)
-            {
-                <p class="text-muted small mb-3">✓ Notifications are enabled on this device.</p>
-            }
-            else if (pushPermission == "denied")
-            {
-                <p class="text-muted small mb-3">
-                    Notifications are blocked for this site — allow them in your browser's
-                    site settings, then reload this page.
-                </p>
-            }
-            else
-            {
-                <div class="mb-3">
-                    <button class="btn btn-outline-secondary btn-sm" disabled="@notifBusy"
-                            @onclick="EnableNotifications">
-                        Enable notifications
-                    </button>
-                </div>
-            }
-            @if (!string.IsNullOrEmpty(notifError))
-            {
-                <div class="alert alert-danger py-2">@notifError</div>
-            }
-
             @if (alarms.Count > 0)
             {
                 <ul class="list-group list-group-flush mb-3">
@@ -314,9 +280,9 @@ else
                 </div>
             </div>
             <p class="text-muted small mt-3 mb-0">
-                Alarms are checked and pushed by the grill bridge, so they still fire
-                (as a device notification) if this tab isn't open — as long as the
-                bridge itself keeps running.
+                Alarms are checked by the grill's own ESP32 and delivered via Telegram,
+                so they still fire even if no tab is open at all — independent of this
+                browser or device.
             </p>
         </div>
     </div>
@@ -354,47 +320,10 @@ else
     private string? alarmLabel;
     private bool alarmBusy;
 
-    private IJSObjectReference? pushModule;
-    private bool pushSupported;
-    private string pushPermission = "default";
-    // Whether the sidecar currently holds a working subscription for this
-    // device — NOT the same as pushPermission == "granted": permission can
-    // be granted while the underlying PushSubscription is gone (e.g. site
-    // storage was cleared, or the sidecar's own volume was reset), and the
-    // card must still offer a way back in rather than showing nothing.
-    private bool pushSubscribed;
-    private bool notifBusy;
-    private string? notifError;
-
     protected override async Task OnInitializedAsync()
     {
         pollTimer = new System.Threading.Timer(_ => _ = InvokeAsync(PollSidecar),
             null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
-
-        try
-        {
-            pushModule = await JS.InvokeAsync<IJSObjectReference>("import", "./js/push.js");
-            pushSupported = await pushModule.InvokeAsync<bool>("isSupported");
-            if (pushSupported)
-            {
-                pushPermission = await pushModule.InvokeAsync<string>("permission");
-                if (pushPermission == "granted")
-                {
-                    // Best-effort: if the browser already holds a subscription
-                    // (e.g. the sidecar's own copy was lost to a volume reset),
-                    // re-register it instead of silently losing this alarm's alerts.
-                    var existing = await pushModule.InvokeAsync<JsonElement?>("getExistingSubscription");
-                    if (existing is { ValueKind: JsonValueKind.Object } sub)
-                    {
-                        pushSubscribed = await Rpc.SubscribePushAsync(sub);
-                    }
-                }
-            }
-        }
-        catch (JSException)
-        {
-            pushSupported = false;
-        }
     }
 
     private async Task PollSidecar()
@@ -433,41 +362,6 @@ else
         }
         polledOnce = true;
         StateHasChanged();
-    }
-
-    private async Task EnableNotifications()
-    {
-        if (pushModule is null) return;
-        notifBusy = true;
-        notifError = null;
-        try
-        {
-            pushPermission = await pushModule.InvokeAsync<string>("requestPermission");
-            if (pushPermission != "granted")
-            {
-                if (pushPermission == "denied")
-                    notifError = "Notifications are blocked for this site.";
-                return;
-            }
-            var vapidKey = await Rpc.GetVapidPublicKeyAsync();
-            if (string.IsNullOrEmpty(vapidKey))
-            {
-                notifError = "Could not reach the grill bridge for the push key.";
-                return;
-            }
-            var subscription = await pushModule.InvokeAsync<JsonElement>("subscribe", vapidKey);
-            pushSubscribed = await Rpc.SubscribePushAsync(subscription);
-            if (!pushSubscribed)
-                notifError = "The grill bridge rejected the subscription.";
-        }
-        catch (Exception ex)
-        {
-            notifError = "Enabling notifications failed: " + ex.Message;
-        }
-        finally
-        {
-            notifBusy = false;
-        }
     }
 
     private async Task AddAlarm()
@@ -705,14 +599,10 @@ else
             ? v.ToString()
             : fw.ToString();
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         pollTimer?.Dispose();
         confirmTimer?.Dispose();
-        if (pushModule is not null)
-        {
-            try { await pushModule.DisposeAsync(); }
-            catch (JSDisconnectedException) { /* page is already unloading */ }
-        }
+        return ValueTask.CompletedTask;
     }
 }

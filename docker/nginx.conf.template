@@ -1,34 +1,34 @@
 # Serves the published Blazor WebAssembly SPA and reverse-proxies API
 # traffic under /api/, so the whole app is one origin — needed for a single
-# Cloudflare Tunnel hostname and so one login covers both. As of Phase 4
-# (docs/ESP32_FIRMWARE_PLAN.md) that traffic is split across two backends:
-# the sidecar (scripts/grill_sidecar.py) for what's not yet ported off it,
-# and the grill's own ESP32 (esphome/grill-firmware.yaml) for everything
-# Phases 4-7 have proven there — /health, /state, /info, /config, /command,
-# /alarms (including DELETE /alarms/{id}), /setup — same JSON shapes in
-# every case, so OpenPit32/Services/GrillRpcService.cs needs no changes
-# either way. /login, /logout, /auth-check still go to the sidecar (rollout
-# item 8, not done yet), along with /push/*, /models, and /probe-targets
-# (not being ported at all — see the plan's decisions #3 and #6).
-# Client-side routes (/grill, /health) don't exist as files, so unmatched
-# paths fall back to index.html and the Blazor router takes it from there.
+# Cloudflare Tunnel hostname and so one login covers both. As of Phase 8
+# (docs/ESP32_FIRMWARE_PLAN.md, completing what Phase 4 started) that
+# traffic is split across two backends: the grill's own ESP32
+# (esphome/grill-firmware.yaml) for every grill/alarm route — /health,
+# /state, /info, /config, /command, /alarms (including
+# DELETE /alarms/{id}), /setup — same JSON shapes in every case, so
+# OpenPit32/Services/GrillRpcService.cs needs no changes; and a small
+# login-only service (scripts/login_service.py) for /login, /logout,
+# /auth-check, all that's left of the old Python sidecar once its BLE
+# bridge, VAPID push, and grill-model catalog were retired outright (see
+# the plan's decisions #3 and #6, and its "What's removed entirely"
+# section). Client-side routes (/grill, /health) don't exist as files, so
+# unmatched paths fall back to index.html and the Blazor router takes it
+# from there.
 #
 # This file is an envsubst *.template (docker/web.Dockerfile copies it into
 # nginx:alpine's /etc/nginx/templates/, which substitutes ${VAR} before
 # nginx starts) so the GRILL_PROXY_HOST env var only has to be set in one
-# place — the same one docker-compose.yml already passes to the sidecar for
-# this exact board. Everything else below stays plain nginx syntax: bare
-# $variable (no braces) is an nginx runtime variable, but be careful adding
-# more comments here — envsubst substitutes bare $NAME too, for any name
-# that happens to match a real env var, comments included. Only ${...} with
-# braces is intentional in this file.
+# place. Everything else below stays plain nginx syntax: bare $variable (no
+# braces) is an nginx runtime variable, but be careful adding more comments
+# here — envsubst substitutes bare $NAME too, for any name that happens to
+# match a real env var, comments included. Only ${...} with braces is
+# intentional in this file.
 #
-# 127.0.0.11 is Docker Compose's embedded DNS; re-resolving per-request
-# (via the $sidecar variable in proxy_pass) rather than once at nginx
-# startup means this keeps working if the sidecar container is recreated
-# on its own. The grill ESP32 isn't on the compose network — $grill_esp32
-# below is a literal LAN IP substituted in at container start, not
-# something this resolver looks up.
+# 127.0.0.11 is Docker Compose's embedded DNS; re-resolving per-request (via
+# the $auth variable in proxy_pass) rather than once at nginx startup means
+# this keeps working if that container is recreated on its own. The grill
+# ESP32 isn't on the compose network — $grill_esp32 below is a literal LAN
+# IP substituted in at container start, not something this resolver looks up.
 resolver 127.0.0.11 valid=10s;
 
 # nginx's own $scheme is always "http" here — it never terminates TLS
@@ -48,19 +48,20 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
-    set $sidecar http://sidecar:8091;
+    set $auth http://auth:8091;
     set $grill_esp32 http://${GRILL_PROXY_HOST};
 
     # Fixed username/password so the app isn't wide open once it's reachable
     # from the internet (e.g. via a Cloudflare Tunnel) — but as a signed
-    # session cookie from a real login FORM (scripts/grill_sidecar.py's
+    # session cookie from a real login FORM (scripts/login_service.py's
     # /login), not auth_basic's browser-native popup, which most password
     # managers don't offer to fill. auth_request delegates the yes/no
-    # decision to the sidecar's /auth-check on every request; AUTH_USERNAME
-    # / AUTH_PASSWORD (docker/README.md) configure it there, not here.
+    # decision to the auth service's /auth-check on every request;
+    # AUTH_USERNAME / AUTH_PASSWORD (docker/README.md) configure it there,
+    # not here.
     location = /auth-check {
         internal;
-        proxy_pass $sidecar/auth-check;
+        proxy_pass $auth/auth-check;
         proxy_pass_request_body off;
         proxy_set_header Content-Length "";
         proxy_set_header Cookie $http_cookie;
@@ -70,12 +71,12 @@ server {
     # stay outside the auth_request gate below or logging in could never
     # succeed.
     location = /login {
-        proxy_pass $sidecar/login;
+        proxy_pass $auth/login;
         proxy_set_header Host $host;
     }
 
     location = /logout {
-        proxy_pass $sidecar/logout;
+        proxy_pass $auth/logout;
         proxy_set_header Host $host;
     }
 
@@ -89,14 +90,12 @@ server {
         try_files $uri $uri/ /index.html;
     }
 
-    # /health, /state, /info come straight from the grill's ESP32 (Phase 4);
-    # /config is ESP32-only, no sidecar equivalent (added alongside these
-    # 2026-09-10). These `location =` exact matches take precedence over the
-    # /api/ prefix block below regardless of file order, so only what's
-    # listed here (plus /api/command, /api/alarms* and /api/setup right
-    # below) goes to the ESP32 — everything else under /api/ (login/logout/
-    # auth-check above are separate blocks entirely; push, models,
-    # probe-targets) still falls through to the sidecar unchanged.
+    # /health, /state, /info, /config, /command, /alarms(+DELETE), /setup —
+    # every grill/alarm route, all going straight to the ESP32 as of Phase 8.
+    # /login, /logout, /auth-check above are the only other /api-adjacent
+    # routes this app has; there is no longer a generic /api/ catch-all
+    # below them (removed once nothing was left to fall through to it — see
+    # git history if you need the old sidecar-catch-all shape back).
     location = /api/health {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
@@ -169,29 +168,6 @@ server {
         rewrite ^/api/alarms/(.*)$ /alarms/$1 break;
         proxy_pass $grill_esp32;
         proxy_set_header Host $host;
-    }
-
-    location /api/ {
-        auth_request /auth-check;
-        # A session that expires mid-visit surfaces as this redirect's HTML
-        # landing where the app expected JSON — GrillRpcService logs that
-        # and falls back to its normal "bridge not reachable" state rather
-        # than crash, so reloading the page (which redirects the whole page
-        # to /login) is what actually recovers it. Fine given 30-day
-        # sessions make this rare; not worth a separate JSON-401 path here.
-        error_page 401 = @login_redirect;
-
-        # Using a variable in proxy_pass (needed above so nginx re-resolves
-        # "sidecar" per request instead of caching its IP at startup) means
-        # nginx no longer strips the location prefix on its own — do it
-        # explicitly, or every request would arrive at the sidecar as
-        # /api/health instead of /health and 404.
-        rewrite ^/api/(.*)$ /$1 break;
-        proxy_pass $sidecar;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     # nginx:alpine's mime.types already maps .wasm; set it explicitly in
