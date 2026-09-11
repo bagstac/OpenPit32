@@ -688,6 +688,25 @@ capture since disabling it; grill state (`moduleIsOn`, etc.) confirmed
 unaffected by the extensive `power_off` testing this required (idempotent
 by design, as intended).
 
+**Tried and reverted the same day, chasing the still-open drop-rate
+question above**: `ESP_GATT_WRITE_TYPE_NO_RSP` (write-without-response,
+`write_value()`'s default) has no delivery guarantee at any layer — a
+packet silently lost over the air is just gone, with no error on either
+side, which fit the symptom (our own "Sent RPC request" log only ever
+confirmed the *local* controller queued the write, never that the grill
+actually received it). Passing `ESP_GATT_WRITE_TYPE_RSP` explicitly
+instead, to get a real ATT Write Response from the peer before considering
+a chunk sent, seemed like a strictly-more-correct fix. Measured live: it
+made things worse, not better — genuine disconnects
+(`"grill BLE link dropped mid-command"`) started happening that had never
+occurred before, on top of the same reply-timeout rate. Reverted
+immediately. Conclusion: whatever this Mongoose OS GATT server actually
+implements on these two characteristics does not tolerate a real Write
+Request the way it tolerates a Write Command — NO_RSP is the correct
+choice here after all, confirmed the hard way rather than assumed. The
+reply-drop root cause itself remains open; this is a ruled-out theory, not
+a fix, kept here so it isn't tried again from scratch.
+
 ## Decisions made (2026-09-09)
 
 Asked as clarifying questions before writing this plan; answers below shape

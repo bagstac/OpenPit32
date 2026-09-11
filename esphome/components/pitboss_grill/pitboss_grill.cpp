@@ -794,6 +794,20 @@ void PitbossGrill::register_for_notifications_() {
 // PB.GetState's longer body (~7 writes: this call + ~6 chunks) always did.
 // So chunks are paced off each one's own ESP_GATTC_WRITE_CHAR_EVT (see
 // on_rpc_write_complete_()) instead of being fired in a loop.
+//
+// Tried and reverted 2026-09-11: passing ESP_GATT_WRITE_TYPE_RSP instead,
+// on the theory that NO_RSP's lack of any delivery guarantee (no
+// retransmission at any layer — a packet silently lost over the air is
+// just gone, with no error on either side) was why replies kept going
+// missing even with WiFi roaming disabled and the link otherwise proven
+// healthy (the grill's own debug-log pushes never missed a beat through
+// every failure). Made things measurably worse, not better: real
+// disconnects ("grill BLE link dropped mid-command") started happening
+// that never had before. Whatever this Mongoose OS GATT server actually
+// implements on these characteristics, it does not tolerate a real Write
+// Request the way NO_RSP's Write Command apparently is — so NO_RSP is
+// correct here, and the reply-drop root cause is still open (see the
+// 2026-09-11 follow-up in docs/ESP32_FIRMWARE_PLAN.md).
 void PitbossGrill::write_rpc_command_(const std::string &json) {
   if (this->rpc_write_in_progress_) {
     ESP_LOGW(TAG, "Dropping RPC write — a previous one is still draining");
