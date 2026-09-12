@@ -90,10 +90,22 @@ else
                     }
                 </div>
                 <hr />
-                <p class="mb-0 text-muted small">
-                    Fan @OnOff(live.fanState) · Igniter @OnOff(live.hotState)
-                    · Auger @OnOff(live.motorState) · Light @OnOff(live.lightState)
-                    · Prime @OnOff(live.primeState)
+                <div class="row text-center pb-temps">
+                    <div class="col">
+                        <span class="status-icon status-icon-fan@(live.fanState ? " active" : "")" title="Fan @OnOff(live.fanState)"></span>
+                        <div class="text-muted small">Fan</div>
+                    </div>
+                    <div class="col">
+                        <span class="status-icon status-icon-igniter@(live.hotState ? " active" : "")" title="Igniter @OnOff(live.hotState)"></span>
+                        <div class="text-muted small">Igniter</div>
+                    </div>
+                    <div class="col">
+                        <span class="status-icon status-icon-prime@(live.primeState ? " active" : "")" title="Prime @OnOff(live.primeState)"></span>
+                        <div class="text-muted small">Prime</div>
+                    </div>
+                </div>
+                <p class="mb-0 mt-2 text-muted small text-center">
+                    Auger @OnOff(live.motorState) · Light @OnOff(live.lightState)
                     @if (AnyError(live))
                     {
                         <span class="badge text-bg-danger ms-1">Error flags set</span>
