@@ -104,7 +104,7 @@ else
                         <div class="text-muted small">Prime</div>
                     </div>
                     <div class="col">
-                        <div class="pb-big-sm @(live.motorState ? "status-text-active" : "text-muted")">@(live.motorState ? "On" : "Off")</div>
+                        <span class="status-icon status-icon-auger@(live.motorState ? " active" : "")" title="Auger @OnOff(live.motorState)"></span>
                         <div class="text-muted small">Auger</div>
                     </div>
                 </div>
