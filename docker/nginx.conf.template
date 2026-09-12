@@ -90,6 +90,25 @@ server {
         try_files $uri $uri/ /index.html;
     }
 
+    # Belt-and-suspenders alongside index.html's service worker registration
+    # using updateViaCache: 'none' (2026-09-12) — an HTTP-cache-level backup
+    # for the same problem: these two files are the only things that
+    # actually change on a redeploy (service-worker.js itself is a static,
+    # never-changing wrapper; service-worker-assets.js is regenerated with
+    # new content-hashed filenames every publish), so they're exactly what
+    # must never be served stale for a redeploy to actually reach an already-
+    # open tab. nginx:alpine sets no explicit Cache-Control by default, which
+    # already relies entirely on the browser's own (sometimes long) heuristic
+    # freshness for a plain .js file — an explicit no-cache removes that
+    # ambiguity outright rather than trusting every browser's default to get
+    # it right.
+    location ~ ^/(service-worker\.js|service-worker-assets\.js)$ {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        add_header Cache-Control "no-cache" always;
+        try_files $uri =404;
+    }
+
     # /health, /state, /info, /config, /command, /alarms(+DELETE), /setup —
     # every grill/alarm route, all going straight to the ESP32 as of Phase 8.
     # /login, /logout, /auth-check above are the only other /api-adjacent
