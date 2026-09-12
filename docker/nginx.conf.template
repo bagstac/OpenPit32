@@ -92,17 +92,27 @@ server {
 
     # Belt-and-suspenders alongside index.html's service worker registration
     # using updateViaCache: 'none' (2026-09-12) — an HTTP-cache-level backup
-    # for the same problem: these two files are the only things that
-    # actually change on a redeploy (service-worker.js itself is a static,
-    # never-changing wrapper; service-worker-assets.js is regenerated with
-    # new content-hashed filenames every publish), so they're exactly what
-    # must never be served stale for a redeploy to actually reach an already-
-    # open tab. nginx:alpine sets no explicit Cache-Control by default, which
-    # already relies entirely on the browser's own (sometimes long) heuristic
-    # freshness for a plain .js file — an explicit no-cache removes that
-    # ambiguity outright rather than trusting every browser's default to get
-    # it right.
-    location ~ ^/(service-worker\.js|service-worker-assets\.js)$ {
+    # for the same problem, extended to cover a second real incident
+    # (2026-09-12, same day: an added Auger icon reached the container's disk
+    # fine, verified by reading it straight off the deployed filesystem, but
+    # never reached a browser going in over the Cloudflare Tunnel — plain
+    # browser cache-clearing did nothing, because it's Cloudflare's edge, not
+    # the browser, holding the stale copy). Every file listed here shares one
+    # trait: it changes on a redeploy but, unlike _framework/*.wasm and
+    # blazor.webassembly#[.{fingerprint}].js, its filename doesn't change
+    # with it (no content hash baked in) — so neither a browser nor a CDN
+    # sitting in front of it (nginx:alpine sends no explicit Cache-Control
+    # for any of these by default) has any signal that a fetch under the same
+    # URL could ever return something different than last time.
+    #   - service-worker.js / service-worker-assets.js: the mechanism above
+    #     depends on these actually being refetched to work at all.
+    #   - css/app.css, OpenPit32.styles.css: plain stylesheets, referenced by
+    #     stable path from index.html — no fingerprinting in this project's
+    #     build for either.
+    # (lib/bootstrap/dist/css/bootstrap.min.css deliberately isn't included —
+    # it's vendored and never changes between our own deploys, so there's
+    # nothing to invalidate.)
+    location ~ ^/(service-worker\.js|service-worker-assets\.js|css/app\.css|OpenPit32\.styles\.css)$ {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
         add_header Cache-Control "no-cache" always;
