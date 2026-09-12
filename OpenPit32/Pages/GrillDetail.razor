@@ -103,14 +103,17 @@ else
                         <span class="status-icon status-icon-prime@(live.primeState ? " active" : "")" title="Prime @OnOff(live.primeState)"></span>
                         <div class="text-muted small">Prime</div>
                     </div>
+                    <div class="col">
+                        <div class="pb-big-sm @(live.motorState ? "status-text-active" : "text-muted")">@(live.motorState ? "On" : "Off")</div>
+                        <div class="text-muted small">Auger</div>
+                    </div>
                 </div>
-                <p class="mb-0 mt-2 text-muted small text-center">
-                    Auger @OnOff(live.motorState)
-                    @if (AnyError(live))
-                    {
-                        <span class="badge text-bg-danger ms-1">Error flags set</span>
-                    }
-                </p>
+                @if (AnyError(live))
+                {
+                    <p class="mb-0 mt-2 text-center">
+                        <span class="badge text-bg-danger">Error flags set</span>
+                    </p>
+                }
             </div>
         </div>
     }
