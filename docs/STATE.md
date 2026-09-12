@@ -114,6 +114,26 @@ signed-session-cookie login form, holding no grill state of any kind.
    right after a rebuild; Vivaldi worked because it had never cached this
    origin before). Both service workers call both, so a redeploy takes over
    immediately instead of requiring a manual "clear site data".
+
+   **Part two of this, found live 2026-09-12**: `skipWaiting()`/
+   `clients.claim()` only help once the browser actually *notices* there's a
+   new service worker to install — and it wasn't, even across multiple
+   plain refreshes. `service-worker.js` registered with no `updateViaCache`
+   option (default: `'imports'`), which lets `service-worker.published.js`'s
+   `importScripts('./service-worker-assets.js')` — the one file that
+   actually changes on every publish (new content-hashed filenames);
+   `service-worker.js` itself is a static wrapper whose bytes never change —
+   be served from the browser's own HTTP cache during the update check. The
+   browser's required byte-comparison could then see "nothing changed" even
+   though the whole point of that file is that it did, so the
+   skipWaiting()/clients.claim() fix above never even got triggered. Fixed
+   with `register('service-worker.js', { updateViaCache: 'none' })` in
+   `index.html`, plus an explicit `Cache-Control: no-cache` on both service
+   worker files in `docker/nginx.conf.template` as a second layer. Real
+   catch: this fix lives inside the same `index.html` that was itself stuck
+   being served stale, so anyone already wedged by this needs one manual
+   cache-clear to receive the fix that prevents it recurring — that's a
+   one-time cost, not evidence the fix didn't work.
 5. **NVS writes must never happen directly on the ESP32's httpd request
    task** — confirmed live 2026-09-10: `POST /alarms` calling
    `nvs_set_str()`/`nvs_commit()` inline stack-overflowed the ESP-IDF
