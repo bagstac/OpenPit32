@@ -77,3 +77,36 @@ you want one.
   needs no access to the grill at all.
 - `.env` holds the app's login; git-ignored, same as `esphome/secrets.yaml`
   for a bare-metal ESP32 flash.
+
+## Disk space on a small host (e.g. a Raspberry Pi)
+
+Found live 2026-09-13 on the Pi this actually runs on: a run of same-day
+redeploys (each `docker compose up -d --build web` after a code change)
+had quietly filled a 14GB SD card to 83% — not container logs (still under
+a few hundred KB each at the time), but **5.5GB of dead `docker builder`
+cache**, an old layer left behind by every rebuild and never evicted on
+its own. `docker system df` shows the breakdown (`Build Cache` row,
+`RECLAIMABLE` column); `docker builder prune -af` reclaims it immediately
+— safe any time, since it's only cached build layers, never anything a
+running container or the `grill-data` volume depends on (worst case, the
+next build is slower for having to redo that layer).
+
+To stop this recurring silently, a cron job on the host runs that
+automatically:
+
+```
+# crontab -e (as the user docker compose runs under)
+0 4 * * 0 docker builder prune -af --filter "until=168h" >/dev/null 2>&1
+```
+
+Weekly, keeps anything built in the last 7 days (so a same-day rebuild
+still hits a warm cache) and evicts everything older. Set up once by hand
+on the host — this repo has no mechanism to install it for you, and
+`docker-compose.yml` doesn't run on the host outside a container so it
+can't schedule anything on the host itself either.
+
+Separately, both services set an explicit `logging.options.max-size`/
+`max-file` in `docker-compose.yml` (10MB x 3 files each) — the Docker
+daemon's default `json-file` driver has no cap at all otherwise, and
+`web`'s nginx access log records every request, including every poll
+from every open tab.

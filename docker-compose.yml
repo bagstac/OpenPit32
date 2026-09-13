@@ -42,6 +42,15 @@ services:
     volumes:
       - grill-data:/data
     restart: unless-stopped
+    # The Docker daemon's default json-file driver has no size cap at all —
+    # left alone, container logs grow forever. This service barely logs
+    # (login attempts only), but capping it costs nothing and matches web
+    # below. 3 x 10MB = 30MB ceiling, old entries rotated out automatically.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   web:
     build:
@@ -57,6 +66,18 @@ services:
     depends_on:
       - auth
     restart: unless-stopped
+    # Same reasoning as auth above, but this one actually matters: nginx's
+    # access log is this container's stdout, and it logs every request --
+    # including every 10s poll from every open tab (found live 2026-09-13,
+    # alongside a 5.5GB backlog of unrelated Docker build cache that had
+    # quietly filled the Pi's disk to 83%; see also the periodic
+    # `docker builder prune` cron job docker/README.md sets up for that
+    # other, bigger source of the same problem).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   # Named "grill-data" from before Phase 8, when it also held the grill's
