@@ -55,7 +55,9 @@ since there's no login gate without nginx in front.
    own `POST /setup`, which logs in once, saves the password to its own
    flash (NVS), and forgets the account login. Nothing is stored in the
    browser or on the PC. Afterwards the Home card → `/grill` (status +
-   controls), `/health` (link diagnostics).
+   controls), `/health` (link diagnostics), `/settings` (Link Settings —
+   the error-display-threshold field, moved off `/grill` 2026-09-13 so it
+   doesn't crowd the live status/controls view).
 
 Alternative: `docker compose up -d --build` runs the web app + a small
 login-only auth service as two containers behind nginx on one host
@@ -206,7 +208,8 @@ signed-session-cookie login form, holding no grill state of any kind.
   (`__init__.py`, `pitboss_grill.h`/`.cpp`) — the grill firmware itself;
   owns everything grill-related. `esphome/secrets.yaml.example`.
 - `OpenPit32/`: Pages (Home, GrillDetail `/grill` incl. the Alarms card,
-  BridgeHealth `/health`), Layout (MainLayout, NavMenu, SetupDialog),
+  BridgeHealth `/health`, Settings `/settings` — the Link Settings card),
+  Layout (MainLayout, NavMenu, SetupDialog),
   `Services/GrillRpcService.cs`, `Services/IncludeCredentialsHandler.cs`
   (makes WASM's HttpClient send the session cookie on background `/api/`
   calls, Docker-only — top-level nav does this on its own, background

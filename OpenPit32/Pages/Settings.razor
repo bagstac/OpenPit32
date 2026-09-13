@@ -1,0 +1,165 @@
+@page "/settings"
+@inject GrillRpcService Rpc
+@implements IDisposable
+
+<PageTitle>Settings — OpenPit32</PageTitle>
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h3 class="mb-0">Settings</h3>
+    <a class="btn btn-outline-secondary btn-sm" href="/">Back</a>
+</div>
+
+@if (health is null && consecutiveFailures <= MaxTransientFailures)
+{
+    <p class="text-muted">Connecting to the grill bridge…</p>
+}
+else if (health is null)
+{
+    <div class="alert alert-warning">
+        Can't reach the grill's ESP32 — for local (non-Docker) dev, check
+        <code>GRILL_HOST</code> in <code>Program.cs</code> matches its LAN IP.
+    </div>
+    <button class="btn btn-outline-secondary btn-sm" @onclick="Poll">Retry</button>
+}
+else if (!health.configured)
+{
+    <div class="alert alert-warning">
+        The bridge has no grill password yet — go <a href="/">back</a> and fetch it
+        from your Pit Boss account before changing link settings.
+    </div>
+}
+else if (info?.error_display_threshold is not null)
+{
+    <div class="card pb-card">
+        <div class="card-header">Link Settings</div>
+        <div class="card-body">
+            <p class="text-muted small">
+                A single failed status check is expected occasionally — the grill's
+                auth key rotates every 10 seconds, and a request that lands right on
+                that boundary can be rejected even though nothing's actually wrong —
+                and it clears itself on its own moments later. This sets how many in
+                a row have to fail before it's shown as a warning on the grill page.
+            </p>
+            <div class="row g-2 align-items-end">
+                <div class="col-auto" style="width:8rem">
+                    <label class="form-label small text-muted mb-1">Consecutive failures</label>
+                    <input type="number" class="form-control form-control-sm" min="1" max="60"
+                           @bind="errorThresholdText" />
+                </div>
+                <div class="col-auto">
+                    <button class="btn btn-outline-secondary btn-sm" disabled="@errorThresholdBusy"
+                            @onclick="SaveErrorThreshold">
+                        Save
+                    </button>
+                </div>
+            </div>
+            @if (!string.IsNullOrEmpty(errorThresholdError))
+            {
+                <div class="alert alert-danger py-2 mt-2 mb-0">@errorThresholdError</div>
+            }
+        </div>
+    </div>
+}
+else
+{
+    <p class="text-muted">No settings available yet.</p>
+}
+
+@code {
+    private SidecarHealthResponse? health;
+    private SidecarInfoResponse? info;
+    // Same debounce as Home.razor/GrillDetail.razor -- a lone failed poll is
+    // expected occasionally (cold app start, WiFi/BLE radio contention on the
+    // ESP32's one shared radio) and usually clears itself a few seconds
+    // later, so this only actually flips to "unreachable" after a few in a
+    // row. See docs/ESP32_FIRMWARE_PLAN.md's 2026-09-11 follow-up.
+    private int consecutiveFailures;
+    private const int MaxTransientFailures = 2;
+    private System.Threading.Timer? pollTimer;
+
+    // ---- Link Settings card (error_display_threshold, ESP32-only) ----
+    // Moved here from GrillDetail.razor so settings live on their own page
+    // instead of crowding the live grill/controls view.
+    private string? errorThresholdText = "5";
+    private bool errorThresholdLoaded;
+    private bool errorThresholdBusy;
+    private string? errorThresholdError;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await Poll();
+        // Settings change rarely -- a slower cadence than the grill page is
+        // fine here and keeps this page from adding to the ESP32's WiFi/BLE
+        // radio contention while it's open in a background tab.
+        pollTimer = new System.Threading.Timer(_ => _ = InvokeAsync(Poll),
+            null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
+    }
+
+    private async Task Poll()
+    {
+        try
+        {
+            health = await Rpc.GetHealthAsync();
+            if (health?.configured == true)
+            {
+                info = await Rpc.GetInfoAsync();
+                // Prefill once from the ESP32's current value, not on every
+                // poll — otherwise an in-progress edit (or a save that just
+                // hasn't round-tripped into `info` yet) would keep getting
+                // overwritten out from under the user.
+                if (!errorThresholdLoaded && info?.error_display_threshold is int t)
+                {
+                    errorThresholdText = t.ToString();
+                    errorThresholdLoaded = true;
+                }
+            }
+            consecutiveFailures = 0;
+        }
+        catch (Exception ex)
+        {
+            consecutiveFailures++;
+            Console.WriteLine($"[Settings.Poll] {ex.GetType().Name}: {ex.Message} (consecutive failures: {consecutiveFailures})");
+            if (consecutiveFailures > MaxTransientFailures)
+            {
+                health = null;
+                info = null;
+            }
+        }
+        StateHasChanged();
+    }
+
+    private async Task SaveErrorThreshold()
+    {
+        errorThresholdError = null;
+        if (!int.TryParse(errorThresholdText, out var t) || t < 1 || t > 60)
+        {
+            errorThresholdError = "Enter a number between 1 and 60.";
+            return;
+        }
+        errorThresholdBusy = true;
+        try
+        {
+            var r = await Rpc.SetErrorDisplayThresholdAsync(t);
+            if (!r.ok)
+            {
+                errorThresholdError = r.error ?? "Failed to save.";
+            }
+            else if (info is not null)
+            {
+                // So the field stays in sync without waiting for the next
+                // poll's round trip back through /info.
+                info.error_display_threshold = r.error_display_threshold ?? t;
+            }
+        }
+        catch (Exception ex)
+        {
+            errorThresholdError = "grill bridge unreachable: " + ex.Message;
+        }
+        finally
+        {
+            errorThresholdBusy = false;
+        }
+    }
+
+    public void Dispose() => pollTimer?.Dispose();
+}
