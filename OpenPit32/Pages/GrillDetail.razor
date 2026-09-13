@@ -518,6 +518,23 @@ else
             actionFailed = !r.ok;
             await PollSidecar();
         }
+        catch (System.Text.Json.JsonException)
+        {
+            // The ESP32's handle_command_() (pitboss_grill.cpp) finishes the
+            // whole BLE round trip -- and applies the command -- before it
+            // ever builds this JSON reply, so a malformed/empty body here
+            // means the reply got corrupted in transit, not that the grill
+            // didn't get the command. Confirmed live 2026-09-14: power_on
+            // occasionally hits exactly this (turning the grill on is real
+            // BLE traffic on the ESP32's one shared radio, right as it's
+            // trying to send the reply back over WiFi -- see
+            // docs/ESP32_FIRMWARE_PLAN.md's 2026-09-11 follow-up), and the
+            // grill turns on anyway. Reassure instead of a scary parse
+            // error, and re-poll so the real state speaks for itself.
+            actionMessage = "Command likely went through, but the reply got garbled in transit (WiFi/BLE congestion) — check the status above.";
+            actionFailed = false;
+            await PollSidecar();
+        }
         catch (Exception ex)
         {
             actionMessage = "sidecar error: " + ex.Message;
