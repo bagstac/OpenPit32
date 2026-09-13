@@ -12,7 +12,7 @@
     </div>
 </div>
 
-@if (health is null && !polledOnce)
+@if (health is null && consecutiveFailures <= MaxTransientFailures)
 {
     <p class="text-muted">Connecting to the grill bridge…</p>
 }
@@ -84,7 +84,10 @@ else if (info is not null)
     private SidecarInfoResponse? info;
     private SidecarHealthResponse? health;
     private bool setupOpen;
-    private bool polledOnce;
+    // See the matching comment on GrillDetail.razor's own consecutiveFailures
+    // -- same debounce, same reasoning, kept in sync between the two pages.
+    private int consecutiveFailures;
+    private const int MaxTransientFailures = 2;
 
     protected override async Task OnInitializedAsync()
     {
@@ -130,6 +133,7 @@ else if (info is not null)
                 live = null;
                 info = null;
             }
+            consecutiveFailures = 0;
         }
         catch (Exception ex)
         {
@@ -137,12 +141,21 @@ else if (info is not null)
             // "start .venv312..." wording is only accurate for local dev;
             // check the browser console for what actually failed (network
             // error vs. a non-2xx response vs. something else).
-            Console.WriteLine($"[PollSidecar] {ex.GetType().Name}: {ex.Message}");
-            live = null;
-            health = null;
-            info = null;
+            consecutiveFailures++;
+            Console.WriteLine($"[PollSidecar] {ex.GetType().Name}: {ex.Message} (consecutive failures: {consecutiveFailures})");
+            // Keep showing the last known-good health/live/info through the
+            // tolerated failures below -- only actually surface "unreachable"
+            // once it's no longer plausibly just a blip (a cold app start
+            // catching the ESP32 mid-boot, or a WiFi/BLE radio contention
+            // hiccup — see docs/ESP32_FIRMWARE_PLAN.md's 2026-09-11
+            // follow-up).
+            if (consecutiveFailures > MaxTransientFailures)
+            {
+                live = null;
+                health = null;
+                info = null;
+            }
         }
-        polledOnce = true;
         StateHasChanged();
     }
 

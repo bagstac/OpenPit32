@@ -4,7 +4,7 @@
 
 <PageTitle>Grill — OpenPit32</PageTitle>
 
-@if (health is null && !polledOnce)
+@if (health is null && consecutiveFailures <= MaxTransientFailures)
 {
     <p class="text-muted">Connecting to the grill bridge…</p>
 }
@@ -306,7 +306,15 @@ else
     private string? sidecarError;
     private SidecarHealthResponse? health;
     private SidecarInfoResponse? info;
-    private bool polledOnce;
+    // A single failed poll is expected occasionally -- WiFi/BLE radio
+    // contention on the ESP32's one shared radio (see the 2026-09-11
+    // follow-up in docs/ESP32_FIRMWARE_PLAN.md), or the grill bridge just
+    // not being up yet on a cold app start -- and usually clears itself by
+    // the next poll a few seconds later. PollSidecar() below only actually
+    // flips to the "unreachable" state after this many in a row, so a lone
+    // blip doesn't flash a scary error over what's otherwise a working page.
+    private int consecutiveFailures;
+    private const int MaxTransientFailures = 2;
     private string? confirmFor;
     private string? actionMessage;
     private bool actionFailed;
@@ -374,13 +382,21 @@ else
                 stateAge = resp?.state_age_seconds;
                 sidecarError = resp?.last_error;
             }
+            consecutiveFailures = 0;
         }
         catch (Exception ex)
         {
-            sidecarError = "sidecar unreachable: " + ex.Message;
-            health = null;
+            consecutiveFailures++;
+            Console.WriteLine($"[PollSidecar] {ex.GetType().Name}: {ex.Message} (consecutive failures: {consecutiveFailures})");
+            // Keep showing the last known-good health/live/info through the
+            // tolerated failures below -- only actually surface "unreachable"
+            // once it's no longer plausibly just a blip.
+            if (consecutiveFailures > MaxTransientFailures)
+            {
+                sidecarError = "sidecar unreachable: " + ex.Message;
+                health = null;
+            }
         }
-        polledOnce = true;
         StateHasChanged();
     }
 
