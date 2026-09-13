@@ -180,6 +180,23 @@ signed-session-cookie login form, holding no grill state of any kind.
    isn't (confirmed: `/health` answered normally the instant the stale
    client processes were force-killed). `taskkill /F /IM python.exe`
    (or killing by tracked PID) actually works; `pkill -f` does not.
+9. **Cloudflare's edge caches unfingerprinted static assets independently
+   of the browser** — found live 2026-09-12 when a new CSS rule (an Auger
+   icon) was confirmed byte-correct on the Pi's own disk, yet never reached
+   a browser going in over the Cloudflare Tunnel; a full browser data wipe
+   did nothing because it wasn't the browser holding the stale copy.
+   `css/app.css` and `OpenPit32.styles.css` are referenced by stable path
+   from `index.html` with no content hash and (before this fix) no
+   `Cache-Control` header — unlike `_framework/*.wasm` and
+   `blazor.webassembly#[.{fingerprint}].js`, nothing about their URL
+   changes on a redeploy, so an edge cache has no signal a refetch could
+   ever return something different. Fixed by extending the `no-cache`
+   `Cache-Control` block already used for the service worker files (see
+   gotcha 4) to also cover these two in `docker/nginx.conf.template`.
+   **This only stops *future* staleness** — it does not retroactively
+   evict whatever Cloudflare already cached before the fix landed; that
+   needs one manual purge (dashboard → Caching → Configuration → Purge
+   Cache) the first time this bites.
 
 ## Files map
 - `scripts/login_service.py` — the entire Python surface now: login form +
