@@ -1,0 +1,211 @@
+# Serves the published Blazor WebAssembly SPA and reverse-proxies API
+# traffic under /api/, so the whole app is one origin — needed for a single
+# Cloudflare Tunnel hostname and so one login covers both. As of Phase 8
+# (docs/ESP32_FIRMWARE_PLAN.md, completing what Phase 4 started) that
+# traffic is split across two backends: the grill's own ESP32
+# (esphome/grill-firmware.yaml) for every grill/alarm route — /health,
+# /state, /info, /config, /command, /alarms (including
+# DELETE /alarms/{id}), /setup — same JSON shapes in every case, so
+# OpenPit32/Services/GrillRpcService.cs needs no changes; and a small
+# login-only service (scripts/login_service.py) for /login, /logout,
+# /auth-check, all that's left of the old Python sidecar once its BLE
+# bridge, VAPID push, and grill-model catalog were retired outright (see
+# the plan's decisions #3 and #6, and its "What's removed entirely"
+# section). Client-side routes (/grill, /health) don't exist as files, so
+# unmatched paths fall back to index.html and the Blazor router takes it
+# from there.
+#
+# This file is an envsubst *.template (docker/web.Dockerfile copies it into
+# nginx:alpine's /etc/nginx/templates/, which substitutes ${VAR} before
+# nginx starts) so the GRILL_PROXY_HOST env var only has to be set in one
+# place. Everything else below stays plain nginx syntax: bare $variable (no
+# braces) is an nginx runtime variable, but be careful adding more comments
+# here — envsubst substitutes bare $NAME too, for any name that happens to
+# match a real env var, comments included. Only ${...} with braces is
+# intentional in this file.
+#
+# 127.0.0.11 is Docker Compose's embedded DNS; re-resolving per-request (via
+# the $auth variable in proxy_pass) rather than once at nginx startup means
+# this keeps working if that container is recreated on its own. The grill
+# ESP32 isn't on the compose network — $grill_esp32 below is a literal LAN
+# IP substituted in at container start, not something this resolver looks up.
+resolver 127.0.0.11 valid=10s;
+
+# nginx's own $scheme is always "http" here — it never terminates TLS
+# itself (that's Cloudflare's edge, for the tunnel path); LAN-direct access
+# really is plain HTTP with nothing to reflect either way. Only trust
+# X-Forwarded-Proto when it says https, so the login redirect below (which
+# has to construct an absolute URL) doesn't tell a tunnel visitor's browser
+# to go to a plain-http URL that isn't actually being served.
+map $http_x_forwarded_proto $external_scheme {
+    default $scheme;
+    https   https;
+}
+
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    set $auth http://auth:8091;
+    set $grill_esp32 http://${GRILL_PROXY_HOST};
+
+    # Fixed username/password so the app isn't wide open once it's reachable
+    # from the internet (e.g. via a Cloudflare Tunnel) — but as a signed
+    # session cookie from a real login FORM (scripts/login_service.py's
+    # /login), not auth_basic's browser-native popup, which most password
+    # managers don't offer to fill. auth_request delegates the yes/no
+    # decision to the auth service's /auth-check on every request;
+    # AUTH_USERNAME / AUTH_PASSWORD (docker/README.md) configure it there,
+    # not here.
+    location = /auth-check {
+        internal;
+        proxy_pass $auth/auth-check;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header Cookie $http_cookie;
+    }
+
+    # Unauthenticated on purpose: the login page and its own actions. Must
+    # stay outside the auth_request gate below or logging in could never
+    # succeed.
+    location = /login {
+        proxy_pass $auth/login;
+        proxy_set_header Host $host;
+    }
+
+    location = /logout {
+        proxy_pass $auth/logout;
+        proxy_set_header Host $host;
+    }
+
+    location @login_redirect {
+        return 302 $external_scheme://$host/login?next=$request_uri;
+    }
+
+    location / {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Belt-and-suspenders alongside index.html's service worker registration
+    # using updateViaCache: 'none' (2026-09-12) — an HTTP-cache-level backup
+    # for the same problem, extended to cover a second real incident
+    # (2026-09-12, same day: an added Auger icon reached the container's disk
+    # fine, verified by reading it straight off the deployed filesystem, but
+    # never reached a browser going in over the Cloudflare Tunnel — plain
+    # browser cache-clearing did nothing, because it's Cloudflare's edge, not
+    # the browser, holding the stale copy). Every file listed here shares one
+    # trait: it changes on a redeploy but, unlike _framework/*.wasm and
+    # blazor.webassembly#[.{fingerprint}].js, its filename doesn't change
+    # with it (no content hash baked in) — so neither a browser nor a CDN
+    # sitting in front of it (nginx:alpine sends no explicit Cache-Control
+    # for any of these by default) has any signal that a fetch under the same
+    # URL could ever return something different than last time.
+    #   - service-worker.js / service-worker-assets.js: the mechanism above
+    #     depends on these actually being refetched to work at all.
+    #   - css/app.css, OpenPit32.styles.css: plain stylesheets, referenced by
+    #     stable path from index.html — no fingerprinting in this project's
+    #     build for either.
+    # (lib/bootstrap/dist/css/bootstrap.min.css deliberately isn't included —
+    # it's vendored and never changes between our own deploys, so there's
+    # nothing to invalidate.)
+    location ~ ^/(service-worker\.js|service-worker-assets\.js|css/app\.css|OpenPit32\.styles\.css)$ {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        add_header Cache-Control "no-cache" always;
+        try_files $uri =404;
+    }
+
+    # /health, /state, /info, /config, /command, /alarms(+DELETE), /setup —
+    # every grill/alarm route, all going straight to the ESP32 as of Phase 8.
+    # /login, /logout, /auth-check above are the only other /api-adjacent
+    # routes this app has; there is no longer a generic /api/ catch-all
+    # below them (removed once nothing was left to fall through to it — see
+    # git history if you need the old sidecar-catch-all shape back).
+    location = /api/health {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/health;
+        proxy_set_header Host $host;
+    }
+
+    location = /api/state {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/state;
+        proxy_set_header Host $host;
+    }
+
+    location = /api/info {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/info;
+        proxy_set_header Host $host;
+    }
+
+    # POST /config — the ESP32-only error_display_threshold/telegram_bot_token/
+    # telegram_chat_id settings (2026-09-10, Phase 7) — not part of the
+    # sidecar's API at all.
+    location = /api/config {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/config;
+        proxy_set_header Host $host;
+    }
+
+    # Phase 5: POST /command (turn-on/turn-off/set-temperature). Body is
+    # forwarded as-is — nginx proxies the request body by default, same as
+    # /api/config above already relies on; no special directive needed.
+    location = /api/command {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/command;
+        proxy_set_header Host $host;
+    }
+
+    # Phase 6/7: GET/POST /alarms (list/create) and POST /setup (Phase 7's
+    # cloud password fetch) — exact matches, same pattern as the ones above.
+    location = /api/alarms {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/alarms;
+        proxy_set_header Host $host;
+    }
+
+    location = /api/setup {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        proxy_pass $grill_esp32/setup;
+        proxy_set_header Host $host;
+    }
+
+    # DELETE /alarms/{id} — a *prefix* match (not `location =`), since the
+    # id is part of the path. More specific than the bare /api/ prefix block
+    # below, so nginx picks this one for anything under /api/alarms/ without
+    # needing a regex. rewrite strips the /api prefix the same way the
+    # generic /api/ block below does (proxy_pass with a variable disables
+    # nginx's automatic prefix-stripping), landing on the ESP32's own
+    # DELETE /alarms/{id} route (pitboss_grill.cpp's setup_delete_handler_()
+    # — a real 200/404, unlike most routes on that ESP-IDF web server
+    # backend, which this proxies through unchanged).
+    location /api/alarms/ {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        rewrite ^/api/alarms/(.*)$ /alarms/$1 break;
+        proxy_pass $grill_esp32;
+        proxy_set_header Host $host;
+    }
+
+    # nginx:alpine's mime.types already maps .wasm; set it explicitly in
+    # case an older image is used, since a wrong type stops the browser
+    # from instantiating the module.
+    location ~ \.wasm$ {
+        default_type application/wasm;
+    }
+
+    gzip on;
+    gzip_types application/wasm application/octet-stream text/javascript application/javascript;
+}

@@ -1,15 +1,10 @@
-# Runtime for scripts/ (Python 3.12+). Install into a venv:
+# Runtime for scripts/login_service.py (Python 3.12+). Install into a venv:
 #   python -m venv .venv312 && .venv312\Scripts\pip install -r requirements.txt
 #
-# Pinned to the versions this was developed and tested against; esphome_ble.py
-# relies on private hooks of bleak-esphome (see its docstring), so bump that
-# one deliberately.
-pytboss==2026.8.6
+# Phase 8 (docs/ESP32_FIRMWARE_PLAN.md) retired the whole BLE stack this file
+# used to pin (pytboss, bleak, bleak-retry-connector, bleak-esphome,
+# aioesphomeapi, habluetooth) along with pywebpush/VAPID — the ESP32 firmware
+# (esphome/grill-firmware.yaml) now owns 100% of grill control, alarms, and
+# Telegram notifications directly. login_service.py just needs an HTTP
+# server for the login form/session cookie/nginx auth_request target.
 aiohttp==3.14.3
-pywebpush==2.5.0  # VAPID web push for grill alarms (scripts/alarms.py); pulls
-                  # in py-vapid and cryptography
-bleak==3.0.2
-bleak-retry-connector==4.7.0
-bleak-esphome==4.1.0
-aioesphomeapi==46.3.0
-habluetooth==6.26.11

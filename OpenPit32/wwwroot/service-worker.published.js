@@ -6,8 +6,6 @@
 // wwwroot file, so it's never part of the assets manifest onFetch below
 // checks against, and always falls through to a real network request.
 self.importScripts('./service-worker-assets.js');
-// Push notifications (grill alarms) — shared with the dev worker, see its comment.
-self.importScripts('./push-worker.js');
 
 self.addEventListener('install', event => event.waitUntil(onInstall(event)));
 self.addEventListener('activate', event => event.waitUntil(onActivate(event)));

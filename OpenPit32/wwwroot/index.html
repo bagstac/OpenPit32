@@ -40,8 +40,24 @@
         // Service workers require a secure context (HTTPS or localhost); on
         // the plain-HTTP LAN address navigator.serviceWorker is undefined,
         // so guard the call rather than let it throw.
+        //
+        // updateViaCache: 'none' (2026-09-12) — the default ('imports') lets
+        // the browser serve service-worker-assets.js (imported via
+        // service-worker.published.js's importScripts(), and regenerated
+        // with new content-hashed filenames on every publish) from its own
+        // HTTP cache during an update check. service-worker.js's own bytes
+        // never change build-to-build (it's a static hand-written wrapper),
+        // so without this, the only thing that actually DOES change on a
+        // redeploy could be served stale, and the browser's byte-comparison
+        // update check could conclude nothing changed at all — a refresh
+        // (or several) then keeps rendering the old UI indefinitely, only
+        // recovering on a hard refresh or fully closing every open tab.
+        // 'none' forces every fetch this service worker makes, imports
+        // included, to always bypass HTTP cache, so an update is detected
+        // and skipWaiting()/clients.claim() (already in both service worker
+        // files) can actually do their job on the very next refresh.
         if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.register('service-worker.js');
+            navigator.serviceWorker.register('service-worker.js', { updateViaCache: 'none' });
         }
     </script>
 </body>

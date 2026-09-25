@@ -1,0 +1,148 @@
+# The grill's production firmware (docs/ESP32_FIRMWARE_PLAN.md): the grill
+# talks Mongoose OS RPC directly to THIS ESP32 — 100% of BLE, command
+# dispatch, alarm evaluation, and Telegram alerting live here, no PC-side
+# process in between at all as of Phase 8. Earlier phases went through
+# esphome/grill-proxy.yaml (a pure BLE-radio bluetooth_proxy a Python
+# sidecar drove remotely) as an instant-rollback fallback while this was
+# being proven out; that file and the sidecar it required are both retired
+# now — see git history if you ever need either back.
+#
+# First flash over USB (later ones go OTA once it's on WiFi — `esphome run`
+# picks that automatically): this exact hardware (classic ESP32-D0WD-V3 dev
+# board, CP2102 USB-UART, 4 MB flash) doesn't enter download mode via its
+# auto-reset circuit by itself — hold BOOT, tap EN, release BOOT, then:
+#   .venv\Scripts\esphome compile esphome\grill-firmware.yaml
+#   .venv\Scripts\python -m esptool --port COM4 --before no-reset --baud 460800 \
+#       write-flash 0x0 esphome\.esphome\build\grill-firmware\.pioenvs\grill-firmware\firmware.factory.bin
+# (An ESP32-C3 was tried first for the original proxy role; it had a WiFi
+# hardware fault. For a C3 use board: esp32-c3-devkitm-1 below — the rest of
+# this file is unchanged.) Secrets live in esphome/secrets.yaml (never
+# committed, never printed).
+#
+# Phase-by-phase history (all bench-verified against the real grill; full
+# detail in docs/ESP32_FIRMWARE_PLAN.md): Phase 1 proved the BLE transport
+# (connect, discover, notify, unauth'd RPC.Ping). Phase 2 added the auth
+# codec and authenticated PB.GetState. Phase 3 decoded the sc_11/sc_12
+# (FE0B/FE0C) frames into internal state. Phase 4 served that state over
+# /health, /state, /info — the pitboss_grill component registers those
+# routes on the web_server_base httpd instance it auto-loads, no separate
+# `web_server_base:`/`web_server:` block needed here. Phase 5 added POST
+# /command: turn-on/turn-off/set-temperature, behind a confirm-required
+# safety gate. Phase 6 added the alarm monitor loop (GET/POST /alarms,
+# DELETE /alarms/{id}) and Telegram notify() for temp-target/timer alarms.
+# Needs real wall-clock time (a timer alarm's fires_at has to be a real Unix
+# timestamp GrillDetail.razor can count down from), hence the `time:` block
+# below — pitboss_grill picks it up automatically via cv.use_id (same
+# pattern as `web_server_base`, which needs no explicit block since it's
+# auto_load'd with an empty/default config; `http_request:` for the
+# Telegram POST works the same way). Phase 7 added POST /setup — a one-time
+# Pit Boss cloud login run from the ESP32 itself — and NVS persistence for
+# the password it fetches, the alarms list, and the Telegram bot token/chat
+# id (POST /config), so none of that resets on a reboot/reflash. Phase 8
+# retired the Python sidecar entirely, replacing it with a small login-only
+# service (scripts/login_service.py) for Docker deployments — see
+# docker/README.md. grill_password/telegram_bot_token/telegram_chat_id
+# below are now only the *initial* fallback (NVS wins once POST /setup /
+# POST /config have run once) — safe to drop from secrets.yaml entirely for
+# a fresh device set up purely through the web app.
+
+esphome:
+  name: grill-firmware
+  friendly_name: Grill Firmware
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 15min
+  # Root-caused live 2026-09-11: ESPHome's post_connect_roaming (default on)
+  # rescans for a "better" AP every 5 min whenever WiFi RSSI is below -49dBm
+  # (wifi_component.h's ROAMING_GOOD_RSSI) — this board's WiFi signal here
+  # (-56 to -58dBm, comfortably fine on its own) is always below that, so it
+  # was roam-scanning on every check. A WiFi scan needs the radio to hop
+  # across every channel, and this ESP32 has one 2.4GHz radio shared with
+  # BLE — each scan collided with whatever BLE RPC exchange was in flight,
+  # dropping the grill's reply notification with nothing on our side able
+  # to tell the difference from any other dropped packet (confirmed via a
+  # `[D][wifi] Roam scan` log line landing right before a `pitboss_grill`
+  # "RPC reply timed out" warning). This board sits fixed next to the grill
+  # — there is no second AP to usefully roam to — so disable it outright
+  # rather than accept periodic BLE collisions for a roam that could never
+  # help here anyway.
+  post_connect_roaming: false
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# api/web_server_base auto-load mdns with its default (enabled) config; disabled
+# here 2026-09-11 as one more piece of the RPC-reply-drop-rate investigation
+# (docs/ESP32_FIRMWARE_PLAN.md's 2026-09-11 follow-up) — nothing actually
+# resolves this device by its .local name at runtime (GRILL_PROXY_HOST/
+# GRILL_HOST are always a plain IP; only ad-hoc `esphome logs`/`esphome run`
+# during development ever used it, and even those work fine given an explicit
+# --device IP instead), so mDNS's periodic multicast announcements were pure
+# radio-contention cost on this ESP32's one 2.4GHz radio (shared with BLE)
+# for zero runtime benefit.
+mdns:
+  disabled: true
+
+logger:
+  level: DEBUG
+  logs:
+    pitboss_grill: DEBUG
+
+# Phase 6: alarms need a real Unix timestamp (fires_at) for
+# GrillDetail.razor's countdown to make sense, not just uptime-since-boot.
+# NTP over the WiFi this ESP32 already has; UTC throughout since every
+# comparison here is epoch-vs-epoch, no calendar/local-time display anywhere.
+time:
+  - platform: sntp
+    id: sntp_time
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+    continuous: true
+  # Confirmed the grill advertises loudly and correctly (RSSI ~-32dBm,
+  # matched by name every ~20-30ms) — removed the debug on_ble_advertise
+  # lambda that proved it. It logged every advertisement at INFO level,
+  # which combined with pitboss_grill's own per-call debug logging almost
+  # certainly caused the WiFi/API instability seen next: this ESP32's
+  # single 2.4GHz radio is shared between BLE and WiFi, and hundreds of
+  # log lines per second competing for the same core/UART starves the
+  # network stack. Lesson for later phases: keep any BLE-scan-frequency
+  # logging heavily rate-limited or one-shot, never per-advertisement.
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+pitboss_grill:
+  id: grill
+  name_prefix: "PBV2-"
+  # Phase 7: only the initial fallback now — NVS (POST /setup) wins once
+  # it has a value. Safe to drop this line (and grill_password from
+  # secrets.yaml) entirely for a device meant to be set up purely through
+  # the web app's "Fetch grill password" dialog.
+  grill_password: !secret grill_password
+  # Telegram (docs/ESP32_FIRMWARE_PLAN.md's "Telegram integration" section):
+  # message @BotFather for a bot token, message the new bot once, then GET
+  # https://api.telegram.org/bot<TOKEN>/getUpdates to read back the chat id.
+  # Both default to "" (no secrets.yaml entry needed to compile) — an alarm
+  # still fires and is dropped on schedule either way, it just logs
+  # "no Telegram bot configured" instead of actually notifying. Configured
+  # 2026-09-10 to verify real delivery — both keys are in secrets.yaml. Like
+  # grill_password above, these are Phase 7's initial fallback only — POST
+  # /config persists a change to NVS, which then wins on every later boot.
+  telegram_bot_token: !secret telegram_bot_token
+  telegram_chat_id: !secret telegram_chat_id

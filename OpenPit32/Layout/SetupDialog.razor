@@ -2,10 +2,10 @@
 
 @*
     One-time setup: fetch the grill's Bluetooth password from the user's
-    Pit Boss account. The credentials go to the local sidecar, which logs in
-    once, stores only the grill's board id / password / model in
-    scripts/.grill_env, and discards the account token. Nothing is kept in
-    the browser.
+    Pit Boss account. The credentials go straight to the grill's own ESP32
+    (POST /setup, Phase 7 — docs/ESP32_FIRMWARE_PLAN.md), which logs in
+    once, stores only the grill's board id/password in its own flash (NVS),
+    and discards the account token. Nothing is kept in the browser.
 *@
 @if (Open)
 {
@@ -22,9 +22,12 @@
                         <p class="small text-muted">
                             Commands to the grill must carry the password the Pit Boss app set when
                             the grill was paired. It is stored on your account, so sign in once here:
-                            the local bridge logs in, saves the grill's password to
-                            <code>scripts/.grill_env</code>, and forgets your account login.
-                            Nothing is stored in this browser.
+                            the grill's own ESP32 logs in, saves the password to its own flash, and
+                            forgets your account login. Nothing is stored in this browser.
+                            @if (!string.IsNullOrEmpty(CurrentModel))
+                            {
+                                <text> Grill model: <strong>@CurrentModel</strong> (fixed — this firmware is built for one grill).</text>
+                            }
                         </p>
                         <div class="mb-3">
                             <label class="form-label" for="setupEmail">Pit Boss account email</label>
@@ -36,23 +39,11 @@
                             <InputText id="setupPassword" class="form-control" type="password"
                                        autocomplete="current-password" @bind-Value="form.Password" />
                         </div>
-                        <div class="row g-2">
-                            <div class="col-4">
-                                <label class="form-label" for="setupCountry">Country</label>
-                                <InputText id="setupCountry" class="form-control" maxlength="2"
-                                           @bind-Value="form.Country" />
-                                <div class="form-text">2-letter code the account was created with.</div>
-                            </div>
-                            <div class="col-8">
-                                <label class="form-label" for="setupModel">Grill model</label>
-                                <InputSelect id="setupModel" class="form-select" @bind-Value="form.Model">
-                                    @foreach (var m in models)
-                                    {
-                                        <option value="@m">@m</option>
-                                    }
-                                </InputSelect>
-                                <div class="form-text">Determines setpoints, probes and lights (from pytboss).</div>
-                            </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="setupCountry">Country</label>
+                            <InputText id="setupCountry" class="form-control" maxlength="2"
+                                       @bind-Value="form.Country" />
+                            <div class="form-text">2-letter code the account was created with.</div>
                         </div>
                         @if (choices is not null)
                         {
@@ -100,7 +91,10 @@
     [Parameter] public EventCallback<bool> OpenChanged { get; set; }
     /// <summary>Raised after a successful setup so the page can refresh.</summary>
     [Parameter] public EventCallback OnConfigured { get; set; }
-    /// <summary>Pre-selected model (the sidecar's current one), if any.</summary>
+    /// <summary>The grill's current model, from /info — informational only
+    /// (see the modal-body note above): the ESP32 firmware is compiled for
+    /// one grill and always reports its own model regardless of what a
+    /// setup request sends, so there's nothing here to select anymore.</summary>
     [Parameter] public string? CurrentModel { get; set; }
 
     private sealed class Form
@@ -108,30 +102,14 @@
         public string Email { get; set; } = "";
         public string Password { get; set; } = "";
         public string Country { get; set; } = "US";
-        public string? Model { get; set; }
         public int? GrillId { get; set; }
     }
 
     private readonly Form form = new();
-    private List<string> models = new();
     private List<SidecarGrillChoice>? choices;
     private string? error;
     private string? success;
     private bool busy;
-
-    protected override async Task OnParametersSetAsync()
-    {
-        if (Open && models.Count == 0)
-        {
-            try
-            {
-                var m = await Rpc.GetModelsAsync();
-                models = m?.models ?? new();
-                form.Model ??= CurrentModel ?? m?.@default ?? models.FirstOrDefault();
-            }
-            catch { models = new(); }
-        }
-    }
 
     private async Task Submit()
     {
@@ -140,7 +118,7 @@
         try
         {
             var r = await Rpc.SetupAsync(form.Email.Trim(), form.Password,
-                form.Country.Trim().ToUpperInvariant(), form.Model, form.GrillId);
+                form.Country.Trim().ToUpperInvariant(), form.GrillId);
             if (r.ok)
             {
                 form.Password = "";
@@ -162,7 +140,7 @@
         }
         catch (Exception ex)
         {
-            error = "bridge error: " + ex.Message;
+            error = "grill unreachable: " + ex.Message;
         }
         finally
         {

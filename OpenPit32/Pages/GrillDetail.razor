@@ -1,19 +1,18 @@
 @page "/grill"
-@using System.Text.Json
 @inject GrillRpcService Rpc
-@inject IJSRuntime JS
 @implements IAsyncDisposable
 
 <PageTitle>Grill — OpenPit32</PageTitle>
 
-@if (health is null && !polledOnce)
+@if (health is null && consecutiveFailures <= MaxTransientFailures)
 {
     <p class="text-muted">Connecting to the grill bridge…</p>
 }
 else if (health is null)
 {
     <div class="alert alert-warning">
-        Grill bridge unreachable — start <code>scripts\grill_sidecar.py</code>.
+        Can't reach the grill's ESP32 — for local (non-Docker) dev, check
+        <code>GRILL_HOST</code> in <code>Program.cs</code> matches its LAN IP.
     </div>
     <button class="btn btn-outline-secondary" @onclick="PollSidecar">Retry</button>
     <a class="btn btn-outline-secondary ms-1" href="/">Back</a>
@@ -31,6 +30,7 @@ else
         <h3 class="mb-0">@(info?.model ?? "Grill")</h3>
         <div>
             <button class="btn btn-outline-secondary btn-sm" @onclick="PollSidecar">Refresh</button>
+            <a class="btn btn-outline-secondary btn-sm ms-1" href="/settings">Settings</a>
             <a class="btn btn-outline-secondary btn-sm ms-1" href="/">Back</a>
         </div>
     </div>
@@ -76,10 +76,6 @@ else
                         <div class="text-muted small">Set Point</div>
                     </div>
                     <div class="col">
-                        <div class="pb-big">@Fmt(live.smokerActTemp)°</div>
-                        <div class="text-muted small">Smoker</div>
-                    </div>
-                    <div class="col">
                         <div class="pb-big">@(live.isFahrenheit ? "°F" : "°C")</div>
                         <div class="text-muted small">Units</div>
                     </div>
@@ -95,15 +91,30 @@ else
                     }
                 </div>
                 <hr />
-                <p class="mb-0 text-muted small">
-                    Fan @OnOff(live.fanState) · Igniter @OnOff(live.hotState)
-                    · Auger @OnOff(live.motorState) · Light @OnOff(live.lightState)
-                    · Prime @OnOff(live.primeState)
-                    @if (AnyError(live))
-                    {
-                        <span class="badge text-bg-danger ms-1">Error flags set</span>
-                    }
-                </p>
+                <div class="row text-center pb-temps">
+                    <div class="col">
+                        <span class="status-icon status-icon-fan@(live.fanState ? " active" : "")" title="Fan @OnOff(live.fanState)"></span>
+                        <div class="text-muted small">Fan</div>
+                    </div>
+                    <div class="col">
+                        <span class="status-icon status-icon-igniter@(live.hotState ? " active" : "")" title="Igniter @OnOff(live.hotState)"></span>
+                        <div class="text-muted small">Igniter</div>
+                    </div>
+                    <div class="col">
+                        <span class="status-icon status-icon-prime@(live.primeState ? " active" : "")" title="Prime @OnOff(live.primeState)"></span>
+                        <div class="text-muted small">Prime</div>
+                    </div>
+                    <div class="col">
+                        <span class="status-icon status-icon-auger@(live.motorState ? " active" : "")" title="Auger @OnOff(live.motorState)"></span>
+                        <div class="text-muted small">Auger</div>
+                    </div>
+                </div>
+                @if (AnyError(live))
+                {
+                    <p class="mb-0 mt-2 text-center">
+                        <span class="badge text-bg-danger">Error flags set</span>
+                    </p>
+                }
             </div>
         </div>
     }
@@ -176,39 +187,6 @@ else
     <div class="card pb-card mt-4">
         <div class="card-header">Alarms</div>
         <div class="card-body">
-            @if (!pushSupported)
-            {
-                <p class="text-muted small mb-3">
-                    This browser can't do push notifications here (no secure context,
-                    or an old browser) — alarms still fire and clear below, but only
-                    while this page is open.
-                </p>
-            }
-            else if (pushSubscribed)
-            {
-                <p class="text-muted small mb-3">✓ Notifications are enabled on this device.</p>
-            }
-            else if (pushPermission == "denied")
-            {
-                <p class="text-muted small mb-3">
-                    Notifications are blocked for this site — allow them in your browser's
-                    site settings, then reload this page.
-                </p>
-            }
-            else
-            {
-                <div class="mb-3">
-                    <button class="btn btn-outline-secondary btn-sm" disabled="@notifBusy"
-                            @onclick="EnableNotifications">
-                        Enable notifications
-                    </button>
-                </div>
-            }
-            @if (!string.IsNullOrEmpty(notifError))
-            {
-                <div class="alert alert-danger py-2">@notifError</div>
-            }
-
             @if (alarms.Count > 0)
             {
                 <ul class="list-group list-group-flush mb-3">
@@ -281,9 +259,9 @@ else
                 </div>
             </div>
             <p class="text-muted small mt-3 mb-0">
-                Alarms are checked and pushed by the grill bridge, so they still fire
-                (as a device notification) if this tab isn't open — as long as the
-                bridge itself keeps running.
+                Alarms are checked by the grill's own ESP32 and delivered via Telegram,
+                so they still fire even if no tab is open at all — independent of this
+                browser or device.
             </p>
         </div>
     </div>
@@ -296,7 +274,15 @@ else
     private string? sidecarError;
     private SidecarHealthResponse? health;
     private SidecarInfoResponse? info;
-    private bool polledOnce;
+    // A single failed poll is expected occasionally -- WiFi/BLE radio
+    // contention on the ESP32's one shared radio (see the 2026-09-11
+    // follow-up in docs/ESP32_FIRMWARE_PLAN.md), or the grill bridge just
+    // not being up yet on a cold app start -- and usually clears itself by
+    // the next poll a few seconds later. PollSidecar() below only actually
+    // flips to the "unreachable" state after this many in a row, so a lone
+    // blip doesn't flash a scary error over what's otherwise a working page.
+    private int consecutiveFailures;
+    private const int MaxTransientFailures = 2;
     private string? confirmFor;
     private string? actionMessage;
     private bool actionFailed;
@@ -315,40 +301,19 @@ else
     private string? alarmLabel;
     private bool alarmBusy;
 
-    private IJSObjectReference? pushModule;
-    private bool pushSupported;
-    private string pushPermission = "default";
-    // Whether the sidecar currently holds a working subscription for this
-    // device — NOT the same as pushPermission == "granted": permission can
-    // be granted while the underlying PushSubscription is gone (e.g. site
-    // storage was cleared, or the sidecar's own volume was reset), and the
-    // card must still offer a way back in rather than showing nothing.
-    private bool pushSubscribed;
-    private bool notifBusy;
-    private string? notifError;
-
     protected override async Task OnInitializedAsync()
     {
+        // 10s, not 5s (as of 2026-09-11) — each poll is up to 4 HTTP requests
+        // (health, alarms, info once, state) and, since Phase 4, all of them
+        // now hit the grill's own ESP32 directly instead of a PC-side
+        // sidecar. That ESP32 has one 2.4GHz radio shared between this WiFi
+        // traffic and the BLE link doing actual grill RPCs — halving the
+        // poll rate measurably reduces radio contention that was
+        // contributing to commands (power_on, set_temp) silently failing to
+        // reach the grill. See docs/ESP32_FIRMWARE_PLAN.md's 2026-09-11
+        // follow-up.
         pollTimer = new System.Threading.Timer(_ => _ = InvokeAsync(PollSidecar),
-            null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
-
-        try
-        {
-            pushModule = await JS.InvokeAsync<IJSObjectReference>("import", "./js/push.js");
-            pushSupported = await pushModule.InvokeAsync<bool>("isSupported");
-            if (pushSupported)
-            {
-                pushPermission = await pushModule.InvokeAsync<string>("permission");
-                // Whether a subscription is actually registered — not just
-                // whether permission is granted — is checked and kept in
-                // sync on every poll tick by RecheckPushSubscription(),
-                // starting with the very first tick pollTimer just queued.
-            }
-        }
-        catch (JSException)
-        {
-            pushSupported = false;
-        }
+            null, TimeSpan.Zero, TimeSpan.FromSeconds(10));
     }
 
     private async Task PollSidecar()
@@ -362,7 +327,6 @@ else
                 // the list regardless of `configured`.
                 alarms = (await Rpc.GetAlarmsAsync())?.alarms ?? alarms;
             }
-            await RecheckPushSubscription();
             if (health?.configured == true)
             {
                 info ??= await Rpc.GetInfoAsync();
@@ -371,75 +335,22 @@ else
                 stateAge = resp?.state_age_seconds;
                 sidecarError = resp?.last_error;
             }
+            consecutiveFailures = 0;
         }
         catch (Exception ex)
         {
-            sidecarError = "sidecar unreachable: " + ex.Message;
-            health = null;
+            consecutiveFailures++;
+            Console.WriteLine($"[PollSidecar] {ex.GetType().Name}: {ex.Message} (consecutive failures: {consecutiveFailures})");
+            // Keep showing the last known-good health/live/info through the
+            // tolerated failures below -- only actually surface "unreachable"
+            // once it's no longer plausibly just a blip.
+            if (consecutiveFailures > MaxTransientFailures)
+            {
+                sidecarError = "sidecar unreachable: " + ex.Message;
+                health = null;
+            }
         }
-        polledOnce = true;
         StateHasChanged();
-    }
-
-    /// <summary>
-    /// Runs every poll tick once a subscription exists: re-registers the
-    /// browser's current PushSubscription with the sidecar (a cheap no-op
-    /// there if nothing changed — see AlarmStore.add_subscription) so a
-    /// subscription the sidecar dropped as dead (push service said 404/410)
-    /// self-heals as long as the browser's own copy is still good, and flips
-    /// pushSubscribed back off if the browser's copy is gone entirely — a
-    /// real gap found in testing: the card used to keep claiming
-    /// notifications were enabled long after the subscription behind them
-    /// had quietly been dropped, with nothing on screen to say so.
-    /// </summary>
-    private async Task RecheckPushSubscription()
-    {
-        if (!pushSupported || pushModule is null || pushPermission != "granted") return;
-        try
-        {
-            var existing = await pushModule.InvokeAsync<JsonElement?>("getExistingSubscription");
-            pushSubscribed = existing is { ValueKind: JsonValueKind.Object } sub
-                && await Rpc.SubscribePushAsync(sub);
-        }
-        catch
-        {
-            // Best-effort — a failed recheck shouldn't disrupt the rest of the poll.
-        }
-    }
-
-    private async Task EnableNotifications()
-    {
-        if (pushModule is null) return;
-        notifBusy = true;
-        notifError = null;
-        try
-        {
-            pushPermission = await pushModule.InvokeAsync<string>("requestPermission");
-            if (pushPermission != "granted")
-            {
-                if (pushPermission == "denied")
-                    notifError = "Notifications are blocked for this site.";
-                return;
-            }
-            var vapidKey = await Rpc.GetVapidPublicKeyAsync();
-            if (string.IsNullOrEmpty(vapidKey))
-            {
-                notifError = "Could not reach the grill bridge for the push key.";
-                return;
-            }
-            var subscription = await pushModule.InvokeAsync<JsonElement>("subscribe", vapidKey);
-            pushSubscribed = await Rpc.SubscribePushAsync(subscription);
-            if (!pushSubscribed)
-                notifError = "The grill bridge rejected the subscription.";
-        }
-        catch (Exception ex)
-        {
-            notifError = "Enabling notifications failed: " + ex.Message;
-        }
-        finally
-        {
-            notifBusy = false;
-        }
     }
 
     private async Task AddAlarm()
@@ -607,6 +518,23 @@ else
             actionFailed = !r.ok;
             await PollSidecar();
         }
+        catch (System.Text.Json.JsonException)
+        {
+            // The ESP32's handle_command_() (pitboss_grill.cpp) finishes the
+            // whole BLE round trip -- and applies the command -- before it
+            // ever builds this JSON reply, so a malformed/empty body here
+            // means the reply got corrupted in transit, not that the grill
+            // didn't get the command. Confirmed live 2026-09-14: power_on
+            // occasionally hits exactly this (turning the grill on is real
+            // BLE traffic on the ESP32's one shared radio, right as it's
+            // trying to send the reply back over WiFi -- see
+            // docs/ESP32_FIRMWARE_PLAN.md's 2026-09-11 follow-up), and the
+            // grill turns on anyway. Reassure instead of a scary parse
+            // error, and re-poll so the real state speaks for itself.
+            actionMessage = "Command likely went through, but the reply got garbled in transit (WiFi/BLE congestion) — check the status above.";
+            actionFailed = false;
+            await PollSidecar();
+        }
         catch (Exception ex)
         {
             actionMessage = "sidecar error: " + ex.Message;
@@ -644,14 +572,10 @@ else
             ? v.ToString()
             : fw.ToString();
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         pollTimer?.Dispose();
         confirmTimer?.Dispose();
-        if (pushModule is not null)
-        {
-            try { await pushModule.DisposeAsync(); }
-            catch (JSDisconnectedException) { /* page is already unloading */ }
-        }
+        return ValueTask.CompletedTask;
     }
 }

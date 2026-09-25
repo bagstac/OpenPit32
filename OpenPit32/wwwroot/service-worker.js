@@ -8,8 +8,3 @@ self.addEventListener('fetch', () => { });
 // take over immediately instead of waiting for every tab to close.
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
-
-// Push notifications (grill alarms) work the same in dev as in production —
-// only the offline asset cache above is dev-specific — so both workers share
-// this handling. See push-worker.js.
-self.importScripts('./push-worker.js');
