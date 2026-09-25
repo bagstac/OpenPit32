@@ -47,6 +47,17 @@ async function onActivate() {
 }
 
 async function onFetch(event) {
+    // /login and /logout are real server routes (scripts/login_service.py,
+    // proxied by nginx) — not Blazor client-side routes. Serving the cached
+    // app shell for these (as every other navigation gets below) means the
+    // request never reaches the auth service at all: clicking "Log out"
+    // would just re-render the cached SPA instead of ever clearing the
+    // session cookie server-side.
+    const url = new URL(event.request.url);
+    if (url.pathname === '/login' || url.pathname === '/logout') {
+        return fetch(event.request);
+    }
+
     let cachedResponse = null;
     if (event.request.method === 'GET') {
         // A client-side route (e.g. /grill) isn't a real file, so serve the
