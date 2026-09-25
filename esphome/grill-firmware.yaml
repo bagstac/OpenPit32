@@ -74,6 +74,19 @@ wifi:
   # rather than accept periodic BLE collisions for a roam that could never
   # help here anyway.
   post_connect_roaming: false
+  # ESPHome defaults classic ESP32 to "light" (modem-sleep) power save, which
+  # is not the mainline WiFi flakiness fix here (that's roaming/mDNS above) —
+  # it's the known cause of a WiFi link that drops and then never recovers on
+  # its own, exactly the "needs a physical power cycle" symptom found live
+  # 2026-09-25. Modem sleep periodically powers the radio down between
+  # beacons; on this board it shares the one 2.4GHz radio with the BLE link
+  # to the grill (see the post_connect_roaming writeup above and
+  # docs/STATE.md gotcha #7's RPC-timeout history) and can leave the WiFi
+  # driver's own state machine wedged badly enough that even `reboot_timeout`
+  # below never gets to run (that check lives in the same cooperative main
+  # loop this component's BLE/RPC handling shares). Disabling power save
+  # outright costs nothing here — this board runs on USB power, not battery.
+  power_save_mode: none
 
 api:
   encryption:
