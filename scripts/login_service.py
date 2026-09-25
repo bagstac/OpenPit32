@@ -21,10 +21,14 @@ model/probe-targets routes — see the plan's "What's removed entirely"
 section and decisions #3/#6).
 
 Configuration, all from the environment:
-  AUTH_USERNAME / AUTH_PASSWORD — the login. Required for /auth-check to
-    ever allow anyone in; left unset, it always denies rather than
-    accidentally leaving a deployment open (same fail-closed behavior the
-    old sidecar had).
+  AUTH_USERS — one or more logins, "user1:pass1,user2:pass2". Merged with
+    AUTH_USERNAME/AUTH_PASSWORD below if both are set (a duplicate username
+    in AUTH_USERS wins). At least one of AUTH_USERS or AUTH_USERNAME+
+    AUTH_PASSWORD is required for /auth-check to ever allow anyone in; left
+    unset, it always denies rather than accidentally leaving a deployment
+    open (same fail-closed behavior the old sidecar had).
+  AUTH_USERNAME / AUTH_PASSWORD — a single login, kept for deployments that
+    only ever needed one. Equivalent to one more entry in AUTH_USERS.
   AUTH_SECRET — signs the session cookie. Generate one and set it
     explicitly to invalidate every session at once (e.g. after changing
     AUTH_PASSWORD); left unset, one is created on first run and persisted
@@ -82,6 +86,27 @@ def load_or_create_auth_secret(configured: str | None, path: Path) -> bytes:
     secret = secrets.token_bytes(32)
     path.write_text(secret.hex(), encoding="utf-8")
     return secret
+
+
+def parse_users(auth_users: str | None, legacy_username: str | None,
+                legacy_password: str | None) -> dict[str, str]:
+    """AUTH_USERS ("user1:pass1,user2:pass2") merged with legacy AUTH_USERNAME/PASSWORD."""
+    users: dict[str, str] = {}
+    if legacy_username and legacy_password:
+        users[legacy_username] = legacy_password
+    for pair in (auth_users or "").split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        username, _, password = pair.partition(":")
+        if username and password:
+            users[username] = password
+    return users
+
+
+def _check_credentials(users: dict[str, str], username: str, password: str) -> bool:
+    return any(hmac.compare_digest(username, u) and hmac.compare_digest(password, p)
+              for u, p in users.items())
 
 
 def _sign(secret: bytes, *parts: str) -> str:
@@ -153,8 +178,7 @@ LOGIN_PAGE = """\
 """
 
 
-def make_app(auth_username: str | None, auth_password: str | None,
-            auth_secret: bytes) -> web.Application:
+def make_app(users: dict[str, str], auth_secret: bytes) -> web.Application:
     allowed_origins = {
         o.strip()
         for o in os.environ.get(
@@ -195,24 +219,23 @@ def make_app(auth_username: str | None, auth_password: str | None,
             content_type="text/html")
 
     async def login_submit(request):
-        if not auth_username or not auth_password:
+        if not users:
             return web.Response(
-                text="Login is not configured — set AUTH_USERNAME and "
-                     "AUTH_PASSWORD (see docker/README.md).",
+                text="Login is not configured — set AUTH_USERS (or "
+                     "AUTH_USERNAME/AUTH_PASSWORD) (see docker/README.md).",
                 status=500)
         body = await request.post()
         username = str(body.get("username") or "")
         password = str(body.get("password") or "")
         next_url = _safe_next(str(body.get("next") or ""))
-        ok = (hmac.compare_digest(username, auth_username)
-              and hmac.compare_digest(password, auth_password))
+        ok = _check_credentials(users, username, password)
         del password, body
         if not ok:
             _LOGGER.info("login failed for username %r", username)
             await asyncio.sleep(LOGIN_FAIL_DELAY)
             raise web.HTTPFound(f"/login?error=1&next={next_url}")
         resp = web.HTTPFound(next_url)
-        resp.set_cookie(SESSION_COOKIE, make_session_cookie(auth_secret, auth_username),
+        resp.set_cookie(SESSION_COOKIE, make_session_cookie(auth_secret, username),
                         max_age=SESSION_MAX_AGE, httponly=True, samesite="Lax", path="/")
         raise resp
 
@@ -225,11 +248,12 @@ def make_app(auth_username: str | None, auth_password: str | None,
         # nginx auth_request target (docker/nginx.conf.template): status
         # code only, body/headers discarded. Fails closed if login isn't
         # configured at all, rather than leaving a misconfigured deployment
-        # wide open.
-        if not auth_username or not auth_password:
+        # wide open. The cookie doesn't carry its username in cleartext, so
+        # check it against every configured user (the list is always small).
+        if not users:
             return web.Response(status=401)
         cookie = request.cookies.get(SESSION_COOKIE)
-        ok = session_cookie_valid(auth_secret, auth_username, cookie)
+        ok = any(session_cookie_valid(auth_secret, u, cookie) for u in users)
         return web.Response(status=204 if ok else 401)
 
     app.router.add_get("/login", login_page)
@@ -243,23 +267,24 @@ async def main():
     port = int(os.environ.get("LOGIN_SERVICE_PORT", DEFAULT_PORT))
     secret_path = Path(os.environ.get("AUTH_SECRET_PATH", str(DEFAULT_SECRET_PATH)))
 
-    auth_username = os.environ.get("AUTH_USERNAME")
-    auth_password = os.environ.get("AUTH_PASSWORD")
+    users = parse_users(os.environ.get("AUTH_USERS"),
+                        os.environ.get("AUTH_USERNAME"), os.environ.get("AUTH_PASSWORD"))
     auth_secret = load_or_create_auth_secret(os.environ.get("AUTH_SECRET"), secret_path)
-    if not (auth_username and auth_password):
+    if not users:
         _LOGGER.warning(
-            "AUTH_USERNAME/AUTH_PASSWORD not set — /auth-check will always "
-            "deny; fine for local dev, but docker/nginx.conf.template's "
-            "login gate won't let anyone in until these are set")
+            "AUTH_USERS/AUTH_USERNAME+AUTH_PASSWORD not set — /auth-check "
+            "will always deny; fine for local dev, but "
+            "docker/nginx.conf.template's login gate won't let anyone in "
+            "until these are set")
 
-    app = make_app(auth_username, auth_password, auth_secret)
+    app = make_app(users, auth_secret)
     runner = web.AppRunner(app)
     await runner.setup()
     bind_host = os.environ.get("LOGIN_SERVICE_HOST", "127.0.0.1")
     site = web.TCPSite(runner, bind_host, port)
     await site.start()
-    print(f"login service listening on http://{bind_host}:{port} "
-          f"({'configured' if auth_username and auth_password else 'NOT configured'})")
+    status = f"{len(users)} user(s) configured" if users else "NOT configured"
+    print(f"login service listening on http://{bind_host}:{port} ({status})")
     try:
         await asyncio.Event().wait()
     finally:

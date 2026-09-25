@@ -24,10 +24,11 @@ services:
     ports:
       - "8091:8091"
     environment:
-      # The login nginx requires for the whole app (docker/nginx.conf.template's
+      # The login(s) nginx requires for the whole app (docker/nginx.conf.template's
       # auth_request calls this same container's /auth-check). Leaving
       # these unset fails closed — /auth-check always denies — rather than
       # accidentally shipping an open deployment.
+      AUTH_USERS: ${AUTH_USERS:-}
       AUTH_USERNAME: ${AUTH_USERNAME:-}
       AUTH_PASSWORD: ${AUTH_PASSWORD:-}
       # Optional: set to invalidate every existing session at once (e.g.

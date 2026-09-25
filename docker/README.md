@@ -40,6 +40,16 @@ isn't the password, just proof someone once knew it — so also set
 `AUTH_SECRET` to any new value if you want to force everyone to log in
 again immediately (e.g. you suspect the login is compromised).
 
+Adding another person with their own login: set `AUTH_USERS` in `.env` to
+`username:password` pairs separated by commas, e.g.
+`AUTH_USERS=alice:hunter2,bob:correcthorse`, then `docker compose up -d`
+(recreates `auth` only). It's merged with `AUTH_USERNAME`/`AUTH_PASSWORD` if
+those are still set, so the original login keeps working unless you also
+give it a username already listed in `AUTH_USERS` (that entry wins). Each
+person logs in with their own username/password; sessions aren't tied to
+which one they used, so revoking a single person's access means changing
+their entry (or everyone's `AUTH_SECRET`, which logs out all of them).
+
 ## Updating
 
 ```
