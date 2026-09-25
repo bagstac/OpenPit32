@@ -57,14 +57,18 @@ since there's no login gate without nginx in front.
    browser or on the PC. Afterwards the Home card → `/grill` (status +
    controls), `/health` (link diagnostics), `/settings` (Link Settings —
    the error-display-threshold field, moved off `/grill` 2026-09-13 so it
-   doesn't crowd the live status/controls view).
+   doesn't crowd the live status/controls view; also a **Log out** button,
+   2026-09-25 — a no-op outside Docker, since there's no session to end).
 
 Alternative: `docker compose up -d --build` runs the web app + a small
 login-only auth service as two containers behind nginx on one host
 (`docker/README.md`) — nginx fans `/api/*` out to the ESP32 directly for
 every grill/alarm route, and to the auth container only for
-`/login`/`/logout`/`/auth-check`. `OpenPit32/Program.cs` picks the API base
-URL at compile time via the `DOCKER_DEPLOY` constant (`docker/web.Dockerfile`
+`/login`/`/logout`/`/auth-check`. `AUTH_USERS` (2026-09-25) supports several
+independent username/password logins in one deployment, on top of the
+original single `AUTH_USERNAME`/`AUTH_PASSWORD` pair (still works, merged
+in) — see `docker/README.md`. `OpenPit32/Program.cs` picks the API base URL
+at compile time via the `DOCKER_DEPLOY` constant (`docker/web.Dockerfile`
 sets it), not at runtime, after two runtime-detection approaches both
 proved unreliable (see `docs/PLAN.md` history if resurrecting this).
 
@@ -199,6 +203,31 @@ signed-session-cookie login form, holding no grill state of any kind.
    evict whatever Cloudflare already cached before the fix landed; that
    needs one manual purge (dashboard → Caching → Configuration → Purge
    Cache) the first time this bites.
+10. **WiFi that drops and never reconnects on its own, needing a physical
+    power cycle** — found live 2026-09-25 (reproduced live: the ESP32 was
+    unreachable at the time this was diagnosed). Root cause: ESPHome
+    defaults classic ESP32 to `power_save_mode: light` (modem-sleep) when
+    not set explicitly, which `grill-firmware.yaml` never did. Modem sleep
+    is a known cause of a WiFi link that can't recover itself, worse here
+    since WiFi shares the one 2.4GHz radio with the grill's BLE link (same
+    root-cause family as gotcha 7's roaming-scan collisions) — badly enough
+    that even the built-in `reboot_timeout: 15min` self-reboot safety net
+    (which itself needs the same cooperative main loop to keep ticking)
+    never got to run. Fixed with `power_save_mode: none` in
+    `grill-firmware.yaml`'s `wifi:` block — free on this board, which runs
+    on USB power, not battery.
+11. **The PWA service worker swallowed `/login` and `/logout`, so clicking
+    Log out silently did nothing** (found live 2026-09-25, same day the
+    Settings page's Log out button was added). `service-worker.published.js`'s
+    `onFetch()` served the cached app shell for *every* navigation request,
+    on the assumption that any path not backed by a real file is a
+    client-side Blazor route (e.g. `/grill`) — true for those, but `/login`
+    and `/logout` are real server routes proxied to `scripts/login_service.py`,
+    not Blazor `@page`s. The cached-shell response meant the browser never
+    actually reached the auth service to clear the session cookie; a manual
+    hard refresh happened to work around it inconsistently. Fixed by
+    special-casing those two paths in `onFetch()` to always go straight to
+    `fetch()`, never the cache.
 
 ## Files map
 - `scripts/login_service.py` — the entire Python surface now: login form +

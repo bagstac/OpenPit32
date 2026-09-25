@@ -21,8 +21,8 @@ a PC-side process.
   a redeploy takes over any open copy immediately rather than requiring
   everyone to close and reopen it first
 - Optional Docker deployment with a real login form (password-manager
-  friendly) for exposing it beyond your LAN — see
-  [docker/README.md](docker/README.md)
+  friendly, supports multiple separate logins) for exposing it beyond your
+  LAN — see [docker/README.md](docker/README.md)
 
 Unofficial, unaffiliated with Dansons / Pit Boss. It talks to a real appliance
 that makes fire — see [Safety](#safety).
@@ -70,7 +70,10 @@ command table re-derived the same way.
   and clear of the grill's metal body.
 - A phone with Telegram, if you want alarm notifications (optional — alarms
   still fire and clear on schedule either way, they just log instead of
-  sending anywhere without a bot configured).
+  sending anywhere without a bot configured). `telegram_chat_id` can point
+  at a group instead of a private chat to notify more than one person with
+  the same bot — add the bot to the group and use the group's (negative)
+  chat id.
 
 ## Setup
 
@@ -111,7 +114,8 @@ browser and PC store nothing.
 
 From then on: the Home card shows live temps; **Status & controls** is the
 grill page (including the Alarms card); **Bridge health** shows the BLE and
-WiFi links.
+WiFi links; **Settings** has the link-error-display threshold and, on a
+Docker deployment, a **Log out** button.
 
 ### Or with Docker
 
