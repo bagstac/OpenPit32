@@ -9,6 +9,13 @@
     <a class="btn btn-outline-secondary btn-sm" href="/">Back</a>
 </div>
 
+<div class="card pb-card mb-3">
+    <div class="card-header">Account</div>
+    <div class="card-body">
+        <a class="btn btn-outline-secondary btn-sm" href="/logout">Log out</a>
+    </div>
+</div>
+
 @if (health is null && consecutiveFailures <= MaxTransientFailures)
 {
     <p class="text-muted">Connecting to the grill bridge…</p>
