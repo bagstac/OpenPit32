@@ -1,5 +1,6 @@
 @page "/settings"
 @inject GrillRpcService Rpc
+@inject NavigationManager Nav
 @implements IDisposable
 
 <PageTitle>Settings — OpenPit32</PageTitle>
@@ -12,7 +13,7 @@
 <div class="card pb-card mb-3">
     <div class="card-header">Account</div>
     <div class="card-body">
-        <a class="btn btn-outline-secondary btn-sm" href="/logout">Log out</a>
+        <button class="btn btn-outline-secondary btn-sm" @onclick="Logout">Log out</button>
     </div>
 </div>
 
@@ -167,6 +168,11 @@ else
             errorThresholdBusy = false;
         }
     }
+
+    // /logout isn't a Blazor @page, so a plain <a href> gets swallowed by
+    // the SPA router's own "not found" instead of ever reaching nginx.
+    // forceLoad bypasses client-side routing for a real browser navigation.
+    private void Logout() => Nav.NavigateTo("/logout", forceLoad: true);
 
     public void Dispose() => pollTimer?.Dispose();
 }
