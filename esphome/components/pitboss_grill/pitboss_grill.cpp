@@ -1632,18 +1632,30 @@ void PitbossGrill::handle_command_(AsyncWebServerRequest *request) {
   // rejected command (bad confirm, grill not connected) is on record too,
   // not just ones that actually reached the grill.
   std::string source_ip = this->get_client_ip_(request);
-  auto log_command = [this, &action, has_value, value, &source_ip](bool ok, const std::string &err) {
+  // 2026-10-12: this handler runs on the httpd task, which is a small-stack
+  // task, and log_event_() blocks for a whole HTTP round trip (its own
+  // esp_http_client, with its own watchdog manager and 512-byte buffers).
+  // Doing that inline here is what was crashing the ESP32: "Fault -
+  // LoadProhibited" in lwip's tcp_new_port, walking a tcp_pcb list that had
+  // been corrupted — i.e. this task's stack writing past its end into
+  // adjacent heap, which is where lwip's PCBs live. Every other log_event_
+  // caller already defers onto the main loop for exactly this reason; do it
+  // here too. Everything is captured BY VALUE: this handler has returned,
+  // and its locals are long gone, by the time the deferred call runs.
+  auto log_command = [this, action, has_value, value, source_ip](bool ok, const std::string &err) {
     if (action.empty())
       return;
-    this->log_event_("command", [&](JsonObject root) {
-      root["action"] = action;
-      if (has_value)
-        root["value"] = value;
-      root["ok"] = ok;
-      if (!err.empty())
-        root["error"] = err;
-      if (!source_ip.empty())
-        root["source_ip"] = source_ip;
+    this->defer([this, action, has_value, value, source_ip, ok, err]() {
+      this->log_event_("command", [&](JsonObject root) {
+        root["action"] = action;
+        if (has_value)
+          root["value"] = value;
+        root["ok"] = ok;
+        if (!err.empty())
+          root["error"] = err;
+        if (!source_ip.empty())
+          root["source_ip"] = source_ip;
+      });
     });
   };
 

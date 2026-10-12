@@ -90,45 +90,42 @@ you want one.
 
 ## Grill event log
 
-> **KNOWN BUG — the firmware half of this crashes the ESP32. Do not enable
-> `event_log_url` until it is fixed (found 2026-10-12, still open).**
-> With the URL set, the ESP32 resets on the `HttpRequestComponent::post()`
-> the event log makes: it reboots every ~60-120 s while commands are being
-> issued, and the live grill monitor goes offline with each reset. Decoded
-> from the firmware's own crash reporter (`esp32.crash`):
+> **FIXED 2026-10-12 — the crash below came from doing the POST on the httpd
+> task; `log_event_()` is now deferred onto the main loop like every other
+> caller.**
 >
-> ```
-> Reason: Fault - LoadProhibited    Crashed core: 1
-> PC: 0x401362EC   tcp_new_port at lwip/src/core/tcp.c:1035
-> BT1 tcp_connect · BT7 connect · BT8 esp_tls_plain_tcp_connect ·
-> BT11 esp_http_client_connect · BT12 esp_http_client_open ·
-> BT13 HttpRequestIDF::perform · BT14 HttpRequestComponent::start ·
-> BT15 HttpRequestComponent::post
-> ```
+> Original symptom: with `event_log_url` set, the ESP32 reset on its own event
+> POST — `Fault - LoadProhibited` in lwip's `tcp_new_port` (tcp.c:1035, the
+> `tcp_pcb` list walk, *after* its NULL guard), reached via
+> `HttpRequestComponent::post` → `HttpRequestIDF::perform` →
+> `esp_http_client_open` → `tcp_connect`. It rebooted every ~60-120 s while
+> commands were being issued, taking the live grill monitor offline with each
+> reset — and the crashing request was the one that should have written the
+> event, so `grill_events.db` never received a single row.
 >
-> `tcp.c:1035` is `if (pcb->local_port == tcp_port)`, the PCB-list walk
-> inside `tcp_new_port()` — *after* its own `pcb != NULL` guard. So lwip's
-> `tcp_pcb` list holds a stale pointer by the time this connect runs:
-> something is freeing or corrupting a PCB. The event log's database has
-> never received a single row, i.e. the requests that crash it are exactly
-> the ones that should have written them.
+> Cause: `handle_command_()` runs on the httpd task and called `log_event_()`
+> *inline*, and that call blocks for a whole HTTP round trip (its own
+> `esp_http_client`, with its own watchdog manager and 512-byte buffers). The
+> httpd task is a small-stack task, so that stack ran past its end into
+> adjacent heap — and adjacent heap is where lwip keeps its PCBs, hence a
+> `tcp_pcb` list holding garbage. Every other `log_event_()` caller (connect,
+> disconnect, setpoint_jump) already deferred onto the main loop for exactly
+> this reason; the command path was the one that didn't. `notify_()`'s
+> Telegram POST has the same shape and is called from the main loop already,
+> but it has still never been exercised end to end — an alarm firing is
+> unverified.
 >
-> `notify_()`'s Telegram POST uses the same `post(...)` → `container->end()`
-> shape and should be treated as equally suspect (the alarm path has never
-> been exercised end to end either).
+> Verified after the fix: two deliberate `set_temp` commands, each carrying
+> the setpoint the grill already had so nothing about the burn changed. The
+> device stayed up through both (uptime 31→94 s, then 119→182 s; the old
+> build died inside ~70 s), and each command landed in `grill_events.db` and
+> came back through `GET /api/events` on both the LAN and the public
+> hostname, with the right `action`, `value`, `ok` and `source_ip`.
 >
-> Two things to check first: `log_event_()` is called *inline from the httpd
-> task* by `handle_command_()` while every other caller defers onto the main
-> loop — and it is the command path that has been seen crashing; and whether
-> `container->end()` plus the container `shared_ptr`'s destructor can close
-> the same connection twice. Reproduce with the log stream running (the
-> crash report prints the full backtrace, and `addr2line -e firmware.elf`
-> resolves the frames the decoder leaves undecoded).
->
-> Everything else in this feature — the nginx `/api/events` route, the auth
-> service's `/log-event` + `/log-events`, and the app's `/events` page — is
-> deployed and verified; they simply sit idle while `event_log_url` is empty,
-> which is the only firmware configuration that has run clean.
+> Known gap, not a regression: a **connect event at boot** has yet to produce
+> a row. The BLE link comes up before WiFi has an address, so that first POST
+> fails — and its warning is logged before any log stream is usually attached
+> to see it. Everything after the network is up is unaffected.
 
 2026-10-05: set up to answer "what's resetting the setpoint to 130?" — was
 it a stray command from the real Pit Boss app/cloud, or something in this
