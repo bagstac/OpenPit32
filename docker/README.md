@@ -111,9 +111,11 @@ you want one.
 > `tcp_pcb` list holding garbage. Every other `log_event_()` caller (connect,
 > disconnect, setpoint_jump) already deferred onto the main loop for exactly
 > this reason; the command path was the one that didn't. `notify_()`'s
-> Telegram POST has the same shape and is called from the main loop already,
-> but it has still never been exercised end to end — an alarm firing is
-> unverified.
+> Telegram POST has the same shape and *is* exercised: a real alarm was fired on
+> 2026-10-12 and the message was delivered with the box staying up (uptime 663 s
+> and climbing, no reset, no crash report). That is the independent evidence
+> that the POST itself was never the problem — only the task it ran on, which is
+> the whole reason the fix is a `defer()` and not a change to the request code.
 >
 > Verified after the fix: two deliberate `set_temp` commands, each carrying
 > the setpoint the grill already had so nothing about the burn changed. The
