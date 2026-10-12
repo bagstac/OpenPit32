@@ -41,7 +41,12 @@ const string GRILL_HOST = "192.168.1.114"; // <- your grill's ESP32 LAN IP
 var apiBase = new Uri($"http://{GRILL_HOST}/");
 #endif
 builder.Services.AddTransient<IncludeCredentialsHandler>();
+// Turns a session that has gone stale behind nginx's login gate into a
+// login prompt rather than a "can't reach the ESP32" error — see the
+// handler's own comment for the 2026-10-12 failure this fixes.
+builder.Services.AddTransient<SessionExpiryHandler>();
 builder.Services.AddHttpClient<GrillRpcService>(client => client.BaseAddress = apiBase)
-    .AddHttpMessageHandler<IncludeCredentialsHandler>();
+    .AddHttpMessageHandler<IncludeCredentialsHandler>()
+    .AddHttpMessageHandler<SessionExpiryHandler>();
 
 await builder.Build().RunAsync();

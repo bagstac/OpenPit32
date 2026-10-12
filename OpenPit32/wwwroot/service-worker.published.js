@@ -16,6 +16,29 @@ const cacheName = `${cacheNamePrefix}${self.assetsManifest.version}`;
 const offlineAssetsInclude = [/\.dll$/, /\.pdb$/, /\.wasm/, /\.html/, /\.js$/, /\.json$/, /\.css$/, /\.woff$/, /\.png$/, /\.jpe?g$/, /\.gif$/, /\.ico$/, /\.blat$/, /\.dat$/, /\.svg$/];
 const offlineAssetsExclude = [/^service-worker\.js$/];
 
+// A navigation the login gate bounced cannot be answered with the bounced
+// response itself (see onFetch), so hand back a page that walks the browser
+// to the real /login. Both mechanisms on purpose: the meta refresh needs no
+// JavaScript at all, the script catches a browser that ignores it, and the
+// link is there for anyone reading it.
+function loginRedirectPage(path) {
+    // Only the shape of the requested URL is reused, and anything that could
+    // break out of an HTML attribute or a script literal is dropped: this is
+    // a URL the caller chose, not something to trust.
+    const requested = (path || '/').replace(/[<>"'`\\]/g, '');
+    const next = requested.charAt(0) === '/' ? requested : '/';
+    const target = '/login?next=' + next;
+    return new Response(
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+        '<meta http-equiv="refresh" content="0;url=' + target + '">' +
+        '<title>OpenPit32 — Log in</title></head><body>' +
+        '<p>Your OpenPit32 session has expired. ' +
+        '<a href="' + target + '">Log in</a>.</p>' +
+        '<script>location.replace(' + JSON.stringify(target) + ');</script>' +
+        '</body></html>',
+        { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
 async function onInstall() {
     console.info('Service worker: install');
 
@@ -58,15 +81,53 @@ async function onFetch(event) {
         return fetch(event.request);
     }
 
+    // A navigation is a client-side route (e.g. /grill) that isn't a real
+    // file, so the app shell stands in for it — matches nginx's own
+    // try_files fallback. NETWORK FIRST, with the cached shell only as the
+    // offline fallback. The shell is served by a login gate, and an
+    // unauthenticated navigation comes back as a redirect to /login (fetch
+    // follows it transparently), so serving the cached shell from the cache
+    // here would boot a logged-out app whose every /api/* call is redirected
+    // too — which is exactly how a lost session used to present itself as an
+    // unreachable grill instead of a login form (2026-10-12), with no way
+    // back: every navigation re-rendered the same cached shell, so the login
+    // page could never be reached from the installed PWA.
+    if (event.request.method === 'GET' && event.request.mode === 'navigate') {
+        const cache = await caches.open(cacheName);
+        try {
+            // cache: 'no-cache' is load-bearing: the app shell carries no
+            // Cache-Control (nginx:alpine sends none for it), so a plain
+            // fetch() can be answered from the browser's own HTTP cache
+            // without ever reaching the server — hiding the redirect this
+            // whole branch exists to surface.
+            const response = await fetch(event.request, { cache: 'no-cache' });
+            if (response.ok && !response.redirected) {
+                await cache.put('index.html', response.clone());
+                return response;
+            }
+            // Anything else means the login gate bounced this navigation:
+            // either the login page (if the redirect was followed) or an
+            // opaque redirect. Neither can be handed back as the response to
+            // a navigation — the browser rejects a followed redirect's target
+            // with ERR_FAILED, measured 2026-10-12 — so answer with a
+            // synthetic page that sends the browser to the real /login,
+            // which reaches the auth service because /login is excluded from
+            // the cache above.
+            return loginRedirectPage(url.pathname + url.search);
+        } catch (error) {
+            const cached = await cache.match('index.html');
+            if (cached) return cached;
+            return new Response('Offline, and no cached copy of the app shell.', {
+                status: 503,
+                headers: { 'Content-Type': 'text/plain' }
+            });
+        }
+    }
+
     let cachedResponse = null;
     if (event.request.method === 'GET') {
-        // A client-side route (e.g. /grill) isn't a real file, so serve the
-        // app shell for any navigation and let the Blazor router take over —
-        // matches nginx's own try_files fallback for the online case.
-        const shouldServeIndexHtml = event.request.mode === 'navigate';
-        const request = shouldServeIndexHtml ? 'index.html' : event.request;
         const cache = await caches.open(cacheName);
-        cachedResponse = await cache.match(request);
+        cachedResponse = await cache.match(event.request);
     }
 
     return cachedResponse || fetch(event.request);
