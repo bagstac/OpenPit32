@@ -88,6 +88,59 @@ you want one.
 - `.env` holds the app's login; git-ignored, same as `esphome/secrets.yaml`
   for a bare-metal ESP32 flash.
 
+## Grill event log
+
+2026-10-05: set up to answer "what's resetting the setpoint to 130?" — was
+it a stray command from the real Pit Boss app/cloud, or something in this
+project? Until now, nothing here logged who/what sent a command at all.
+
+With `EVENT_LOG_TOKEN` set in `.env` and the matching `event_log_url`/
+`event_log_token` uncommented in `esphome/grill-firmware.yaml` (pointed at
+`http://<HOST_IP>:8091/log-event` — the `auth` container's own LAN port,
+not through nginx, since this isn't a browser request and doesn't need the
+login gate), the ESP32 itself POSTs one JSON event, bearer-authenticated,
+for each of:
+
+- every `POST /command` (`power_on`/`power_off`/`set_temp`), with the
+  action, value, whether it succeeded, and the caller's IP;
+- every BLE connect/disconnect to the grill — lets you tell "the official
+  app took the one BLE connection instead" apart from "a command came
+  through this project's own `/command`";
+- any setpoint change the ESP32 observes that *isn't* explained by a
+  command it just dispatched itself — the strongest signal, since it
+  catches a reset coming from somewhere this project never touches at all
+  (the real app connecting directly, the Pit Boss cloud relay, the grill's
+  own auto-shutoff).
+
+`auth` (`scripts/login_service.py`) writes these to a small SQLite file —
+`grill_events.db` in the same `grill-data` volume the session-signing
+secret already lives in, **not** RBP1/pi-spare-01: the ESP32 can't mount
+an NFS share or speak SQLite, and this app host (`srv-mc-01`) has no
+existing NFS mount to that Pi (the one that exists today only reaches
+`pi-print-01`, for an unrelated app's database) — so keeping this one
+local avoids inventing a cross-host dependency for a database this small.
+
+Inspect it directly on the host:
+
+```
+docker compose exec auth sqlite3 /data/grill_events.db \
+    "SELECT datetime(received_at, 'unixepoch'), event, action, value, ok, error, source_ip FROM grill_events ORDER BY received_at DESC LIMIT 20;"
+```
+
+Only events worth looking at are ever written here — never routine status
+polling — so there's no further "keep only the interesting ones"
+filtering to do. What still needs bounding is how far back even that
+smaller set is kept, on a host with limited disk: `scripts/
+cleanup_grill_events.py` deletes rows older than `EVENT_LOG_RETENTION_DAYS`
+(default 30), and isn't run automatically by anything in this repo — same
+limitation as the `docker builder prune` cron job below, since nothing in
+this Docker stack can schedule something on the host itself:
+
+```
+# crontab -e (as the user docker compose runs under), once daily
+0 3 * * * cd ~/openpit32 && docker compose exec -T auth python3 cleanup_grill_events.py >>~/openpit32-cleanup.log 2>&1
+```
+
 ## Disk space on a small host (e.g. a Raspberry Pi)
 
 Found live 2026-09-13 on the Pi this actually runs on: a run of same-day

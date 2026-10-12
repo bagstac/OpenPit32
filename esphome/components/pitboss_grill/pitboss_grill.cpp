@@ -7,6 +7,8 @@
 #include <esp_http_server.h>
 #include <esp_random.h>
 #include <nvs.h>
+#include <lwip/inet.h>
+#include <lwip/sockets.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -119,6 +121,14 @@ static const char *const CLOUD_BOARD_PREFIX = "PBV2";
 // command). turn-off is universal (FE0102FF, "turn-off" slug).
 static const char *const CMD_TURN_ON = "FE0101FF";
 static const char *const CMD_TURN_OFF = "FE0102FF";
+
+// How long after this firmware's own POST /command a setpoint change seen
+// in a status frame is attributed to that command rather than logged as an
+// unexplained "setpoint_jump" event (see parse_temperature_frame_()). Wider
+// than handle_command_()'s own 12s semaphore wait so a command that
+// succeeded via its one retry (abandon_pending_rpc_(), up to ~2x the 5s
+// RPC_REPLY_TIMEOUT_MS) still falls inside the window.
+static constexpr uint32_t OWN_COMMAND_GRACE_MS = 20000;
 
 // Grill setpoints the PBV2 board honours for this model (PBV5 P2) — pytboss's
 // grills.json temp_increment, 130-420F in 5-degree steps. Fixed here for the
@@ -1117,6 +1127,13 @@ void PitbossGrill::parse_temperature_frame_(const std::string &hex) {
   }
   LockGuard lock(this->state_mutex_);
   auto &s = this->grill_state_;
+  // Captured before this frame overwrites grill_set_temp — see the
+  // setpoint_jump check below. had_prior_reading gates it on there being an
+  // actual previous value to compare against (not this boot's first frame,
+  // where GrillState's {-1} default would otherwise read as a bogus jump).
+  bool had_prior_reading = s.has_temperatures;
+  int16_t prior_set_temp = s.grill_set_temp;
+  bool own_command_recent = (millis() - this->last_own_command_millis_) < OWN_COMMAND_GRACE_MS;
   s.has_temperatures = true;
   this->last_frame_millis_ = millis();
   this->has_frame_millis_ = true;
@@ -1146,6 +1163,29 @@ void PitbossGrill::parse_temperature_frame_(const std::string &hex) {
   }
   ESP_LOGI(TAG, "Temps (%s): grill=%d/%d smoker=%d p1=%d p2=%d p3=%d p4=%d", s.is_fahrenheit ? "F" : "C", s.grill_temp,
            s.grill_set_temp, s.smoker_act_temp, s.p1_temp, s.p2_temp, s.p3_temp, s.p4_temp);
+  // 2026-10-05 investigation: the setpoint changed since the last frame, and
+  // not because this firmware's own POST /command just told it to (that
+  // includes power_on, whose startup-default-130 behavior is itself
+  // "explained" by the command that triggered it) — something else moved
+  // it: the real Pit Boss app connecting directly, the cloud relay, a grill-
+  // side auto-shutoff, or anything else never passing through this ESP32's
+  // own /command route at all. Logged, not treated as an error — there's
+  // nothing to reject here, only something worth recording. this->defer():
+  // this function runs on the BLE stack task when called from on_debug_log_
+  // () (see the header's comment), which must never block on log_event_()'s
+  // HTTP round trip.
+  if (had_prior_reading && s.grill_set_temp != prior_set_temp && !own_command_recent) {
+    int16_t old_value = prior_set_temp;
+    int16_t new_value = s.grill_set_temp;
+    bool fahrenheit = s.is_fahrenheit;
+    this->defer([this, old_value, new_value, fahrenheit]() {
+      this->log_event_("setpoint_jump", [&](JsonObject root) {
+        root["old_value"] = old_value;
+        root["new_value"] = new_value;
+        root["fahrenheit"] = fahrenheit;
+      });
+    });
+  }
 }
 
 void PitbossGrill::request_next_reply_chunk_() {
@@ -1585,6 +1625,28 @@ void PitbossGrill::handle_command_(AsyncWebServerRequest *request) {
   bool has_value = !doc["value"].isNull();
   double value = doc["value"] | 0.0;
 
+  // 2026-10-05: "what's resetting the setpoint to 130?" investigation — the
+  // one piece this project had never logged at all. source_ip is read now
+  // (the request object/socket aren't guaranteed valid once this handler
+  // returns); the log_command lambda is called at every exit below so a
+  // rejected command (bad confirm, grill not connected) is on record too,
+  // not just ones that actually reached the grill.
+  std::string source_ip = this->get_client_ip_(request);
+  auto log_command = [this, &action, has_value, value, &source_ip](bool ok, const std::string &err) {
+    if (action.empty())
+      return;
+    this->log_event_("command", [&](JsonObject root) {
+      root["action"] = action;
+      if (has_value)
+        root["value"] = value;
+      root["ok"] = ok;
+      if (!err.empty())
+        root["error"] = err;
+      if (!source_ip.empty())
+        root["source_ip"] = source_ip;
+    });
+  };
+
   std::string error;
   std::string command_hex;
   if (action == "power_on") {
@@ -1618,6 +1680,7 @@ void PitbossGrill::handle_command_(AsyncWebServerRequest *request) {
     error = "grill not connected";
 
   if (!error.empty()) {
+    log_command(false, error);
     std::string resp = esphome::json::build_json([&](JsonObject root) {
       root["ok"] = false;
       root["error"] = error;
@@ -1647,6 +1710,15 @@ void PitbossGrill::handle_command_(AsyncWebServerRequest *request) {
     }
     this->command_pending_hex_ = command_hex;
     this->pending_after_time_ = PendingReply::MCU_COMMAND;
+    {
+      // Recorded now, not after the round trip completes: parse_temperature_
+      // frame_() just needs "a command was recently dispatched", and this is
+      // the earliest point the main loop is actually about to act on one —
+      // before, not after, the BLE write that could itself trigger a status
+      // push landing first.
+      LockGuard lock(this->state_mutex_);
+      this->last_own_command_millis_ = millis();
+    }
     this->send_get_time_();
   });
 
@@ -1659,6 +1731,7 @@ void PitbossGrill::handle_command_(AsyncWebServerRequest *request) {
   // to succeed via its retry.
   bool completed = xSemaphoreTake(this->command_done_sem_, pdMS_TO_TICKS(12000)) == pdTRUE;
   std::string result_error = completed ? this->command_result_error_ : std::string("timed out waiting for grill");
+  log_command(result_error.empty(), result_error);
 
   std::string resp = esphome::json::build_json([&](JsonObject root) {
     root["ok"] = result_error.empty();
@@ -1974,6 +2047,77 @@ void PitbossGrill::notify_(const std::string &message) {
   container->end();
 }
 
+// 2026-10-05 "what's resetting the setpoint to 130?" investigation — see
+// set_event_log_url()'s header comment. One HTTPS/HTTP POST per event,
+// `{"event": ..., "ts": ..., ...fill()'s fields}`; `ts` is a real Unix
+// timestamp when time_ has synced, 0 otherwise (still orderable against
+// other events from the same boot, just not against wall-clock elsewhere).
+// Mirrors notify_()'s shape deliberately (same no-op-if-unconfigured,
+// same fire-and-forget blocking-the-caller trade-off) rather than sharing
+// code with it — the trigger (an alarm vs. an operational event) and the
+// destination (Telegram vs. this project's own log sink) are unrelated, and
+// notify_() has no caller-supplied JSON fields to parallel this one's `fill`.
+void PitbossGrill::log_event_(const std::string &event, const std::function<void(JsonObject)> &fill) {
+  std::string url, token;
+  {
+    LockGuard lock(this->state_mutex_);
+    url = this->event_log_url_;
+    token = this->event_log_token_;
+  }
+  if (url.empty())
+    return;
+  if (this->http_request_ == nullptr) {
+    ESP_LOGW(TAG, "Cannot log event %s — http_request component missing", event.c_str());
+    return;
+  }
+  double ts = (this->time_ != nullptr && this->time_->now().is_valid()) ? this->time_->now().timestamp : 0;
+  std::string body = esphome::json::build_json([&](JsonObject root) {
+    root["event"] = event;
+    root["ts"] = ts;
+    if (fill)
+      fill(root);
+  });
+  std::string auth_value = "Bearer " + token;
+  std::vector<http_request::Header> headers{{"Content-Type", "application/json"}};
+  if (!token.empty())
+    headers.push_back({"Authorization", auth_value});
+  auto container = this->http_request_->post(url, body, headers);
+  if (container == nullptr) {
+    ESP_LOGW(TAG, "Event log POST failed to start (%s)", event.c_str());
+    return;
+  }
+  if (!http_request::is_success(container->status_code)) {
+    ESP_LOGW(TAG, "Event log POST failed: HTTP %d (%s)", container->status_code, event.c_str());
+  }
+  container->end();
+}
+
+// Reads the caller's IP straight off the httpd request's underlying socket
+// via esp_http_server's own httpd_req_to_sockfd() + a plain getpeername() —
+// there's no higher-level accessor for it on this project's ESP-IDF
+// AsyncWebServerRequest shim (web_server_idf.h), unlike the Arduino
+// ESPAsyncWebServer original most ESPHome examples are written against.
+// Plain sockaddr_in/AF_INET, not sockaddr_in6: this build has no IPv6
+// support compiled into lwip at all (confirmed on the bench — sockaddr_in6
+// is an incomplete type here), and esp_http_server listens on IPv4 only as
+// a result, so every real caller on this LAN already arrives as AF_INET.
+std::string PitbossGrill::get_client_ip_(AsyncWebServerRequest *request) const {
+  httpd_req_t *req = *request;
+  int sockfd = httpd_req_to_sockfd(req);
+  if (sockfd < 0)
+    return "";
+  struct sockaddr_in addr {};
+  socklen_t addr_len = sizeof(addr);
+  if (getpeername(sockfd, reinterpret_cast<struct sockaddr *>(&addr), &addr_len) != 0)
+    return "";
+  if (addr.sin_family != AF_INET)
+    return "";
+  char buf[INET_ADDRSTRLEN] = {0};
+  if (inet_ntop(AF_INET, &addr.sin_addr, buf, sizeof(buf)) == nullptr)
+    return "";
+  return std::string(buf);
+}
+
 // -- Phase 7: POST /setup (cloud password fetch) --
 //
 // A direct port of scripts/pitboss_cloud.py's fetch_and_save() onto the
@@ -2206,6 +2350,10 @@ bool PitbossGrill::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
     case ESP_GATTC_OPEN_EVT: {
       if (param->open.status == ESP_GATT_OK) {
         ESP_LOGI(TAG, "Connected to grill — discovering services...");
+        // This task is the BLE stack's own — log_event_() blocks on an HTTP
+        // round trip, so it must run on the main loop instead (same reason
+        // notify_() is never called from here either).
+        this->defer([this]() { this->log_event_("connect", nullptr); });
       }
       break;
     }
@@ -2213,6 +2361,15 @@ bool PitbossGrill::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
     case ESP_GATTC_CLOSE_EVT: {
       ESP_LOGW(TAG, "Disconnected from grill");
       this->set_last_error_("grill BLE link dropped — reconnecting");
+      {
+        // was_command is read further down for pending_after_time_'s own
+        // purposes — captured again here rather than shared, since this
+        // lambda outlives the switch block that computes it below.
+        bool was_mid_command = this->pending_after_time_ == PendingReply::MCU_COMMAND;
+        this->defer([this, was_mid_command]() {
+          this->log_event_("disconnect", [&](JsonObject root) { root["mid_command"] = was_mid_command; });
+        });
+      }
       this->rpc_data_handle_ = this->rpc_tx_ctl_handle_ = this->rpc_rx_ctl_handle_ = this->debug_log_handle_ = 0;
       this->notifies_expected_ = this->notifies_confirmed_ = 0;
       this->rpc_reply_in_progress_ = false;

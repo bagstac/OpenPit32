@@ -182,6 +182,21 @@ server {
         proxy_set_header Host $host;
     }
 
+    # 2026-10-05, docker/README.md's "Grill event log" section: GET
+    # /log-events lives on the `auth` service (scripts/login_service.py),
+    # not the ESP32 — same session-cookie gate as everything else here, so
+    # GrillEvents.razor needs no separate login of its own.
+    location = /api/events {
+        auth_request /auth-check;
+        error_page 401 = @login_redirect;
+        # $is_args$args forwards ?limit=... — needed here (unlike the other
+        # blocks above) because this is the first GET route with a query
+        # string: a variable-based proxy_pass target doesn't auto-append one
+        # the way a static proxy_pass URI would.
+        proxy_pass $auth/log-events$is_args$args;
+        proxy_set_header Host $host;
+    }
+
     # DELETE /alarms/{id} — a *prefix* match (not `location =`), since the
     # id is part of the path. More specific than the bare /api/ prefix block
     # below, so nginx picks this one for anything under /api/alarms/ without

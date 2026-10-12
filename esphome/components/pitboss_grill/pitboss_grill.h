@@ -54,6 +54,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <atomic>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -142,6 +143,17 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   /// of sending), so this compiles and runs with no bot configured at all.
   void set_telegram_bot_token(const std::string &token) { this->telegram_bot_token_ = token; }
   void set_telegram_chat_id(const std::string &chat_id) { this->telegram_chat_id_ = chat_id; }
+
+  /// Optional sink for operational event logging — set up to answer "what's
+  /// resetting the setpoint to 130?" (2026-10-05 investigation): every
+  /// POST /command, BLE connect/disconnect, and any setpoint change this
+  /// firmware didn't itself just request gets POSTed here as one JSON
+  /// object if set. Left "" (the default), log_event_() is a no-op — same
+  /// pattern as telegram_bot_token_ above. See docker/README.md's "Grill
+  /// event log" section for what's listening on the other end
+  /// (scripts/login_service.py's POST /log-event).
+  void set_event_log_url(const std::string &url) { this->event_log_url_ = url; }
+  void set_event_log_token(const std::string &token) { this->event_log_token_ = token; }
 
   // -- AsyncWebHandler (web_server_base's shared httpd) --
   bool canHandle(AsyncWebServerRequest *request) const override;
@@ -316,6 +328,20 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   // docs/ESP32_FIRMWARE_PLAN.md's "Telegram integration" section, so
   // swapping to ntfy.sh/Pushover later touches only this one body.
   void notify_(const std::string &message);
+
+  // Best-effort POST of one JSON event to event_log_url_ (Authorization:
+  // Bearer event_log_token_ if set) — a no-op if event_log_url_ is "".
+  // Blocks the calling task for the round trip, same trade-off notify_()
+  // already makes; callers running on the BLE stack task (gattc_event_
+  // handler(), parse_temperature_frame_()) must this->defer() onto the
+  // main loop first rather than call this directly — only handle_command_()
+  // (its own httpd task) calls it inline.
+  void log_event_(const std::string &event, const std::function<void(JsonObject)> &fill);
+  // Best-effort caller IP for an in-flight httpd-task request, read off the
+  // raw esp_http_server socket (there's no higher-level accessor on this
+  // ESP-IDF AsyncWebServerRequest shim, unlike the Arduino original) — ""
+  // if it can't be determined. Only meaningful from the httpd task.
+  std::string get_client_ip_(AsyncWebServerRequest *request) const;
 
   // Phase 4 is the first thing that reads grill_state_/last_error_/board_id_/
   // last_rssi_ from outside the task that writes them — the REST handlers
@@ -530,6 +556,24 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   // state_mutex_.
   std::string telegram_bot_token_;
   std::string telegram_chat_id_;
+
+  // event_log_url_/event_log_token_: set once at boot (YAML/secrets.yaml),
+  // never rewritten at runtime (no POST /setup-style flow for these), but
+  // still read from both the httpd task (handle_command_()) and the main
+  // loop (deferred connect/disconnect/setpoint-jump logging) — state_mutex_
+  // guards every access past setup(), same reasoning as grill_password_.
+  std::string event_log_url_;
+  std::string event_log_token_;
+  // millis() of the last POST /command this firmware itself dispatched —
+  // written under state_mutex_ from handle_command_()'s main-loop defer()
+  // lambda, read under state_mutex_ in parse_temperature_frame_() to decide
+  // whether an observed setpoint change was this firmware's own doing
+  // (within OWN_COMMAND_GRACE_MS) or something else's — see that function's
+  // comment. 0 (the default) just means "never", which correctly makes the
+  // very first setpoint reading of a boot count as unexplained if it
+  // somehow differs from GrillState's own {-1} default — it never does,
+  // since has_temperatures gates the comparison.
+  uint32_t last_own_command_millis_{0};
 };
 
 }  // namespace pitboss_grill

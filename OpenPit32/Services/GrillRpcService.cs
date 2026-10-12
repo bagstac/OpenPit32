@@ -138,6 +138,39 @@ public class AlarmResponse
     public AlarmDto? alarm { get; set; }
 }
 
+/// <summary>One row from GET /api/events (scripts/login_service.py's
+/// POST /log-event, written by the ESP32 — see docker/README.md's "Grill
+/// event log" section). <c>event</c> is "command" | "connect" |
+/// "disconnect" | "setpoint_jump"; which other fields are set depends on
+/// which one it is — e.g. <c>action</c>/<c>value</c>/<c>source_ip</c> for a
+/// command, <c>old_value</c>/<c>new_value</c> (inside <c>detail</c>) for a
+/// setpoint jump. <c>received_at</c> is this service's own wall-clock (always
+/// reliable); <c>ts</c> is the ESP32's, 0/null if it hadn't synced NTP yet.</summary>
+public class GrillEventDto
+{
+    public long received_at { get; set; }
+    public double? ts { get; set; }
+    /// <summary>"event" is a C# keyword — <c>@event</c> escapes it while
+    /// still matching the JSON field name exactly, same as every other
+    /// property on this DTO. <see cref="EventType"/> is a plain alias for
+    /// Razor markup, where nesting a second <c>@</c> inside an expression
+    /// is needless risk for no benefit.</summary>
+    public string @event { get; set; } = "";
+    public string EventType => @event;
+    public string? action { get; set; }
+    public double? value { get; set; }
+    public double? old_value { get; set; }
+    public bool? ok { get; set; }
+    public string? error { get; set; }
+    public string? source_ip { get; set; }
+    public JsonElement? detail { get; set; }
+}
+
+public class GrillEventsResponse
+{
+    public List<GrillEventDto> events { get; set; } = new();
+}
+
 /// <summary>
 /// Thin client for the grill bridge — as of Phase 8 (docs/ESP32_FIRMWARE_PLAN.md),
 /// the grill's own ESP32 for every grill/alarm route, and a small login-only
@@ -262,4 +295,15 @@ public class GrillRpcService
 
     public async Task<bool> DeleteAlarmAsync(string id) =>
         (await _http.DeleteAsync($"alarms/{Uri.EscapeDataString(id)}")).IsSuccessStatusCode;
+
+    /// <summary>GET /api/events (docker/README.md's "Grill event log"
+    /// section) — the auth service, not the ESP32, same reasoning as
+    /// HealthUrl's comment on this being one shared base address. Empty
+    /// list, not null/throw, if the feature isn't configured yet (the
+    /// backend answers {"events": []} in that case).</summary>
+    public async Task<List<GrillEventDto>> GetEventsAsync(int limit = 200)
+    {
+        var resp = await _http.GetFromJsonAsync<GrillEventsResponse>($"events?limit={limit}");
+        return resp?.events ?? new();
+    }
 }

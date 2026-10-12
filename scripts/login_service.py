@@ -46,15 +46,31 @@ Configuration, all from the environment:
     diagnostics); the browser's normal path through nginx is same-origin
     and doesn't use it. Same default/caveat docker/README.md documented for
     the old sidecar's GRILL_SIDECAR_ORIGINS.
+  EVENT_LOG_TOKEN — 2026-10-05, the "what's resetting the setpoint to 130?"
+    investigation (docker/README.md's "Grill event log" section). Bearer
+    token POST /log-event requires in its Authorization header — must match
+    event_log_token in the ESP32's esphome/secrets.yaml exactly. Left unset,
+    POST /log-event always answers 503 rather than silently accepting
+    unauthenticated writes from anything that finds the port.
+  EVENT_LOG_DB_PATH — where the SQLite file POST /log-event writes to
+    (default: /data/grill_events.db, i.e. the same grill-data volume
+    AUTH_SECRET_PATH already uses, not RBP1/pi-spare-01 — ESP32 firmware
+    can't mount an NFS share or speak SQLite, and this app host has no
+    existing NFS mount to that Pi, so keeping it local avoids inventing one
+    for a database this small). scripts/cleanup_grill_events.py prunes it;
+    see that script's own docstring for the retention policy and how to
+    schedule it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import secrets
+import sqlite3
 import time
 from html import escape
 from pathlib import Path
@@ -70,6 +86,41 @@ SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 days — a password manager should
                                      # only need to fill this once in a while
 LOGIN_FAIL_DELAY = 1.0  # blunts trivial brute-forcing without real rate limiting
 DEFAULT_SECRET_PATH = Path(__file__).resolve().parent / ".auth_secret"
+DEFAULT_EVENT_LOG_DB_PATH = Path(__file__).resolve().parent / "grill_events.db"
+
+# Keep in sync with scripts/cleanup_grill_events.py, which opens the same
+# file/table by the same names rather than importing this module (it's
+# meant to run standalone via `docker exec`/cron — see its own docstring).
+EVENT_LOG_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS grill_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_at INTEGER NOT NULL,
+    ts INTEGER,
+    event TEXT NOT NULL,
+    action TEXT,
+    value REAL,
+    old_value REAL,
+    ok INTEGER,
+    error TEXT,
+    source_ip TEXT,
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_grill_events_received_at ON grill_events(received_at);
+"""
+
+
+def open_event_log_db(path: Path) -> sqlite3.Connection:
+    """One connection, opened once at startup and reused — see make_app()'s
+    comment on why not "open per write": aiohttp's event loop is single-
+    threaded and these writes are rare (at most a few an hour), so there's
+    no concurrency to speak of; a short-lived connection per request would
+    only add needless file-open overhead on a Pi's SD card for nothing a
+    kept-open one doesn't already give for free.
+    """
+    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn.executescript(EVENT_LOG_SCHEMA)
+    conn.commit()
+    return conn
 
 
 def load_or_create_auth_secret(configured: str | None, path: Path) -> bytes:
@@ -178,7 +229,15 @@ LOGIN_PAGE = """\
 """
 
 
-def make_app(users: dict[str, str], auth_secret: bytes) -> web.Application:
+# Columns grill_events has its own place for — anything else POST /log-event
+# receives (e.g. setpoint_jump's "fahrenheit", disconnect's "mid_command")
+# is kept, not dropped, as a small JSON blob in the `detail` column instead
+# of growing a new column per event type's one-off field.
+EVENT_LOG_KNOWN_FIELDS = {"event", "ts", "action", "value", "old_value", "ok", "error", "source_ip"}
+
+
+def make_app(users: dict[str, str], auth_secret: bytes, event_log_token: str,
+            event_log_db: sqlite3.Connection | None) -> web.Application:
     allowed_origins = {
         o.strip()
         for o in os.environ.get(
@@ -256,10 +315,95 @@ def make_app(users: dict[str, str], auth_secret: bytes) -> web.Application:
         ok = any(session_cookie_valid(auth_secret, u, cookie) for u in users)
         return web.Response(status=204 if ok else 401)
 
+    async def list_events(request):
+        # Read side of the same investigation, for GrillEvents.razor — gated
+        # by the ordinary browser session cookie (not EVENT_LOG_TOKEN, which
+        # is the ESP32's write-only credential), checked here directly
+        # rather than relying solely on nginx's auth_request: port 8091 is
+        # still reachable straight from the LAN, bypassing nginx entirely
+        # (see docker/README.md), so this mirrors auth_check()'s own
+        # fail-closed logic instead of trusting the caller already passed
+        # through it.
+        if not users:
+            return web.Response(status=401)
+        cookie = request.cookies.get(SESSION_COOKIE)
+        if not any(session_cookie_valid(auth_secret, u, cookie) for u in users):
+            return web.Response(status=401)
+        if event_log_db is None:
+            return web.json_response({"events": []})
+        try:
+            limit = max(1, min(int(request.query.get("limit", "200")), 500))
+        except ValueError:
+            limit = 200
+        rows = event_log_db.execute(
+            "SELECT received_at, ts, event, action, value, old_value, ok, error, source_ip, detail "
+            "FROM grill_events ORDER BY received_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        events = [
+            {
+                "received_at": r[0],
+                "ts": r[1],
+                "event": r[2],
+                "action": r[3],
+                "value": r[4],
+                "old_value": r[5],
+                "ok": bool(r[6]) if r[6] is not None else None,
+                "error": r[7],
+                "source_ip": r[8],
+                "detail": json.loads(r[9]) if r[9] else None,
+            }
+            for r in rows
+        ]
+        return web.json_response({"events": events})
+
+    async def log_event(request):
+        # 2026-10-05 investigation (docker/README.md's "Grill event log"
+        # section): a separate bearer token, not the browser session cookie
+        # above — the ESP32 is not a browser and has no way to go through
+        # /login. Fails closed exactly like auth_check() does when login
+        # itself isn't configured: an unset EVENT_LOG_TOKEN always 503s
+        # rather than silently accepting unauthenticated writes from
+        # anything that finds this port.
+        if not event_log_token or event_log_db is None:
+            return web.Response(status=503, text="EVENT_LOG_TOKEN not configured")
+        auth_header = request.headers.get("Authorization", "")
+        presented = auth_header[len("Bearer "):] if auth_header.startswith("Bearer ") else ""
+        if not presented or not hmac.compare_digest(presented, event_log_token):
+            return web.Response(status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.Response(status=400, text="invalid JSON")
+        if not isinstance(payload, dict) or not payload.get("event"):
+            return web.Response(status=400, text="missing 'event'")
+        extra = {k: v for k, v in payload.items() if k not in EVENT_LOG_KNOWN_FIELDS}
+        event_log_db.execute(
+            "INSERT INTO grill_events "
+            "(received_at, ts, event, action, value, old_value, ok, error, source_ip, detail) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                int(time.time()),
+                payload.get("ts"),
+                str(payload["event"])[:64],
+                str(payload["action"])[:64] if payload.get("action") is not None else None,
+                payload.get("value"),
+                payload.get("old_value"),
+                int(bool(payload["ok"])) if "ok" in payload else None,
+                str(payload["error"])[:500] if payload.get("error") is not None else None,
+                str(payload["source_ip"])[:64] if payload.get("source_ip") is not None else None,
+                json.dumps(extra) if extra else None,
+            ),
+        )
+        event_log_db.commit()
+        return web.Response(status=204)
+
     app.router.add_get("/login", login_page)
     app.router.add_post("/login", login_submit)
     app.router.add_get("/logout", logout)
     app.router.add_get("/auth-check", auth_check)
+    app.router.add_post("/log-event", log_event)
+    app.router.add_get("/log-events", list_events)
     return app
 
 
@@ -277,7 +421,19 @@ async def main():
             "docker/nginx.conf.template's login gate won't let anyone in "
             "until these are set")
 
-    app = make_app(users, auth_secret)
+    event_log_token = os.environ.get("EVENT_LOG_TOKEN", "")
+    event_log_db_path = Path(os.environ.get("EVENT_LOG_DB_PATH", str(DEFAULT_EVENT_LOG_DB_PATH)))
+    # Opened regardless of whether EVENT_LOG_TOKEN is set: GET /log-events
+    # (GrillEvents.razor) should still work — showing an empty list — even
+    # before the ESP32 side is configured to write anything.
+    event_log_db = open_event_log_db(event_log_db_path)
+    if not event_log_token:
+        _LOGGER.warning(
+            "EVENT_LOG_TOKEN not set — POST /log-event will always 503; "
+            "fine if you haven't set up the ESP32's event_log_url yet (see "
+            "docker/README.md's \"Grill event log\" section)")
+
+    app = make_app(users, auth_secret, event_log_token, event_log_db)
     runner = web.AppRunner(app)
     await runner.setup()
     bind_host = os.environ.get("LOGIN_SERVICE_HOST", "127.0.0.1")
@@ -289,6 +445,8 @@ async def main():
         await asyncio.Event().wait()
     finally:
         await runner.cleanup()
+        if event_log_db is not None:
+            event_log_db.close()
 
 
 if __name__ == "__main__":

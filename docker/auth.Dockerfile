@@ -8,16 +8,21 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY scripts/login_service.py ./
+COPY scripts/login_service.py scripts/cleanup_grill_events.py ./
 
 # Reachable from other hosts on the LAN (the web container's browser client
 # calls back into this port via nginx's auth_request); AUTH_SECRET_PATH
 # keeps a generated session-signing secret on the mounted volume so it
 # survives a container restart — the same /data/.auth_secret path the old
 # sidecar container used for the same file, so upgrading from that image
-# doesn't invalidate anyone's existing session.
+# doesn't invalidate anyone's existing session. EVENT_LOG_DB_PATH (2026-10-05,
+# docker/README.md's "Grill event log" section) puts the grill_events.db
+# SQLite file on the same mounted volume for the same reason — otherwise it
+# would default to /app/grill_events.db, which a rebuild discards along
+# with the rest of the image layer.
 ENV LOGIN_SERVICE_HOST=0.0.0.0 \
     AUTH_SECRET_PATH=/data/.auth_secret \
+    EVENT_LOG_DB_PATH=/data/grill_events.db \
     PYTHONUNBUFFERED=1
 
 VOLUME ["/data"]

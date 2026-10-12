@@ -36,6 +36,13 @@ services:
       # and persisted in the grill-data volume, so restarts don't log
       # everyone out.
       AUTH_SECRET: ${AUTH_SECRET:-}
+      # 2026-10-05, docker/README.md's "Grill event log" section: the ESP32
+      # authenticates its POST /log-event calls with this, not a session
+      # cookie — must match event_log_token in esphome/secrets.yaml
+      # exactly. Unset, POST /log-event always 503s (same fail-closed
+      # pattern as AUTH_USERS above) rather than accepting unauthenticated
+      # writes from anything that finds this port.
+      EVENT_LOG_TOKEN: ${EVENT_LOG_TOKEN:-}
       # Only matters for hitting this container directly (LAN diagnostics);
       # the browser's normal path through nginx is same-origin and doesn't
       # use it. Must match the origin the browser loads the web app from.

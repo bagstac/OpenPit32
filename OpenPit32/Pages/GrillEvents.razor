@@ -1,0 +1,123 @@
+@page "/events"
+@using System.Text.Json
+@inject Services.GrillRpcService Rpc
+@implements IDisposable
+
+<PageTitle>Grill Events — OpenPit32</PageTitle>
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h3 class="mb-0">Grill Events <span class="text-muted small">who changed what, and when</span></h3>
+    <div>
+        <button class="btn btn-outline-secondary btn-sm" disabled="@loading" @onclick="Poll">Refresh</button>
+        <a class="btn btn-outline-secondary btn-sm ms-1" href="/settings">Back</a>
+    </div>
+</div>
+
+<p class="text-muted small">
+    Every <code>POST /command</code> this app (or anything else on the LAN) sent the grill's
+    ESP32, every BLE connect/disconnect to the grill, and any setpoint change the ESP32 saw
+    that it didn't just cause itself — see <code>docker/README.md</code>'s "Grill event log"
+    section. Empty here either means nothing's happened yet, or <code>EVENT_LOG_TOKEN</code>/
+    <code>event_log_url</code> haven't been set up — see that doc.
+</p>
+
+@if (events is null)
+{
+    <p class="text-muted">Loading…</p>
+}
+else if (events.Count == 0)
+{
+    <div class="alert alert-secondary mb-0">No events recorded yet.</div>
+}
+else
+{
+    <div class="table-responsive">
+        <table class="table table-sm pb-card">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Event</th>
+                    <th>Action</th>
+                    <th>Value</th>
+                    <th>OK</th>
+                    <th>Source IP</th>
+                    <th>Detail</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var e in events)
+                {
+                    <tr>
+                        <td class="text-nowrap">@FormatTime(e.received_at)</td>
+                        <td>@e.EventType</td>
+                        <td>@(e.action ?? "—")</td>
+                        <td>@FormatValue(e)</td>
+                        <td>
+                            @if (e.ok is bool ok)
+                            {
+                                <span class="@(ok ? "text-success" : "text-danger")">@(ok ? "ok" : "failed")</span>
+                            }
+                            else
+                            {
+                                <span class="text-muted">—</span>
+                            }
+                        </td>
+                        <td>@(e.source_ip ?? "—")</td>
+                        <td class="small text-muted">@FormatDetail(e)</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}
+
+@code {
+    private List<Services.GrillEventDto>? events;
+    private bool loading;
+    private System.Threading.Timer? pollTimer;
+
+    protected override void OnInitialized()
+    {
+        pollTimer = new System.Threading.Timer(_ => _ = InvokeAsync(Poll),
+            null, TimeSpan.Zero, TimeSpan.FromSeconds(15));
+    }
+
+    private async Task Poll()
+    {
+        loading = true;
+        StateHasChanged();
+        try { events = await Rpc.GetEventsAsync(); }
+        catch { events ??= new(); }
+        loading = false;
+        StateHasChanged();
+    }
+
+    private static string FormatTime(long receivedAtUnix) =>
+        DateTimeOffset.FromUnixTimeSeconds(receivedAtUnix).ToLocalTime().ToString("MMM d HH:mm:ss");
+
+    private static string FormatValue(Services.GrillEventDto e) => e switch
+    {
+        { value: double v } => v.ToString("0.#"),
+        { old_value: double ov } => $"{ov:0.#} → ?",
+        _ => "—",
+    };
+
+    /// <summary>setpoint_jump's new_value/fahrenheit and disconnect's
+    /// mid_command don't have their own columns (see login_service.py's
+    /// EVENT_LOG_KNOWN_FIELDS) — folded into `detail` instead, shown here
+    /// as plain "key: value" pairs rather than raw JSON.</summary>
+    private static string FormatDetail(Services.GrillEventDto e)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrEmpty(e.error)) parts.Add($"error: {e.error}");
+        if (e.old_value is double ov) parts.Add($"old: {ov:0.#}");
+        if (e.detail is JsonElement detail && detail.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var prop in detail.EnumerateObject())
+                parts.Add($"{prop.Name}: {prop.Value}");
+        }
+        return parts.Count > 0 ? string.Join(", ", parts) : "—";
+    }
+
+    public void Dispose() => pollTimer?.Dispose();
+}

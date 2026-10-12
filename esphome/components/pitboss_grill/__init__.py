@@ -61,6 +61,8 @@ CONF_HAS_LIGHTS = "has_lights"
 CONF_MEAT_PROBES = "meat_probes"
 CONF_TELEGRAM_BOT_TOKEN = "telegram_bot_token"
 CONF_TELEGRAM_CHAT_ID = "telegram_chat_id"
+CONF_EVENT_LOG_URL = "event_log_url"
+CONF_EVENT_LOG_TOKEN = "event_log_token"
 
 CONFIG_SCHEMA = (
     cv.Schema(
@@ -105,6 +107,14 @@ CONFIG_SCHEMA = (
             # drop on schedule; nothing is sent anywhere).
             cv.Optional(CONF_TELEGRAM_BOT_TOKEN, default=""): cv.string_strict,
             cv.Optional(CONF_TELEGRAM_CHAT_ID, default=""): cv.string_strict,
+            # 2026-10-05: optional operational event log (POST /command,
+            # BLE connect/disconnect, unexplained setpoint changes) — see
+            # pitboss_grill.h's set_event_log_url()/docker/README.md's
+            # "Grill event log" section. Both default to "" (disabled,
+            # log_event_() is then a no-op), same pattern as the Telegram
+            # fields above.
+            cv.Optional(CONF_EVENT_LOG_URL, default=""): cv.string_strict,
+            cv.Optional(CONF_EVENT_LOG_TOKEN, default=""): cv.string_strict,
             cv.GenerateID(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
             cv.GenerateID(CONF_HTTP_REQUEST_ID): cv.use_id(
                 http_request.HttpRequestComponent
@@ -130,6 +140,8 @@ async def to_code(config):
     cg.add(var.set_meat_probes(config[CONF_MEAT_PROBES]))
     cg.add(var.set_telegram_bot_token(config[CONF_TELEGRAM_BOT_TOKEN]))
     cg.add(var.set_telegram_chat_id(config[CONF_TELEGRAM_CHAT_ID]))
+    cg.add(var.set_event_log_url(config[CONF_EVENT_LOG_URL]))
+    cg.add(var.set_event_log_token(config[CONF_EVENT_LOG_TOKEN]))
 
     web_server = await cg.get_variable(config[CONF_WEB_SERVER_BASE_ID])
     cg.add(var.set_web_server_base(web_server))
