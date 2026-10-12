@@ -90,6 +90,46 @@ you want one.
 
 ## Grill event log
 
+> **KNOWN BUG — the firmware half of this crashes the ESP32. Do not enable
+> `event_log_url` until it is fixed (found 2026-10-12, still open).**
+> With the URL set, the ESP32 resets on the `HttpRequestComponent::post()`
+> the event log makes: it reboots every ~60-120 s while commands are being
+> issued, and the live grill monitor goes offline with each reset. Decoded
+> from the firmware's own crash reporter (`esp32.crash`):
+>
+> ```
+> Reason: Fault - LoadProhibited    Crashed core: 1
+> PC: 0x401362EC   tcp_new_port at lwip/src/core/tcp.c:1035
+> BT1 tcp_connect · BT7 connect · BT8 esp_tls_plain_tcp_connect ·
+> BT11 esp_http_client_connect · BT12 esp_http_client_open ·
+> BT13 HttpRequestIDF::perform · BT14 HttpRequestComponent::start ·
+> BT15 HttpRequestComponent::post
+> ```
+>
+> `tcp.c:1035` is `if (pcb->local_port == tcp_port)`, the PCB-list walk
+> inside `tcp_new_port()` — *after* its own `pcb != NULL` guard. So lwip's
+> `tcp_pcb` list holds a stale pointer by the time this connect runs:
+> something is freeing or corrupting a PCB. The event log's database has
+> never received a single row, i.e. the requests that crash it are exactly
+> the ones that should have written them.
+>
+> `notify_()`'s Telegram POST uses the same `post(...)` → `container->end()`
+> shape and should be treated as equally suspect (the alarm path has never
+> been exercised end to end either).
+>
+> Two things to check first: `log_event_()` is called *inline from the httpd
+> task* by `handle_command_()` while every other caller defers onto the main
+> loop — and it is the command path that has been seen crashing; and whether
+> `container->end()` plus the container `shared_ptr`'s destructor can close
+> the same connection twice. Reproduce with the log stream running (the
+> crash report prints the full backtrace, and `addr2line -e firmware.elf`
+> resolves the frames the decoder leaves undecoded).
+>
+> Everything else in this feature — the nginx `/api/events` route, the auth
+> service's `/log-event` + `/log-events`, and the app's `/events` page — is
+> deployed and verified; they simply sit idle while `event_log_url` is empty,
+> which is the only firmware configuration that has run clean.
+
 2026-10-05: set up to answer "what's resetting the setpoint to 130?" — was
 it a stray command from the real Pit Boss app/cloud, or something in this
 project? Until now, nothing here logged who/what sent a command at all.
