@@ -124,10 +124,20 @@ you want one.
 > came back through `GET /api/events` on both the LAN and the public
 > hostname, with the right `action`, `value`, `ok` and `source_ip`.
 >
-> Known gap, not a regression: a **connect event at boot** has yet to produce
-> a row. The BLE link comes up before WiFi has an address, so that first POST
-> fails — and its warning is logged before any log stream is usually attached
-> to see it. Everything after the network is up is unaffected.
+> Fixed 2026-10-13 (`3e70501`): that boot-time connect was the one event that
+> ALWAYS vanished — the BLE link to the grill is already up (`gattc_calls=774`,
+> tracker `active: 1` in a captured boot dump) before `http_request` and WiFi
+> are usable, so `log_event_()` took its "http_request component missing" early
+> return and left no row and no error. It now serializes the body, tries the
+> POST, and on failure queues it in a bounded backlog (8 events, oldest dropped
+> with a warning) retried from the main loop every 15 s — one event per tick,
+> oldest first, so an unreachable sink costs one client timeout per interval
+> rather than stalling the queue. Nothing is silently dropped any more, which
+> covers a transient network blip as well as boot. Verified on the device: after
+> an OTA reboot the boot-time connect landed as a row (`10:13:00Z`, the first
+> this log has ever captured) with `Event log backlog: one sent, 0 still
+> pending` in the device log, and a deliberate `set_temp` still wrote its row on
+> the first attempt.
 
 2026-10-05: set up to answer "what's resetting the setpoint to 130?" — was
 it a stray command from the real Pit Boss app/cloud, or something in this
