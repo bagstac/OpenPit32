@@ -130,6 +130,17 @@ static const char *const CMD_TURN_OFF = "FE0102FF";
 // RPC_REPLY_TIMEOUT_MS) still falls inside the window.
 static constexpr uint32_t OWN_COMMAND_GRACE_MS = 20000;
 
+// The event log's bounded backlog + its retry interval (see log_event_()).
+// An event whose POST cannot be made is queued rather than dropped, because
+// the one case that ALWAYS fails is the first connect after a boot: the BLE
+// link to the grill is already up (gattc_calls=774 and tracker "active: 1" in
+// the boot dump, 2026-10-13) before http_request and WiFi are usable, so that
+// event used to disappear with no row and no visible error. Retried from the
+// main loop, one event per tick; oldest dropped (with a warning) if the sink
+// stays unreachable.
+static constexpr size_t MAX_PENDING_EVENTS = 8;
+static constexpr uint32_t EVENT_FLUSH_RETRY_MS = 15000;
+
 // Grill setpoints the PBV2 board honours for this model (PBV5 P2) — pytboss's
 // grills.json temp_increment, 130-420F in 5-degree steps. Fixed here for the
 // same reason the commands above are: this project is pinned to one grill.
@@ -2059,29 +2070,79 @@ void PitbossGrill::notify_(const std::string &message) {
   container->end();
 }
 
-// 2026-10-05 "what's resetting the setpoint to 130?" investigation — see
-// set_event_log_url()'s header comment. One HTTPS/HTTP POST per event,
-// `{"event": ..., "ts": ..., ...fill()'s fields}`; `ts` is a real Unix
-// timestamp when time_ has synced, 0 otherwise (still orderable against
-// other events from the same boot, just not against wall-clock elsewhere).
-// Mirrors notify_()'s shape deliberately (same no-op-if-unconfigured,
-// same fire-and-forget blocking-the-caller trade-off) rather than sharing
-// code with it — the trigger (an alarm vs. an operational event) and the
-// destination (Telegram vs. this project's own log sink) are unrelated, and
-// notify_() has no caller-supplied JSON fields to parallel this one's `fill`.
-void PitbossGrill::log_event_(const std::string &event, const std::function<void(JsonObject)> &fill) {
+// Posts one already-built event body. True when the sink took it (HTTP 2xx);
+// false when the request couldn't be made at all — no URL configured, or
+// http_request not constructed yet, which is the normal state during boot (a
+// deferred event can run before that component's setup(), and this is how the
+// first connect event after every boot used to get lost), or the POST itself
+// failed. Callers queue on false rather than dropping the event.
+bool PitbossGrill::send_event_body_(const std::string &body) {
   std::string url, token;
   {
     LockGuard lock(this->state_mutex_);
     url = this->event_log_url_;
     token = this->event_log_token_;
   }
-  if (url.empty())
+  if (url.empty() || this->http_request_ == nullptr)
+    return false;
+  std::vector<http_request::Header> headers{{"Content-Type", "application/json"}};
+  if (!token.empty())
+    headers.push_back({"Authorization", "Bearer " + token});
+  auto container = this->http_request_->post(url, body, headers);
+  if (container == nullptr)
+    return false;
+  bool ok = http_request::is_success(container->status_code);
+  if (!ok)
+    ESP_LOGW(TAG, "Event log POST got HTTP %d", container->status_code);
+  container->end();
+  return ok;
+}
+
+// One backlog event per tick, oldest first: a sink that is unreachable then
+// costs a single client timeout per interval instead of stalling every event
+// queued behind it. Main loop only (set_timeout), same as every other
+// log_event_ caller.
+void PitbossGrill::flush_pending_events_() {
+  if (this->pending_events_.empty())
     return;
-  if (this->http_request_ == nullptr) {
-    ESP_LOGW(TAG, "Cannot log event %s — http_request component missing", event.c_str());
+  if (!this->send_event_body_(this->pending_events_.front())) {
+    this->schedule_event_flush_();  // still unreachable — try again next tick
     return;
   }
+  this->pending_events_.pop_front();
+  ESP_LOGI(TAG, "Event log backlog: one sent, %u still pending", (unsigned) this->pending_events_.size());
+  if (!this->pending_events_.empty())
+    this->schedule_event_flush_();
+}
+
+void PitbossGrill::schedule_event_flush_() {
+  if (this->event_flush_scheduled_)
+    return;
+  this->event_flush_scheduled_ = true;
+  this->set_timeout("event_log_flush", EVENT_FLUSH_RETRY_MS, [this]() {
+    this->event_flush_scheduled_ = false;
+    this->flush_pending_events_();
+  });
+}
+
+// 2026-10-05 "what's resetting the setpoint to 130?" investigation — see
+// set_event_log_url()'s header comment. One HTTPS/HTTP POST per event,
+// `{"event": ..., "ts": ..., ...fill()'s fields}`; `ts` is a real Unix
+// timestamp when time_ has synced, 0 otherwise (still orderable against
+// other events from the same boot, just not against wall-clock elsewhere).
+// Never silently drops: an event that can't be sent goes into the bounded
+// backlog and is retried from the main loop (2026-10-13 — the boot-time
+// connect event was vanishing here). Still blocks the caller for the round
+// trip when it does send, so callers on the BLE stack task must this->defer()
+// onto the main loop first, as every caller now does.
+void PitbossGrill::log_event_(const std::string &event, const std::function<void(JsonObject)> &fill) {
+  std::string url;
+  {
+    LockGuard lock(this->state_mutex_);
+    url = this->event_log_url_;
+  }
+  if (url.empty())
+    return;  // feature off — log_event_ is a no-op, as documented
   double ts = (this->time_ != nullptr && this->time_->now().is_valid()) ? this->time_->now().timestamp : 0;
   std::string body = esphome::json::build_json([&](JsonObject root) {
     root["event"] = event;
@@ -2089,19 +2150,17 @@ void PitbossGrill::log_event_(const std::string &event, const std::function<void
     if (fill)
       fill(root);
   });
-  std::string auth_value = "Bearer " + token;
-  std::vector<http_request::Header> headers{{"Content-Type", "application/json"}};
-  if (!token.empty())
-    headers.push_back({"Authorization", auth_value});
-  auto container = this->http_request_->post(url, body, headers);
-  if (container == nullptr) {
-    ESP_LOGW(TAG, "Event log POST failed to start (%s)", event.c_str());
+  if (this->send_event_body_(body))
     return;
+  if (this->pending_events_.size() >= MAX_PENDING_EVENTS) {
+    ESP_LOGW(TAG, "Event log backlog full (%u) — dropping oldest to fit %s",
+             (unsigned) MAX_PENDING_EVENTS, event.c_str());
+    this->pending_events_.pop_front();
   }
-  if (!http_request::is_success(container->status_code)) {
-    ESP_LOGW(TAG, "Event log POST failed: HTTP %d (%s)", container->status_code, event.c_str());
-  }
-  container->end();
+  ESP_LOGW(TAG, "Event log: %s not sent yet, queued (%u pending)", event.c_str(),
+           (unsigned) this->pending_events_.size());
+  this->pending_events_.push_back(body);
+  this->schedule_event_flush_();
 }
 
 // Reads the caller's IP straight off the httpd request's underlying socket

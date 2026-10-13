@@ -54,6 +54,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <string>
 #include <vector>
@@ -331,12 +332,21 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
 
   // Best-effort POST of one JSON event to event_log_url_ (Authorization:
   // Bearer event_log_token_ if set) — a no-op if event_log_url_ is "".
-  // Blocks the calling task for the round trip, same trade-off notify_()
-  // already makes; callers running on the BLE stack task (gattc_event_
-  // handler(), parse_temperature_frame_()) must this->defer() onto the
-  // main loop first rather than call this directly — only handle_command_()
-  // (its own httpd task) calls it inline.
+  // Blocks the calling task for the round trip when it sends, so callers on
+  // the BLE stack task (gattc_event_handler(), parse_temperature_frame_())
+  // and handle_command_() (its own httpd task, small stack — see the defer
+  // there) must this->defer() onto the main loop rather than call this
+  // directly. An event that can't be sent is queued, never silently dropped.
   void log_event_(const std::string &event, const std::function<void(JsonObject)> &fill);
+  // Sends one already-built event body; false means "couldn't send" (no URL,
+  // http_request_ not constructed yet — the normal state during boot, which is
+  // why the first connect after a boot used to vanish — or the POST failed).
+  bool send_event_body_(const std::string &body);
+  // Backlog retry, main loop only: one event per tick, oldest first, so an
+  // unreachable sink costs one client timeout per interval rather than
+  // stalling everything queued behind it.
+  void flush_pending_events_();
+  void schedule_event_flush_();
   // Best-effort caller IP for an in-flight httpd-task request, read off the
   // raw esp_http_server socket (there's no higher-level accessor on this
   // ESP-IDF AsyncWebServerRequest shim, unlike the Arduino original) — ""
@@ -564,6 +574,13 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   // guards every access past setup(), same reasoning as grill_password_.
   std::string event_log_url_;
   std::string event_log_token_;
+  // Events whose POST couldn't be made, bodies already serialized (so a slow
+  // retry never re-runs the caller's fill()). Bounded by MAX_PENDING_EVENTS,
+  // oldest dropped with a warning. Touched only from the main loop — log_event_
+  // via a deferred call, flush_pending_events_ via set_timeout — so unlike the
+  // two settings above it needs no mutex.
+  std::deque<std::string> pending_events_;
+  bool event_flush_scheduled_{false};
   // millis() of the last POST /command this firmware itself dispatched —
   // written under state_mutex_ from handle_command_()'s main-loop defer()
   // lambda, read under state_mutex_ in parse_temperature_frame_() to decide
