@@ -25,11 +25,12 @@ Configuration, all from the environment (matching login_service.py's style):
 Usage — intended to run on a schedule from OUTSIDE the container, since
 nothing in this Docker stack can schedule anything on the host itself
 (same limitation docker/README.md's build-cache cron note already
-documents for `docker builder prune`):
+documents for `docker builder prune`). Deployed on srv-mc-01 (2026-10-13)
+via scripts/grill-event-log-prune.sh, which gates it to 05:00 local time
+(the host runs UTC) and then runs exactly the following; the same thing by
+hand is:
 
-    # crontab -e (as the user docker compose runs under), once daily
-    0 3 * * * cd ~/openpit32 && docker compose exec -T auth \\
-        python3 cleanup_grill_events.py >>~/openpit32-cleanup.log 2>&1
+    docker compose exec -T auth python3 cleanup_grill_events.py
 
 `docker compose exec` (rather than a hardcoded `docker exec <container
 name>`) is what's robust to whatever Compose actually named the container

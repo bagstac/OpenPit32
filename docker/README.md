@@ -181,14 +181,31 @@ polling — so there's no further "keep only the interesting ones"
 filtering to do. What still needs bounding is how far back even that
 smaller set is kept, on a host with limited disk: `scripts/
 cleanup_grill_events.py` deletes rows older than `EVENT_LOG_RETENTION_DAYS`
-(default 30), and isn't run automatically by anything in this repo — same
+(30), and isn't run automatically by anything in this repo — same
 limitation as the `docker builder prune` cron job below, since nothing in
-this Docker stack can schedule something on the host itself:
+this Docker stack can schedule something on the host itself. Deployed on
+srv-mc-01 (2026-10-13) as one crontab line calling `scripts/
+grill-event-log-prune.sh`, which runs the prune only in the hour that is
+05:00 in America/New_York:
 
 ```
-# crontab -e (as the user docker compose runs under), once daily
-0 3 * * * cd ~/openpit32 && docker compose exec -T auth python3 cleanup_grill_events.py >>~/openpit32-cleanup.log 2>&1
+# crontab -e (as brian, the user docker compose runs under)
+0 * * * * /home/brian/openpit32/scripts/grill-event-log-prune.sh >>/home/brian/openpit32-cleanup.log 2>&1
 ```
+
+Hourly-plus-a-gate rather than `0 9 * * *`, because that box runs
+`Etc/UTC` and Ubuntu's cron is vixie 3.0pl1 (checked: no `CRON_TZ`), so
+any fixed UTC hour is an hour out for half the year — 09:00 UTC is 05:00
+EDT but 04:00 EST. A systemd timer with
+`OnCalendar=*-*-* 05:00:00 America/New_York` would be exact too (that
+syntax does work here — `systemd-analyze calendar` confirms it), but
+installing one needs root and this box only takes a passworded sudo. The
+gate reads the Eastern wall clock instead, so it stays at 05:00 local
+across the DST change with no twice-a-year edit, and it keeps working if
+the box is ever moved to local time (an open question in the fleet docs).
+Verified 2026-10-13 with a one-minute self-test entry: cron ran the whole
+chain (cron → `docker compose exec` → the script) and logged
+`deleted 0 row(s) older than 30 days`.
 
 ## Disk space on a small host (e.g. a Raspberry Pi)
 
