@@ -230,7 +230,16 @@ hardcoded IP). Everything else under `/api/`, plus `/login`/`/logout`/
 `/auth-check`, is untouched. Deployed to the real Pi
 (`bsbagley@192.168.1.172`, `~/openpit32` — an `scp`'d tree, not a git
 checkout, so this was a targeted file copy + `docker compose up -d --build
-web`, not `git pull`) and verified end-to-end: logged in through nginx with
+web`, not `git pull`) and verified end-to-end:
+
+> **That host is history.** 192.168.1.172 is `pi-grill-01`, where this stack ran until
+> 2026-09-28. It now runs on `srv-mc-01` — `brian@192.168.1.131:/home/brian/openpit32`,
+> built from this repo with `docker compose up -d --build` — and the public hostname
+> `openpit32.codingattempts.com` reaches it through the Cloudflare tunnel on pi-print-01.
+> See the homelab repo's `runbooks/openpit32-migration.md`. Do not deploy to `.172`: it has
+> not run this stack since 2026-10-16.
+
+The 2026-09-10 deployment was verified end-to-end: logged in through nginx with
 the real credentials and confirmed `/api/health`, `/api/state`, `/api/info`
 all return live ESP32 data through the full auth-gated path, not just
 reachable in isolation.
