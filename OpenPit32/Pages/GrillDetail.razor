@@ -140,7 +140,10 @@ else
             <div class="row g-2 align-items-end">
                 <div class="col-6 col-md-3">
                     <label class="form-label small text-muted mb-1">Target temp (@(live?.isFahrenheit == true ? "F" : "C"))</label>
-                    <input type="number" class="form-control" placeholder="e.g. 250" @bind="setTemp" />
+                    <input type="number" class="form-control" placeholder="e.g. 250"
+                           min="@(Setpoints.Count > 0 ? Setpoints[0] : null)"
+                           max="@(Setpoints.Count > 0 ? Setpoints[^1] : null)"
+                           value="@setTemp" @oninput="OnSetTempInput" />
                 </div>
                 <div class="col-auto">
                     <button class="btn btn-outline-secondary" disabled="@actionBusy" @onclick="SetTemp">Set Temperature</button>
@@ -171,11 +174,6 @@ else
                         </button>
                     </div>
                 }
-                <div class="col-auto">
-                    <button class="btn btn-outline-secondary" disabled="@actionBusy" @onclick="TogglePrime">
-                        Prime @(live?.primeState == true ? "Off" : "On")
-                    </button>
-                </div>
             </div>
         </div>
     </div>
@@ -466,7 +464,6 @@ else
     private void PowerOn() => ClickPower("power_on");
     private void PowerOff() => ClickPower("power_off");
     private Task ToggleLight() => Send(live?.lightState == true ? "light_off" : "light_on");
-    private Task TogglePrime() => Send(live?.primeState == true ? "prime_off" : "prime_on");
 
     private void ClickPower(string action)
     {
@@ -489,6 +486,37 @@ else
         confirmFor = null;
         actionMessage = null;
         _ = Send(action);
+    }
+
+    // The grill only honours the setpoints in /info's accepted_setpoints_f
+    // (always Fahrenheit); in Celsius they're derived the same way the
+    // firmware does it, floor((f-32)/1.8). Empty until /info has loaded.
+    private List<int> Setpoints =>
+        info?.accepted_setpoints_f is not { Count: > 0 } f
+            ? new List<int>()
+            : live?.isFahrenheit == true
+                ? f
+                : f.Select(x => (int)Math.Floor((x - 32) / 1.8)).Distinct().ToList();
+
+    // A browser spinner click moves a number input by exactly 1; turn that
+    // into a step to the neighbouring valid setpoint. Typed values (which
+    // change by more than 1) are left alone for the grill to snap.
+    private void OnSetTempInput(ChangeEventArgs e)
+    {
+        var text = e.Value?.ToString();
+        var points = Setpoints;
+        if (points.Count > 0 && int.TryParse(text, out var v) && int.TryParse(setTemp, out var prev)
+            && Math.Abs(v - prev) == 1)
+        {
+            var next = v > prev
+                ? points.FirstOrDefault(p => p > prev)
+                : points.LastOrDefault(p => p < prev);
+            if (next != 0)
+                text = next.ToString();
+            else
+                text = prev.ToString();
+        }
+        setTemp = text;
     }
 
     private async Task SetTemp()
