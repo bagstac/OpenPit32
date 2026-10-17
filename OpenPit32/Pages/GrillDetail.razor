@@ -177,10 +177,6 @@ else
                     </button>
                 </div>
             </div>
-            <p class="text-muted small mt-3 mb-0">
-                Commands go over Bluetooth LE through the ESP32 proxy — no cloud involved.
-                They act on a real appliance; double-check before confirming.
-            </p>
         </div>
     </div>
 
@@ -503,11 +499,14 @@ else
             actionFailed = true;
             return;
         }
-        await Send("set_temp", t);
+        if (await Send("set_temp", t))
+            setTemp = null;
     }
 
-    private async Task Send(string action, double? value = null)
+    // Returns true when the sidecar reported the command as accepted.
+    private async Task<bool> Send(string action, double? value = null)
     {
+        var accepted = false;
         actionBusy = true;
         actionMessage = null;
         actionFailed = false;
@@ -516,6 +515,7 @@ else
             var r = await Rpc.SendCommandAsync(action, value, confirm: true);
             actionMessage = r.ok ? "Command accepted." : r.error;
             actionFailed = !r.ok;
+            accepted = r.ok;
             await PollSidecar();
         }
         catch (System.Text.Json.JsonException)
@@ -544,6 +544,7 @@ else
         {
             actionBusy = false;
         }
+        return accepted;
     }
 
     private static IEnumerable<KeyValuePair<int, double?>> Probes(SidecarState s)
