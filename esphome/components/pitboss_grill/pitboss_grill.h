@@ -545,6 +545,20 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
 
   GrillState grill_state_;
 
+  // Phase 7 (POST /setup) — added 2026-10-20 after that handler reset the
+  // board on its first two real uses. The two cloud TLS round trips cannot
+  // run on the httpd task (see handle_setup_()'s comment for the measured
+  // backtrace), so they run on the main loop and the httpd task blocks here
+  // for the result — the same handoff command_done_sem_ already does for
+  // POST /command. setup_result_body_ is the raw /customer-grills reply,
+  // serialized by the main loop and re-parsed by the httpd task (a
+  // JsonDocument must not cross tasks).
+  Mutex setup_mutex_;
+  SemaphoreHandle_t setup_done_sem_{nullptr};
+  std::string setup_result_body_;
+  std::string setup_result_error_;
+  void run_cloud_setup_(const std::string &email, const std::string &account_password, const std::string &country);
+
   // Phase 6 (alarms) — alarms_mutex_ guards the vector itself: written from
   // the httpd task (handle_alarms_post_()/handle_alarms_delete_()) and read
   // from both the httpd task (handle_alarms_get_()) and the main loop

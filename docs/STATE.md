@@ -18,6 +18,25 @@ the session-cookie login Docker deployments gate behind (`/login`,
 `/logout`, `/auth-check`) — unused entirely for a bare-metal/local-dev run,
 since there's no login gate without nginx in front.
 
+**Updated 2026-10-20 — the control board was replaced.** Brian fitted a new
+Pit Boss controller in the smoker; it advertises `PBV2-885721C4C3F4` (the old
+board was `PBV2-9451DC46B934`). Nothing in the protocol changed: same
+`PBV2-` name prefix, same Mongoose OS RPC/debug services at the same handles
+(data `0x0031`, tx_ctl `0x0033`, rx_ctl `0x002e`, debug `0x002a`), and the
+FE0B/FE0C frames decode unchanged. The only per-unit resource that differs is
+the grill's RPC password, which lives in NVS and is refreshed with
+`POST /setup` — editing `secrets.yaml` does nothing once NVS holds a value.
+That refresh did not work at first, because `POST /setup` **reset the board**
+on both of its first two real uses: the two cloud TLS round trips ran on the
+httpd task (~4 KB stack), which crashed in lwip (`Fault - LoadProhibited` at
+`udp_bind`, reached from `dns_alloc_random_port` via `getaddrinfo` <-
+`esp_tls_*` <- `ssl_connect` <- `HttpRequestComponent::post`) and left nginx
+answering 502. Same failure shape as the 2026-10-12 event-log crash. Fixed by
+handing both calls to the main loop through a semaphore, exactly like
+`POST /command` (`pitboss_grill.cpp`'s `run_cloud_setup_()`); verified with a
+real setup run (two POSTs, both 200: grill picker, then the fetch) and by
+`PB.GetState`/an MCU command succeeding afterwards.
+
 ## TL;DR status
 - Web client (Blazor WASM) talks to the grill's ESP32 directly over plain
   HTTP/JSON — `GET/POST` `/health`, `/state`, `/info`, `/config`,

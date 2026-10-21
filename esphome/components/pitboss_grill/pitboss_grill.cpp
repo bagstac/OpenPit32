@@ -476,6 +476,8 @@ void PitbossGrill::setup() {
   // Phase 5: the httpd task waiting inside handle_command_() is woken by
   // this once the main loop has a real result — see that method's comment.
   this->command_done_sem_ = xSemaphoreCreateBinary();
+  // Phase 7's POST /setup uses the same handoff for its cloud round trips.
+  this->setup_done_sem_ = xSemaphoreCreateBinary();
 
   // Phase 4: register /health, /state, /info (Phase 6: /alarms) on
   // ESPHome's shared httpd (web_server_base) — same pattern web_server/
@@ -2257,6 +2259,33 @@ bool PitbossGrill::cloud_list_grills_(const std::string &token, const std::strin
   return true;
 }
 
+// Main loop only — see handle_setup_()'s comment for why these two calls
+// cannot run on the httpd task. Does the login and the grill list, then
+// serializes the list reply into setup_result_body_ and wakes the blocked
+// httpd task. The account password never leaves this function's scope: it is
+// used for one login, and the copies in `email`/`account_password` are freed
+// when this returns (the caller's own copy is cleared the same way, and the
+// account JWT was never persisted in the first place — only the grill's own
+// RPC password is, below).
+void PitbossGrill::run_cloud_setup_(const std::string &email, const std::string &account_password,
+                                    const std::string &country) {
+  std::string token, error, body;
+  bool ok = this->cloud_login_(email, account_password, country, token, error);
+  if (ok) {
+    JsonDocument grills_doc;
+    ok = this->cloud_list_grills_(token, country, grills_doc, error);
+    if (ok)
+      body = esphome::json::build_json([&](JsonObject root) { root.set(grills_doc.as<JsonObjectConst>()); });
+  }
+  token.clear();
+  {
+    LockGuard lock(this->setup_mutex_);
+    this->setup_result_error_ = ok ? std::string() : error;
+    this->setup_result_body_ = body;
+  }
+  xSemaphoreGive(this->setup_done_sem_);
+}
+
 // Mirrors scripts/grill_sidecar.py's setup(): body {email, password,
 // country?, grill_id?, model?}, reply {ok, error?, grills?, board_id?,
 // nickname?, model?, connected} — see GrillRpcService.cs's SetupAsync/
@@ -2279,11 +2308,13 @@ bool PitbossGrill::cloud_list_grills_(const std::string &token, const std::strin
 // GrillRpcService.cs's SetupAsync never checks the status code either way —
 // it deserializes the body and reads `ok`/`grills`/`error` unconditionally).
 //
-// Both cloud calls are synchronous, blocking this httpd task for their
-// combined round trip (typically a couple of seconds, two TLS handshakes)
-// — the same trade-off handle_command_()'s comment documents for BLE
-// commands: acceptable for a rare, user-initiated, one-time action, not
-// something any polling loop triggers.
+// Both cloud calls are synchronous and blocking, but they run on the MAIN
+// LOOP (see the handoff in the body), so they stall this ESP32's BLE polling
+// and GET /health,/state,/info for their combined round trip — the same
+// trade-off handle_command_() documents for BLE commands: acceptable for a
+// rare, user-initiated, one-time action, not something a polling loop should
+// ever trigger. They must NOT run on the httpd task: see the 2026-10-20 note
+// in the body for the measured backtrace.
 void PitbossGrill::handle_setup_(AsyncWebServerRequest *request) {
   std::string body;
   if (!read_json_body(request, body)) {
@@ -2314,22 +2345,51 @@ void PitbossGrill::handle_setup_(AsyncWebServerRequest *request) {
   bool has_grill_id = !doc["grill_id"].isNull();
   int grill_id = doc["grill_id"] | -1;
 
-  std::string token, error;
-  bool login_ok = this->cloud_login_(email, password, country, token, error);
+  std::string error;
+  // 2026-10-20: BOTH cloud round trips are handed to the main loop, not made
+  // here. Both of this feature's first two real uses (15:16 and 16:32 local,
+  // the user's two attempts to refresh the grill password for the replaced
+  // control board) ended in a board reset and an nginx 502 — the same
+  // failure shape this file has now hit three times: "Fault - LoadProhibited"
+  // reached from dns_alloc_random_port under getaddrinfo <-
+  // esp_tls_hostname_to_fd <- esp_tls_low_level_conn <- ssl_connect <-
+  // HttpRequestComponent::post, i.e. this handler's own task running past the
+  // end of its stack into the heap where lwip keeps its PCBs. This handler is
+  // on the httpd task (~4 KB), which has no room for a TLS handshake; that is
+  // exactly why handle_command_() defers log_event_() and why
+  // nvs_save_string_deferred_() exists. The main loop is where every other
+  // TLS call in this file already runs (Telegram notify_(), the event log),
+  // so it goes there; this task blocks on the semaphore for the result, the
+  // same handoff POST /command uses.
+  xSemaphoreTake(this->setup_done_sem_, 0);  // drain a stale signal from a prior timeout
+  {
+    LockGuard lock(this->setup_mutex_);
+    this->setup_result_error_.clear();
+    this->setup_result_body_.clear();
+  }
+  // Captured BY VALUE: this handler may return before the main loop runs it.
+  this->defer([this, email, password, country]() { this->run_cloud_setup_(email, password, country); });
   password.clear();  // the account password is used once and dropped, same as pytboss_cloud.py
-  if (!login_ok) {
+
+  // 25s: two TLS handshakes plus the API's own latency, measured at a few
+  // seconds each — generous headroom without wedging the httpd task forever.
+  if (xSemaphoreTake(this->setup_done_sem_, pdMS_TO_TICKS(25000)) != pdTRUE) {
+    send_error("timed out waiting for the Pit Boss cloud");
+    return;
+  }
+
+  std::string list_body;
+  {
+    LockGuard lock(this->setup_mutex_);
+    error = this->setup_result_error_;
+    list_body = this->setup_result_body_;
+  }
+  if (!error.empty()) {
     send_error(error);
     return;
   }
 
-  JsonDocument grills_doc;
-  bool list_ok = this->cloud_list_grills_(token, country, grills_doc, error);
-  token.clear();  // the account's JWT is never persisted either — only the grill's own RPC password is
-  if (!list_ok) {
-    send_error(error);
-    return;
-  }
-
+  JsonDocument grills_doc = esphome::json::parse_json(list_body);
   JsonArray rows = grills_doc["data"]["customer_grills"].as<JsonArray>();
   if (rows.isNull() || rows.size() == 0) {
     send_error("no grills on this account — pair the grill in the Pit Boss app first");
