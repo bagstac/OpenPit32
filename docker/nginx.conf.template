@@ -125,25 +125,47 @@ server {
     # routes this app has; there is no longer a generic /api/ catch-all
     # below them (removed once nothing was left to fall through to it — see
     # git history if you need the old sidecar-catch-all shape back).
+    #
+    # `proxy_pass_request_headers off` in every block below is load-bearing
+    # (2026-11-02). By default nginx forwards the client's ENTIRE header set
+    # upstream, and this upstream is an ESP-IDF httpd with a 1 KB request
+    # header budget (CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024 in the firmware's
+    # sdkconfig). A browser's own headers plus the cf-* set Cloudflare and
+    # cloudflared add overflow that, and the ESP32 answers 431 "Header fields
+    # are too long" — measured 2026-11-01: three POST /api/command attempts
+    # from the phone 431'd and the app rendered each as an expired session.
+    # What the firmware's handlers actually need is the path, the body, and
+    # its Content-Type: no cookies, no cf-* headers, no UA. /api/events and
+    # /auth-check below deliberately keep the default (they proxy to the auth
+    # service, which needs the session Cookie).
     location = /api/health {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
         proxy_pass $grill_esp32/health;
+        proxy_pass_request_headers off;
         proxy_set_header Host $host;
+        proxy_set_header Content-Type $content_type;
+        proxy_set_header Content-Length $content_length;
     }
 
     location = /api/state {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
         proxy_pass $grill_esp32/state;
+        proxy_pass_request_headers off;
         proxy_set_header Host $host;
+        proxy_set_header Content-Type $content_type;
+        proxy_set_header Content-Length $content_length;
     }
 
     location = /api/info {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
         proxy_pass $grill_esp32/info;
+        proxy_pass_request_headers off;
         proxy_set_header Host $host;
+        proxy_set_header Content-Type $content_type;
+        proxy_set_header Content-Length $content_length;
     }
 
     # POST /config — the ESP32-only error_display_threshold/telegram_bot_token/
@@ -153,17 +175,25 @@ server {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
         proxy_pass $grill_esp32/config;
+        proxy_pass_request_headers off;
         proxy_set_header Host $host;
+        proxy_set_header Content-Type $content_type;
+        proxy_set_header Content-Length $content_length;
     }
 
     # Phase 5: POST /command (turn-on/turn-off/set-temperature). Body is
-    # forwarded as-is — nginx proxies the request body by default, same as
-    # /api/config above already relies on; no special directive needed.
+    # forwarded as-is — nginx proxies the request body by default even with
+    # proxy_pass_request_headers off (that switch is about headers only);
+    # Content-Type and Content-Length are set explicitly above because the
+    # firmware's handler parses the body as JSON and httpd needs the length.
     location = /api/command {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
         proxy_pass $grill_esp32/command;
+        proxy_pass_request_headers off;
         proxy_set_header Host $host;
+        proxy_set_header Content-Type $content_type;
+        proxy_set_header Content-Length $content_length;
     }
 
     # Phase 6/7: GET/POST /alarms (list/create) and POST /setup (Phase 7's
@@ -172,14 +202,20 @@ server {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
         proxy_pass $grill_esp32/alarms;
+        proxy_pass_request_headers off;
         proxy_set_header Host $host;
+        proxy_set_header Content-Type $content_type;
+        proxy_set_header Content-Length $content_length;
     }
 
     location = /api/setup {
         auth_request /auth-check;
         error_page 401 = @login_redirect;
         proxy_pass $grill_esp32/setup;
+        proxy_pass_request_headers off;
         proxy_set_header Host $host;
+        proxy_set_header Content-Type $content_type;
+        proxy_set_header Content-Length $content_length;
     }
 
     # 2026-10-05, docker/README.md's "Grill event log" section: GET
@@ -211,7 +247,10 @@ server {
         error_page 401 = @login_redirect;
         rewrite ^/api/alarms/(.*)$ /alarms/$1 break;
         proxy_pass $grill_esp32;
+        proxy_pass_request_headers off;
         proxy_set_header Host $host;
+        proxy_set_header Content-Type $content_type;
+        proxy_set_header Content-Length $content_length;
     }
 
     # nginx:alpine's mime.types already maps .wasm; set it explicitly in

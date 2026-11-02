@@ -21,7 +21,9 @@ namespace OpenPit32.Services;
 /// itself, so .NET never sees a 302 and the URI keeps naming the /api/
 /// route (measured 2026-10-12 — a URI-based check silently never fires).
 /// Every grill route answers JSON, so in a build that has a login gate in
-/// front of it, a non-JSON reply IS that gate.
+/// front of it, a <b>successful</b> non-JSON reply IS that gate — a failed
+/// one is nginx or the ESP32 saying so, and is left to the page's error
+/// rendering.
 ///
 /// Navigating with <c>forceLoad</c> deliberately leaves the SPA (a
 /// client-side route would just re-render the app) and /login is the one
@@ -53,6 +55,20 @@ public class SessionExpiryHandler : DelegatingHandler
     private void PromptForLoginIfSessionExpired(HttpResponseMessage response)
     {
 #if DOCKER_DEPLOY
+        // Only a *successful* non-JSON reply is the gate. nginx's own failures
+        // are text/html too — 502 when the ESP32 is off the network, 504 on an
+        // upstream timeout — and so are the ESP32's own rejections (431 when
+        // the request header set overflows its 1 KB httpd buffer). Treating
+        // "not JSON" alone as the gate turned every one of those into a login
+        // prompt: 2026-11-01, three POST /api/command 431s each bounced the
+        // phone to /login mid-cook, and 2026-11-02 a powered-off grill made
+        // the app loop login → 502 → login. Those deserve the connectivity
+        // error instead, which is what the calling page renders.
+        if (!response.IsSuccessStatusCode)
+        {
+            return;
+        }
+
         if (IsJson(response))
         {
             return;
