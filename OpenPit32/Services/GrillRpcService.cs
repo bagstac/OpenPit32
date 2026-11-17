@@ -251,8 +251,41 @@ public class GrillRpcService
     public async Task<SidecarConfigResponse> SetAlertTargetAsync(string target)
     {
         var resp = await _http.PostAsJsonAsync("config", new { telegram_alert_target = target });
-        return await resp.Content.ReadFromJsonAsync<SidecarConfigResponse>()
-               ?? new SidecarConfigResponse { ok = false, error = "Empty reply from grill bridge" };
+        // A 502/504 from nginx means the controller is off the network or slow,
+        // not that the request was wrong — say so, rather than letting the JSON
+        // reader throw "ExpectedStartOfValueNotFound" into the UI (measured
+        // 2026-11-02 against a stopped controller).
+        if (!resp.IsSuccessStatusCode)
+        {
+            return new SidecarConfigResponse
+            {
+                ok = false,
+                error = $"The grill's controller answered HTTP {(int)resp.StatusCode} — it may be powered off or unreachable.",
+            };
+        }
+        var mediaType = resp.Content.Headers.ContentType?.MediaType;
+        if (mediaType is null || !mediaType.Contains("json", StringComparison.OrdinalIgnoreCase))
+        {
+            return new SidecarConfigResponse
+            {
+                ok = false,
+                error = "The grill's controller sent a reply this app can't read (expected JSON).",
+            };
+        }
+        var parsed = await resp.Content.ReadFromJsonAsync<SidecarConfigResponse>()
+                     ?? new SidecarConfigResponse { ok = false, error = "Empty reply from grill bridge" };
+        // A firmware from before 2026-11-02 accepts POST /config but ignores
+        // telegram_alert_target and echoes nothing back — never report that as
+        // a successful change.
+        if (parsed.ok && string.IsNullOrEmpty(parsed.telegram_alert_target))
+        {
+            return new SidecarConfigResponse
+            {
+                ok = false,
+                error = "The controller's firmware doesn't support choosing the alarm destination yet.",
+            };
+        }
+        return parsed;
     }
 
     /// <summary>
