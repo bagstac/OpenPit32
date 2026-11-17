@@ -119,6 +119,28 @@ Two things to know before switching:
   the status one is configured — that route is also reachable unauthenticated
   from the LAN, and the web app needs no id to render the dropdown.
 
+### Pointing the grill at a different chat or channel
+
+The **Grill chat** option means whatever `telegram_chat_id` holds — there is no UI to type
+an id, only the dropdown that switches between the two destinations. To move it (e.g. to a
+dedicated notifications channel):
+
+1. **Add the bot to the target.** For a group it must be a member; for a *channel* it must
+   be an **admin**, or posts are rejected.
+2. **Read the id.** Send any message in that chat, then
+   `curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | grep -o '"chat":{"id":-\?[0-9]*'`
+   — groups and channels are negative (`-100…` for supergroups/channels), a DM is the
+   plain user id. (Forwarding a message to `@userinfobot` does the same thing without the
+   token.)
+3. **Write it to the controller:**
+   `curl -s -X POST -H 'Content-Type: application/json' -d '{"telegram_chat_id":"-100…"}' http://<grill-ip>/config`
+   — note this route is unauthenticated on the LAN, which is why the app never exposes or
+   needs it. NVS now wins over `secrets.yaml`'s fallback on every boot.
+4. **Verify** with a temp alarm that must fire immediately (pit temp is lower than the
+   target), watching the device log: `Telegram notify sent (target=group)` proves it. A
+   wrong/unjoined id answers `Telegram notify failed: HTTP 400 (target=group)` — Telegram's
+   `chat not found` — and the alarm is lost.
+
 ## Grill event log
 
 > **FIXED 2026-10-12 — the crash below came from doing the POST on the httpd
