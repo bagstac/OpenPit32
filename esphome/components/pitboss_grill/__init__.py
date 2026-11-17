@@ -61,6 +61,7 @@ CONF_HAS_LIGHTS = "has_lights"
 CONF_MEAT_PROBES = "meat_probes"
 CONF_TELEGRAM_BOT_TOKEN = "telegram_bot_token"
 CONF_TELEGRAM_CHAT_ID = "telegram_chat_id"
+CONF_TELEGRAM_CHAT_ID_STATUS = "telegram_chat_id_status"
 CONF_EVENT_LOG_URL = "event_log_url"
 CONF_EVENT_LOG_TOKEN = "event_log_token"
 
@@ -107,6 +108,12 @@ CONFIG_SCHEMA = (
             # drop on schedule; nothing is sent anywhere).
             cv.Optional(CONF_TELEGRAM_BOT_TOKEN, default=""): cv.string_strict,
             cv.Optional(CONF_TELEGRAM_CHAT_ID, default=""): cv.string_strict,
+            # 2026-11-02: the chat the daily device-status digest delivers to
+            # — the second destination the web app's Notify dropdown can send
+            # alarm notifications to (POST /config's telegram_alert_target).
+            # Defaults to "" (the "status" option is then refused and hidden),
+            # so a checkout without this secret still builds and still runs.
+            cv.Optional(CONF_TELEGRAM_CHAT_ID_STATUS, default=""): cv.string_strict,
             # 2026-10-05: optional operational event log (POST /command,
             # BLE connect/disconnect, unexplained setpoint changes) — see
             # pitboss_grill.h's set_event_log_url()/docker/README.md's
@@ -140,6 +147,7 @@ async def to_code(config):
     cg.add(var.set_meat_probes(config[CONF_MEAT_PROBES]))
     cg.add(var.set_telegram_bot_token(config[CONF_TELEGRAM_BOT_TOKEN]))
     cg.add(var.set_telegram_chat_id(config[CONF_TELEGRAM_CHAT_ID]))
+    cg.add(var.set_telegram_chat_id_status(config[CONF_TELEGRAM_CHAT_ID_STATUS]))
     cg.add(var.set_event_log_url(config[CONF_EVENT_LOG_URL]))
     cg.add(var.set_event_log_token(config[CONF_EVENT_LOG_TOKEN]))
 

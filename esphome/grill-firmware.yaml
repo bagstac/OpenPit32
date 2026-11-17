@@ -159,6 +159,18 @@ pitboss_grill:
   # /config persists a change to NVS, which then wins on every later boot.
   telegram_bot_token: !secret telegram_bot_token
   telegram_chat_id: !secret telegram_chat_id
+  # 2026-11-02 — the daily homelab device-status digest's chat, i.e. the
+  # second destination GrillDetail.razor's "Notify" dropdown offers. Compiled
+  # in rather than settable at runtime (unlike telegram_chat_id above) so
+  # "Device status digest" always means the chat the digest really delivers
+  # to; POST /config only switches BETWEEN the two, never rewrites this one.
+  # Must be a chat this bot can post to: for a private chat that means Brian
+  # has pressed Start on THIS bot at least once, or Telegram answers 403 and
+  # notify_() logs "Telegram notify failed: HTTP 403".
+  # scripts/login_service.py's /log-event token pattern applies here too:
+  # the value lives in secrets.yaml and in the Hermes job's own config, and
+  # they have to be kept in step by hand.
+  telegram_chat_id_status: !secret telegram_chat_id_status
   # 2026-10-05 "what's resetting the setpoint to 130?" investigation
   # (docker/README.md's "Grill event log" section has the full picture):
   # every POST /command, BLE connect/disconnect, and setpoint change this

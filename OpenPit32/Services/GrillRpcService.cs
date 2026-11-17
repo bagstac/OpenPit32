@@ -71,6 +71,15 @@ public class SidecarInfoResponse
     /// required before the grill link shows a warning. Null when talking to
     /// the sidecar, which has no such setting.</summary>
     public int? error_display_threshold { get; set; }
+    /// <summary>ESP32-only, 2026-11-02 — which chat alarm notifications go
+    /// to: "group" (the chat this controller has always used) or "status"
+    /// (the daily device-status digest's chat). Null on a firmware older than
+    /// that, which is how GrillDetail.razor knows to hide the control.</summary>
+    public string? telegram_alert_target { get; set; }
+    /// <summary>ESP32-only — false when the firmware was built without a
+    /// status chat id (secrets.yaml's telegram_chat_id_status), in which case
+    /// switching to "status" is refused and the option is hidden.</summary>
+    public bool? telegram_status_target_configured { get; set; }
 }
 
 /// <summary>POST /config reply — see SetErrorDisplayThresholdAsync.</summary>
@@ -79,6 +88,8 @@ public class SidecarConfigResponse
     public bool ok { get; set; }
     public string? error { get; set; }
     public int? error_display_threshold { get; set; }
+    /// <summary>Echoed back after a successful telegram_alert_target write.</summary>
+    public string? telegram_alert_target { get; set; }
 }
 
 public class SidecarCommandResponse
@@ -226,6 +237,20 @@ public class GrillRpcService
     public async Task<SidecarConfigResponse> SetErrorDisplayThresholdAsync(int threshold)
     {
         var resp = await _http.PostAsJsonAsync("config", new { error_display_threshold = threshold });
+        return await resp.Content.ReadFromJsonAsync<SidecarConfigResponse>()
+               ?? new SidecarConfigResponse { ok = false, error = "Empty reply from grill bridge" };
+    }
+
+    /// <summary>
+    /// ESP32-only (POST /config), 2026-11-02: which chat alarm notifications
+    /// are delivered to — <c>"group"</c> (the chat this controller has always
+    /// used, whatever its id is) or <c>"status"</c> (the daily device-status
+    /// digest's chat, fixed in the firmware). The controller validates the
+    /// value, persists it to NVS, and echoes the now-current target back.
+    /// </summary>
+    public async Task<SidecarConfigResponse> SetAlertTargetAsync(string target)
+    {
+        var resp = await _http.PostAsJsonAsync("config", new { telegram_alert_target = target });
         return await resp.Content.ReadFromJsonAsync<SidecarConfigResponse>()
                ?? new SidecarConfigResponse { ok = false, error = "Empty reply from grill bridge" };
     }

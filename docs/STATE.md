@@ -50,6 +50,14 @@ real setup run (two POSTs, both 200: grill picker, then the fetch) and by
   state (no VAPID, no service-worker push, that whole approach was dropped
   — see the plan's decision #3). Evaluated by the ESP32 itself on a 5 s
   timer; alarms persist across a reboot/reflash (NVS).
+- **Send alarms to** dropdown (2026-11-02) on that same card: "Grill chat"
+  (the controller's existing `telegram_chat_id` — NVS value, else
+  `secrets.yaml`) or "Device status digest" (the daily homelab status
+  digest's chat, compiled in from `secrets.yaml`'s
+  `telegram_chat_id_status`). Persisted as `telegram_alert_target` in NVS;
+  `GET /info` reports the active one and whether the digest chat is
+  configured, so the app never guesses. See docker/README.md's "Alarm
+  notifications" section.
 - Works with the controller switched off (mains only) — remote power-on
   from cold verified. Needs the ESP32 powered within a few metres of the
   controller with a usable BLE RSSI (> -80 dBm comfortable, < -85 flaky).

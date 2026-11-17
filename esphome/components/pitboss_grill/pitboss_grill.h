@@ -145,6 +145,16 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   void set_telegram_bot_token(const std::string &token) { this->telegram_bot_token_ = token; }
   void set_telegram_chat_id(const std::string &chat_id) { this->telegram_chat_id_ = chat_id; }
 
+  /// The daily device-status digest's chat (2026-11-02) — the second alarm
+  /// destination, selected at runtime via POST /config's
+  /// telegram_alert_target. Compile-time only (secrets.yaml): unlike
+  /// telegram_chat_id_ there is no runtime write path, so this can never
+  /// drift from the chat the digest actually delivers to. Empty disables the
+  /// "status" option (GET /info's telegram_status_target_configured).
+  void set_telegram_chat_id_status(const std::string &chat_id) {
+    this->telegram_chat_id_status_ = chat_id;
+  }
+
   /// Optional sink for operational event logging — set up to answer "what's
   /// resetting the setpoint to 130?" (2026-10-05 investigation): every
   /// POST /command, BLE connect/disconnect, and any setpoint change this
@@ -580,6 +590,13 @@ class PitbossGrill : public BLEClientBase, public AsyncWebHandler {
   // state_mutex_.
   std::string telegram_bot_token_;
   std::string telegram_chat_id_;
+  // 2026-11-02 — the alarm-notification destination. telegram_chat_id_status_
+  // is compile-time (see set_telegram_chat_id_status()); the target name is
+  // runtime-settable via POST /config and persisted to NVS, read by notify_()
+  // on the main loop, so — like telegram_chat_id_ above — all access past
+  // setup()/load_persisted_state_() goes through state_mutex_.
+  std::string telegram_chat_id_status_;
+  std::string telegram_alert_target_{"group"};
 
   // event_log_url_/event_log_token_: set once at boot (YAML/secrets.yaml),
   // never rewritten at runtime (no POST /setup-style flow for these), but

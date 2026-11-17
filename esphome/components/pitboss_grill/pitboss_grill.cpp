@@ -104,7 +104,21 @@ static const char *const NVS_NAMESPACE = "pitboss_grill";
 static const char *const NVS_KEY_GRILL_PW = "grill_pw";
 static const char *const NVS_KEY_TG_TOKEN = "tg_token";
 static const char *const NVS_KEY_TG_CHAT = "tg_chat_id";
+static const char *const NVS_KEY_TG_TARGET = "tg_target";
 static const char *const NVS_KEY_ALARMS = "alarms";
+
+// Alarm alert routing (2026-11-02). Two destinations, selected at runtime by
+// POST /config's telegram_alert_target and remembered in NVS:
+//   group  — telegram_chat_id, i.e. the chat this box has always used. That
+//            member is the NVS value when POST /config has ever set one, so
+//            the live group id never has to be known to, or stored in, the
+//            web app; it simply keeps pointing at whatever is configured.
+//   status — telegram_chat_id_status, the chat the daily device-status
+//            digest delivers to. Compile-time (secrets.yaml) and never
+//            rewritten at runtime, so "status" always means that one chat.
+// "group" is the default, i.e. exactly the pre-2026-11-02 behaviour.
+static const char *const ALERT_TARGET_GROUP = "group";
+static const char *const ALERT_TARGET_STATUS = "status";
 
 // Pit Boss cloud API (docs/PROTOCOL.md section 1) — a direct port of
 // scripts/pitboss_cloud.py's BASE/_headers()/BOARD_PREFIX. Only ever hit
@@ -681,6 +695,17 @@ void PitbossGrill::load_persisted_state_() {
     this->telegram_bot_token_ = saved;
   if (this->nvs_load_string_(NVS_KEY_TG_CHAT, saved))
     this->telegram_chat_id_ = saved;
+  // Unknown values are ignored rather than fatal: a downgrade (or a future
+  // third target) must fall back to the chat this box has always used, not
+  // leave alarms pointed at nothing.
+  if (this->nvs_load_string_(NVS_KEY_TG_TARGET, saved)) {
+    if (saved == ALERT_TARGET_GROUP || saved == ALERT_TARGET_STATUS) {
+      this->telegram_alert_target_ = saved;
+    } else {
+      ESP_LOGW(TAG, "Ignoring unknown persisted alert target '%s' — using '%s'", saved.c_str(),
+               ALERT_TARGET_GROUP);
+    }
+  }
 
   std::string alarms_json;
   if (!this->nvs_load_string_(NVS_KEY_ALARMS, alarms_json))
@@ -721,6 +746,10 @@ void PitbossGrill::save_alarms_locked_() {
 void PitbossGrill::dump_config() {
   ESP_LOGCONFIG(TAG, "Pitboss Grill (Phase 7 — POST /setup + NVS persistence):");
   ESP_LOGCONFIG(TAG, "  Advertised-name prefix: %s", this->name_prefix_.c_str());
+  // Names only, never a chat id — this goes to the device log (and to anyone
+  // running `esphome logs`).
+  ESP_LOGCONFIG(TAG, "  Alarm Telegram target: %s (status chat %s)", this->telegram_alert_target_.c_str(),
+                this->telegram_chat_id_status_.empty() ? "not configured" : "configured");
 }
 
 bool PitbossGrill::parse_device(const espbt::ESPBTDevice &device) {
@@ -1487,11 +1516,15 @@ void PitbossGrill::handle_info_(AsyncWebServerRequest *request) {
   std::string board_id;
   bool configured;
   bool telegram_configured;
+  std::string alert_target;
+  bool status_target_configured;
   {
     LockGuard lock(this->state_mutex_);
     board_id = this->board_id_;
     configured = !this->grill_password_.empty();
     telegram_configured = !this->telegram_bot_token_.empty() && !this->telegram_chat_id_.empty();
+    alert_target = this->telegram_alert_target_;
+    status_target_configured = !this->telegram_chat_id_status_.empty();
   }
   std::string body = esphome::json::build_json([&](JsonObject root) {
     root["configured"] = configured;
@@ -1508,6 +1541,12 @@ void PitbossGrill::handle_info_(AsyncWebServerRequest *request) {
     // handle_config_()) the web app reads here and writes via POST /config.
     root["error_display_threshold"] = this->error_display_threshold_.load();
     root["telegram_configured"] = telegram_configured;
+    // 2026-11-02: which chat alarm notifications go to, and whether the
+    // "status" option is usable at all — GrillDetail.razor's Notify dropdown
+    // reads both. Only the target name is exposed, never a chat id: /info is
+    // also reachable unauthenticated from the LAN.
+    root["telegram_alert_target"] = alert_target;
+    root["telegram_status_target_configured"] = status_target_configured;
   });
   request->send(200, "application/json", body.c_str());
 }
@@ -1571,9 +1610,41 @@ void PitbossGrill::handle_config_(AsyncWebServerRequest *request) {
     LockGuard lock(this->state_mutex_);
     this->telegram_chat_id_ = chat_id;
   }
+  // 2026-11-02: which of the two chats alarm notifications go to. Validated
+  // against the two known names — anything else would persist a value
+  // notify_() can't act on — and "status" is refused while no status chat id
+  // is compiled in, so the web app can never select a destination that
+  // silently falls back to the group.
+  if (!doc["telegram_alert_target"].isNull()) {
+    std::string target = doc["telegram_alert_target"] | "";
+    if (target != ALERT_TARGET_GROUP && target != ALERT_TARGET_STATUS) {
+      request->send(200, "application/json",
+                    "{\"ok\":false,\"error\":\"telegram_alert_target must be 'group' or 'status'\"}");
+      return;
+    }
+    bool status_configured;
+    {
+      LockGuard lock(this->state_mutex_);
+      status_configured = !this->telegram_chat_id_status_.empty();
+    }
+    if (target == ALERT_TARGET_STATUS && !status_configured) {
+      request->send(200, "application/json",
+                    "{\"ok\":false,\"error\":\"no status chat id is configured in the firmware\"}");
+      return;
+    }
+    this->nvs_save_string_deferred_(NVS_KEY_TG_TARGET, target);
+    LockGuard lock(this->state_mutex_);
+    this->telegram_alert_target_ = target;
+  }
+  std::string alert_target;
+  {
+    LockGuard lock(this->state_mutex_);
+    alert_target = this->telegram_alert_target_;
+  }
   std::string resp = esphome::json::build_json([&](JsonObject root) {
     root["ok"] = true;
     root["error_display_threshold"] = this->error_display_threshold_.load();
+    root["telegram_alert_target"] = alert_target;
   });
   request->send(200, "application/json", resp.c_str());
 }
@@ -2036,11 +2107,27 @@ void PitbossGrill::notify_(const std::string &message) {
   // Phase 7: both are now runtime-settable via POST /config (handle_config_
   // ()), from the httpd task — so this main-loop read needs state_mutex_
   // too, same reasoning as send_get_state_()'s grill_password_ read.
-  std::string bot_token, chat_id;
+  // 2026-11-02: the destination is whichever chat telegram_alert_target_
+  // names — "group" is telegram_chat_id_ (NVS value if POST /config ever set
+  // one, else the YAML default), "status" is the compile-time digest chat.
+  std::string bot_token, chat_id, target, status_chat_id;
   {
     LockGuard lock(this->state_mutex_);
     bot_token = this->telegram_bot_token_;
     chat_id = this->telegram_chat_id_;
+    target = this->telegram_alert_target_;
+    status_chat_id = this->telegram_chat_id_status_;
+  }
+  // A status target with no id configured can only happen if the field was
+  // left out of secrets.yaml; fall back to the group chat rather than
+  // dropping the alarm silently, and say so.
+  if (target == ALERT_TARGET_STATUS) {
+    if (status_chat_id.empty()) {
+      ESP_LOGW(TAG, "Alert target is '%s' but no status chat id is configured — using '%s'",
+               ALERT_TARGET_STATUS, ALERT_TARGET_GROUP);
+    } else {
+      chat_id = status_chat_id;
+    }
   }
   if (bot_token.empty() || chat_id.empty()) {
     ESP_LOGI(TAG, "Alarm fired but no Telegram bot configured: %s", message.c_str());
@@ -2065,9 +2152,9 @@ void PitbossGrill::notify_(const std::string &message) {
     return;
   }
   if (!http_request::is_success(container->status_code)) {
-    ESP_LOGW(TAG, "Telegram notify failed: HTTP %d", container->status_code);
+    ESP_LOGW(TAG, "Telegram notify failed: HTTP %d (target=%s)", container->status_code, target.c_str());
   } else {
-    ESP_LOGI(TAG, "Telegram notify sent");
+    ESP_LOGI(TAG, "Telegram notify sent (target=%s)", target.c_str());
   }
   container->end();
 }

@@ -88,6 +88,37 @@ you want one.
 - `.env` holds the app's login; git-ignored, same as `esphome/secrets.yaml`
   for a bare-metal ESP32 flash.
 
+## Alarm notifications — which chat they go to
+
+The Alarms card on the grill page carries a **Send alarms to** dropdown with
+two destinations. It writes `telegram_alert_target` to the ESP32's
+`POST /config`, which validates it and persists it to NVS, so the choice
+survives reboots and reflashes:
+
+| Option | Sends to | Where the id comes from |
+|---|---|---|
+| **Grill chat** (default) | the chat this controller has always used | `telegram_chat_id` — the NVS value once `POST /config` has set one, else `secrets.yaml` |
+| **Device status digest** | the chat the daily homelab status digest delivers to | `telegram_chat_id_status` in `esphome/secrets.yaml`, compiled in |
+
+The second one is deliberately **not** runtime-settable: "device status
+digest" has to keep meaning the chat the digest really goes to, so it can
+only be changed by rebuilding the firmware. If that secret is absent the
+firmware still builds and runs — `GET /info` reports
+`telegram_status_target_configured: false`, `POST /config` refuses
+`"status"`, and the app hides the option.
+
+Two things to know before switching:
+
+- **A private chat needs the bot to have been started.** `8984047513` is a
+  user id, so the digest bot and the grill bot each need their own
+  conversation with that user; if this bot has never been started, Telegram
+  answers `403 Forbidden` and the device log shows
+  `Telegram notify failed: HTTP 403 (target=status)` with the alarm lost.
+  A group id (`-100…`) has no such problem — the bot only has to be a member.
+- **`GET /info` never exposes a chat id**, only the target name and whether
+  the status one is configured — that route is also reachable unauthenticated
+  from the LAN, and the web app needs no id to render the dropdown.
+
 ## Grill event log
 
 > **FIXED 2026-10-12 — the crash below came from doing the POST on the httpd
