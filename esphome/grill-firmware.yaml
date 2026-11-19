@@ -113,6 +113,30 @@ logger:
   logs:
     pitboss_grill: DEBUG
 
+# 2026-11-19: why does this box reboot? Until now nothing recorded it — the
+# ESP-IDF reset reason lives in RTC memory and only reaches the console at
+# boot, which the API log client (reconnecting ~7s after the boot lines)
+# never catches. A real reset at 18:28:33 that day left no trace at all: no
+# `disconnect` event in the grill event log, no panic text, nothing.
+#
+# The `debug` text_sensor holds the reason for the life of the boot, so it can
+# be read at ANY time afterwards rather than only in the first second:
+#   .venv/Scripts/python.exe -m esphome logs esphome/grill-firmware.yaml --device 192.168.1.114
+# prints `Reset reason: …` on subscribe (Brownout / Software reset CPU /
+# Task watchdog / Panic …), which is the difference between "it rebooted" and
+# "it browned out".
+#
+# Deliberately NOT posted to the grill event log: log_event_() blocks for a
+# whole HTTP round trip and every caller must defer it (see the comments in
+# pitboss_grill.cpp) — a boot-time POST would race the WiFi coming up, for a
+# value that is now readable on demand anyway.
+debug:
+
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Reset reason"
+
 # Phase 6: alarms need a real Unix timestamp (fires_at) for
 # GrillDetail.razor's countdown to make sense, not just uptime-since-boot.
 # NTP over the WiFi this ESP32 already has; UTC throughout since every
