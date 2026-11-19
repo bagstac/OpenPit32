@@ -90,10 +90,13 @@ you want one.
 
 ## Alarm notifications — which chat they go to
 
-The Alarms card on the grill page carries a **Send alarms to** dropdown with
-two destinations. It writes `telegram_alert_target` to the ESP32's
-`POST /config`, which validates it and persists it to NVS, so the choice
-survives reboots and reflashes:
+**The Alarms card's "Send alarms to" dropdown was REMOVED on 2026-11-19.** It was a temporary
+switch between the two destinations below; the grill now has its own bot and one chat, so
+there was nothing left to switch between. The removal is app-side only — the firmware still
+implements both targets, still persists `telegram_alert_target` in NVS, and `POST /config`
+still accepts it, so the destination is a curl away and the control can be restored without a
+reflash. The table stays because the targets themselves still exist and `GET /info` still
+reports which one is active:
 
 | Option | Sends to | Where the id comes from |
 |---|---|---|
@@ -104,8 +107,8 @@ The second one is deliberately **not** runtime-settable: "device status
 digest" has to keep meaning the chat the digest really goes to, so it can
 only be changed by rebuilding the firmware. If that secret is absent the
 firmware still builds and runs — `GET /info` reports
-`telegram_status_target_configured: false`, `POST /config` refuses
-`"status"`, and the app hides the option.
+`telegram_status_target_configured: false` and `POST /config` refuses
+`"status"`.
 
 Two things to know before switching:
 
@@ -117,13 +120,13 @@ Two things to know before switching:
   A group id (`-100…`) has no such problem — the bot only has to be a member.
 - **`GET /info` never exposes a chat id**, only the target name and whether
   the status one is configured — that route is also reachable unauthenticated
-  from the LAN, and the web app needs no id to render the dropdown.
+  from the LAN, which is why no id is ever handed to the browser.
 
 ### Pointing the grill at a different chat or channel
 
-The **Grill chat** option means whatever `telegram_chat_id` holds — there is no UI to type
-an id, only the dropdown that switches between the two destinations. To move it (e.g. to a
-dedicated notifications channel):
+The **Grill chat** target means whatever `telegram_chat_id` holds — there is no UI to type
+an id (and no dropdown any more; see above), so it is a `POST /config` field. To move it
+(e.g. to a dedicated notifications channel):
 
 1. **Add the bot to the target.** For a group it must be a member; for a *channel* it must
    be an **admin**, or posts are rejected.
