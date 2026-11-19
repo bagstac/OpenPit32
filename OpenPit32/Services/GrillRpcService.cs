@@ -247,6 +247,10 @@ public class GrillRpcService
     /// used, whatever its id is) or <c>"status"</c> (the daily device-status
     /// digest's chat, fixed in the firmware). The controller validates the
     /// value, persists it to NVS, and echoes the now-current target back.
+    /// <para>2026-11-19: <b>no UI calls this any more</b> — the Alarms card's
+    /// dropdown was removed once the grill got its own bot and a single
+    /// destination. Kept because the firmware still accepts and stores the
+    /// field, so a curl or a restored control still works.</para>
     /// </summary>
     public async Task<SidecarConfigResponse> SetAlertTargetAsync(string target)
     {

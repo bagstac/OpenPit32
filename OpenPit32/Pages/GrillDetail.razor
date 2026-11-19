@@ -253,45 +253,18 @@ else
                 </div>
             </div>
 
-            @* 2026-11-02: where fired alarms are delivered. Only rendered when
-               the controller's firmware reports a target (GET /info's
-               telegram_alert_target), so an older build simply shows nothing
-               rather than a control that writes a field it ignores. *@
-            @if (info?.telegram_alert_target is not null)
-            {
-                <div class="row g-2 align-items-end mt-1">
-                    <div class="col-auto">
-                        <label class="form-label small text-muted mb-1">Send alarms to</label>
-                        <select class="form-select form-select-sm" value="@alertTarget"
-                                disabled="@alertBusy" @onchange="OnAlertTargetChanged">
-                            <option value="group">Grill chat</option>
-                            @if (info?.telegram_status_target_configured != false)
-                            {
-                                <option value="status">Device status digest</option>
-                            }
-                        </select>
-                    </div>
-                    <div class="col-auto pb-1">
-                        @if (alertBusy)
-                        {
-                            <span class="text-muted small">Saving…</span>
-                        }
-                        else if (!string.IsNullOrEmpty(alertMessage))
-                        {
-                            <span class="small @(alertFailed ? "text-danger" : "text-success")">@alertMessage</span>
-                        }
-                    </div>
-                </div>
-            }
+            @* 2026-11-19: the "Send alarms to" dropdown is REMOVED. It existed as a
+               temporary two-destination switch (2026-11-02) between the grill chat and
+               the digest chat; the grill now has its own bot and one destination, so
+               there is nothing to switch. The firmware still carries
+               `telegram_alert_target` (NVS, default "group") and POST /config still
+               accepts it — this is an app-side removal only, revertible without a
+               reflash. Set the destination itself with POST /config {telegram_chat_id}
+               — see runbooks/telegram-bots.md in C:\git\homelab. *@
             <p class="text-muted small mt-3 mb-0">
-                Alarms are checked by the grill's own ESP32 and delivered via Telegram,
-                so they still fire even if no tab is open at all — independent of this
-                browser or device.
-                @if (info?.telegram_alert_target == "status")
-                {
-                    <text> They currently go to the device status digest's chat, the same
-                    one the daily homelab status message uses, rather than the grill chat.</text>
-                }
+                Alarms are checked by the grill's own ESP32 and delivered via Telegram by
+                the grill's own bot, so they still fire even if no tab is open at all —
+                independent of this browser or device.
             </p>
         </div>
     </div>
@@ -331,15 +304,6 @@ else
     private string? alarmLabel;
     private bool alarmBusy;
 
-    // ---- Alarms card: alert destination (2026-11-02) ----
-    // Mirrors GET /info's telegram_alert_target. Only ever set from the
-    // controller (page load, or the reply to a write) — never assumed — so a
-    // failed write reverts the dropdown instead of showing a lie.
-    private string alertTarget = "group";
-    private bool alertBusy;
-    private string? alertMessage;
-    private bool alertFailed;
-
     protected override async Task OnInitializedAsync()
     {
         // 10s, not 5s (as of 2026-09-11) — each poll is up to 4 HTTP requests
@@ -369,13 +333,6 @@ else
             if (health?.configured == true)
             {
                 info ??= await Rpc.GetInfoAsync();
-                // Keep the alarm-destination dropdown (2026-11-02) in step with
-                // the controller — but never while a write of our own is in
-                // flight, or the reply would fight the poll.
-                if (!alertBusy && info?.telegram_alert_target is string target)
-                {
-                    alertTarget = target;
-                }
                 var resp = await Rpc.GetStateAsync();
                 live = resp?.state;
                 stateAge = resp?.state_age_seconds;
@@ -440,58 +397,6 @@ else
     {
         await Rpc.DeleteAlarmAsync(id);
         await RefreshAlarms();
-    }
-
-    /// <summary>
-    /// Alarms card's "Send alarms to" dropdown (2026-11-02). The controller is
-    /// the source of truth: on success the reply's echoed target becomes the
-    /// displayed value; on any failure the dropdown snaps back to what it was
-    /// showing, so it can never claim a destination the ESP32 didn't accept.
-    /// </summary>
-    private async Task OnAlertTargetChanged(ChangeEventArgs e)
-    {
-        var requested = e.Value?.ToString();
-        if (string.IsNullOrEmpty(requested) || requested == alertTarget)
-        {
-            return;
-        }
-        var previous = alertTarget;
-        alertTarget = requested;
-        alertBusy = true;
-        alertMessage = null;
-        alertFailed = false;
-        try
-        {
-            var r = await Rpc.SetAlertTargetAsync(requested);
-            if (r.ok)
-            {
-                alertTarget = r.telegram_alert_target ?? requested;
-                if (info is not null)
-                {
-                    info.telegram_alert_target = alertTarget;
-                }
-                alertMessage = alertTarget == "status"
-                    ? "Alarms now go to the device status digest chat."
-                    : "Alarms now go to the grill chat.";
-            }
-            else
-            {
-                alertTarget = previous;
-                alertFailed = true;
-                alertMessage = r.error ?? "Could not change the alarm destination.";
-            }
-        }
-        catch (Exception ex)
-        {
-            alertTarget = previous;
-            alertFailed = true;
-            alertMessage = "Could not reach the grill: " + ex.Message;
-        }
-        finally
-        {
-            alertBusy = false;
-        }
-        StateHasChanged();
     }
 
     private async Task RefreshAlarms()
